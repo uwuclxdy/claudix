@@ -28,6 +28,10 @@ enum Command {
         path_prefix: Option<String>,
     },
     Status,
+    ReindexFile {
+        path: String,
+    },
+    Clear,
     Hook {
         event: String,
     },
@@ -112,6 +116,17 @@ async fn main() -> Result<()> {
             if let Some(last_incremental_at) = output.last_incremental_at {
                 println!("last_incremental_at: {last_incremental_at}");
             }
+        }
+        Command::ReindexFile { path } => {
+            let output = cli::run_reindex_file(&project_root, path).await?;
+            println!(
+                "indexed {} files into {} chunks",
+                output.file_count, output.chunk_count
+            );
+        }
+        Command::Clear => {
+            let output = cli::run_clear_index(&project_root).await?;
+            println!("cleared: {}", output.cleared);
         }
         Command::Hook { event } => {
             let event = cli::parse_hook_event(&event)?;

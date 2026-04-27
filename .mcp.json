@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "claudix": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/claudix",
+      "args": ["mcp"]
+    }
+  }
+}
