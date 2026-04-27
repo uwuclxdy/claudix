@@ -164,9 +164,9 @@ mod tests {
 
     #[tokio::test]
     async fn http_provider_embeds_batch() {
-        let server = TestServer::spawn(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 77\r\n\r\n{\"data\":[{\"embedding\":[0.1,0.2]},{\"embedding\":[0.3,0.4]}]}",
-        )
+        let server = TestServer::spawn(response_with_json(
+            r#"{"data":[{"embedding":[0.1,0.2]},{"embedding":[0.3,0.4]}]}"#,
+        ))
         .await;
 
         let provider = HttpProvider::new(
@@ -193,9 +193,9 @@ mod tests {
 
     #[tokio::test]
     async fn http_provider_reports_dimension_mismatch() {
-        let server = TestServer::spawn(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 41\r\n\r\n{\"data\":[{\"embedding\":[0.1,0.2,0.3]}]}",
-        )
+        let server = TestServer::spawn(response_with_json(
+            r#"{"data":[{"embedding":[0.1,0.2,0.3]}]}"#,
+        ))
         .await;
 
         let provider = HttpProvider::new(
@@ -215,9 +215,9 @@ mod tests {
 
     #[tokio::test]
     async fn http_provider_health_check_uses_endpoint() {
-        let server = TestServer::spawn(
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 42\r\n\r\n{\"data\":[{\"embedding\":[0.1,0.2,0.3,0.4]}]}",
-        )
+        let server = TestServer::spawn(response_with_json(
+            r#"{"data":[{"embedding":[0.1,0.2,0.3,0.4]}]}"#,
+        ))
         .await;
 
         let provider = HttpProvider::new(
@@ -235,6 +235,14 @@ mod tests {
         let request = server.finish().await;
         assert!(request.contains("authorization: Bearer secret"));
         assert!(request.contains("\"input\":[\"health-check\"]"));
+    }
+
+    fn response_with_json(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        )
     }
 
     #[tokio::test]
@@ -272,7 +280,7 @@ mod tests {
     }
 
     impl TestServer {
-        async fn spawn(response: &'static str) -> Self {
+        async fn spawn(response: String) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").await;
             assert!(listener.is_ok());
             let listener = listener.ok().unwrap_or_else(|| unreachable!());
