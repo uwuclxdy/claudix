@@ -1,7 +1,13 @@
+#[cfg(any(test, feature = "test-stub"))]
+pub mod stub;
+
 use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::types::Dimension;
+
+#[cfg(any(test, feature = "test-stub"))]
+pub use stub::StubProvider;
 
 #[async_trait]
 pub trait Provider: Send + Sync {
