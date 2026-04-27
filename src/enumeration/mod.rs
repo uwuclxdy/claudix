@@ -54,7 +54,11 @@ impl FileEnumerator {
 
     fn enumerate_one(&self, relative_path: RelativePath) -> Result<Option<EnumeratedFile>> {
         let absolute_path = self.resolve_relative_path(&relative_path)?;
-        let metadata = fs::symlink_metadata(&absolute_path)?;
+        let metadata = match fs::symlink_metadata(&absolute_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
 
         if metadata.file_type().is_symlink() && !self.config.indexing.follow_symlinks {
             return Ok(None);
@@ -64,7 +68,11 @@ impl FileEnumerator {
             return Ok(None);
         }
 
-        let contents = fs::read(&absolute_path)?;
+        let contents = match fs::read(&absolute_path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
         let file_hash = hash_bytes(&contents);
         let language = language_for_path(&absolute_path);
 

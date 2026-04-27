@@ -171,7 +171,7 @@ impl fmt::Display for ChunkKind {
 }
 
 /// Fundamental indexable unit of source code.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Chunk {
     pub id: ChunkId,
     pub file_path: RelativePath,

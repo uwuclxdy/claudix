@@ -15,7 +15,7 @@ pub use types::{
     RelativePath,
 };
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +23,8 @@ use chunking::{Chunker, MultiLanguageChunker};
 use config::{Config, EmbeddingProvider};
 use embedding::{BundledProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator};
+use error::RecoveryHint;
+use search::{SearchQuery, SearchResult, Searcher};
 use store::Store;
 use tokio::{fs, task};
 
@@ -57,7 +59,7 @@ impl Claudix {
         self.config.as_ref()
     }
 
-    pub fn project_root(&self) -> &PathBuf {
+    pub fn project_root(&self) -> &Path {
         &self.project_root
     }
 
@@ -77,23 +79,68 @@ impl Claudix {
         })
     }
 
+    pub async fn reindex_file(&self, path: &Path) -> Result<IndexStats> {
+        let relative_path = self.relative_path_from_input(path)?;
+        let files = FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?
+            .enumerate()?;
+
+        let Some(file) = files
+            .into_iter()
+            .find(|file| file.relative_path == relative_path)
+        else {
+            let stats = self
+                .store
+                .delete_file_chunks(&relative_path, self.config.as_ref())
+                .await?;
+            return Ok(IndexStats {
+                file_count: stats.file_count,
+                chunk_count: stats.chunk_count,
+            });
+        };
+
+        let chunks = self.collect_file_chunks(&file).await?;
+        let embedded_chunks = self.embed_chunks(chunks).await?;
+        let stats = self
+            .store
+            .replace_file_chunks(&embedded_chunks, self.config.as_ref())
+            .await?;
+
+        Ok(IndexStats {
+            file_count: stats.file_count,
+            chunk_count: stats.chunk_count,
+        })
+    }
+
+    pub async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
+        let searcher = Searcher::new(
+            self.store.clone(),
+            Arc::clone(&self.embedder),
+            self.config.search.clone(),
+        );
+        searcher.search(query).await
+    }
+
     async fn collect_chunks(&self, files: &[EnumeratedFile]) -> Result<Vec<Chunk>> {
         let mut chunks = Vec::new();
 
         for file in files {
-            let content = fs::read_to_string(&file.absolute_path).await?;
-            let path = file.relative_path.clone();
-            let language = file.language;
-            let file_hash = file.file_hash;
-            let file_chunks = task::spawn_blocking(move || {
-                MultiLanguageChunker::new().chunk(&path, language, file_hash, &content)
-            })
-            .await
-            .map_err(|error| ClaudixError::TreeSitter(error.to_string()))??;
-            chunks.extend(file_chunks);
+            chunks.extend(self.collect_file_chunks(file).await?);
         }
 
         Ok(chunks)
+    }
+
+    async fn collect_file_chunks(&self, file: &EnumeratedFile) -> Result<Vec<Chunk>> {
+        let content = fs::read_to_string(&file.absolute_path).await?;
+        let path = file.relative_path.clone();
+        let language = file.language;
+        let file_hash = file.file_hash;
+
+        task::spawn_blocking(move || {
+            MultiLanguageChunker::new().chunk(&path, language, file_hash, &content)
+        })
+        .await
+        .map_err(|error| ClaudixError::TreeSitter(error.to_string()))?
     }
 
     async fn embed_chunks(&self, chunks: Vec<Chunk>) -> Result<Vec<EmbeddedChunk>> {
@@ -122,7 +169,7 @@ impl Claudix {
                     return Err(ClaudixError::DimensionMismatch {
                         store_dim: expected_dimensions.0,
                         model_dim: actual_dimensions,
-                        recovery: error::RecoveryHint(
+                        recovery: RecoveryHint(
                             "Reindex the project after aligning embedding dimensions with the active model",
                         ),
                     });
@@ -133,6 +180,22 @@ impl Claudix {
         }
 
         Ok(embedded_chunks)
+    }
+
+    fn relative_path_from_input(&self, path: &Path) -> Result<RelativePath> {
+        if path.is_absolute() {
+            let relative =
+                path.strip_prefix(&self.project_root)
+                    .map_err(|_| ClaudixError::PathTraversal {
+                        path: path.to_path_buf(),
+                        recovery: RecoveryHint("Only reindex files inside $CLAUDE_PROJECT_DIR"),
+                    })?;
+            reject_relative_escape(relative)?;
+            return Ok(RelativePath::from_path(relative));
+        }
+
+        reject_relative_escape(path)?;
+        Ok(RelativePath::from_path(path))
     }
 }
 
@@ -152,6 +215,22 @@ fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
             None,
         )?)),
     }
+}
+
+fn reject_relative_escape(path: &Path) -> Result<()> {
+    for component in path.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(ClaudixError::PathTraversal {
+                path: path.to_path_buf(),
+                recovery: RecoveryHint("Only reindex files inside $CLAUDE_PROJECT_DIR"),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -276,5 +355,83 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(names.contains("salute"));
         assert!(!names.contains("greet"));
+    }
+
+    #[tokio::test]
+    async fn reindex_file_updates_only_target_file() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = test_config();
+
+        let claudix = test_claudix(fixture.root().to_path_buf(), config);
+        assert!(claudix.is_ok());
+        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(claudix.index_full().await.is_ok());
+        assert!(
+            fs::write(
+                fixture.root().join("src/math.rs"),
+                "pub fn multiply(left: i32, right: i32) -> i32 {\n    left * right\n}\n",
+            )
+            .await
+            .is_ok()
+        );
+
+        let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
+        assert!(stats.is_ok());
+        assert_eq!(
+            stats.ok().unwrap_or_else(|| unreachable!()),
+            IndexStats {
+                file_count: 2,
+                chunk_count: 3,
+            }
+        );
+
+        let rows = claudix.store.read_chunks().await;
+        assert!(rows.is_ok());
+        let rows = rows.ok().unwrap_or_else(|| unreachable!());
+
+        let names = rows
+            .iter()
+            .filter_map(|row| row.name.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(names.contains("greet"));
+        assert!(names.contains("multiply"));
+        assert!(!names.contains("add"));
+    }
+
+    #[tokio::test]
+    async fn reindex_file_deletes_missing_file_chunks() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = test_config();
+
+        let claudix = test_claudix(fixture.root().to_path_buf(), config);
+        assert!(claudix.is_ok());
+        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(claudix.index_full().await.is_ok());
+        assert!(
+            fs::remove_file(fixture.root().join("src/math.rs"))
+                .await
+                .is_ok()
+        );
+
+        let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
+        assert!(stats.is_ok());
+        assert_eq!(
+            stats.ok().unwrap_or_else(|| unreachable!()),
+            IndexStats {
+                file_count: 1,
+                chunk_count: 2,
+            }
+        );
+
+        let rows = claudix.store.read_chunks().await;
+        assert!(rows.is_ok());
+        let rows = rows.ok().unwrap_or_else(|| unreachable!());
+        assert!(rows.iter().all(|row| row.file_path == "src/lib.rs"));
     }
 }
