@@ -121,6 +121,56 @@ impl Store {
         fs::rename(temp_path, &self.paths.manifest_path)?;
         Ok(())
     }
+
+    pub fn validate_manifest_compatibility(
+        &self,
+        expected_model: &str,
+        expected_dimensions: u16,
+    ) -> Result<Option<Manifest>> {
+        self.read_manifest()?
+            .map(|manifest| {
+                validate_manifest_compatibility(manifest, expected_model, expected_dimensions)
+            })
+            .transpose()
+    }
+}
+
+fn validate_manifest_compatibility(
+    manifest: Manifest,
+    expected_model: &str,
+    expected_dimensions: u16,
+) -> Result<Manifest> {
+    if manifest.schema_version != SCHEMA_VERSION {
+        return Err(ClaudixError::SchemaMismatch {
+            store: manifest.schema_version,
+            binary: SCHEMA_VERSION,
+            recovery: RecoveryHint(
+                "Reindex the project to rebuild the store with the current schema version",
+            ),
+        });
+    }
+
+    if manifest.embedding_model != expected_model {
+        return Err(ClaudixError::EmbeddingModelMismatch {
+            store_model: manifest.embedding_model,
+            active_model: expected_model.to_owned(),
+            recovery: RecoveryHint(
+                "Reindex the project after changing the configured embedding model",
+            ),
+        });
+    }
+
+    if manifest.dimensions != expected_dimensions {
+        return Err(ClaudixError::DimensionMismatch {
+            store_dim: manifest.dimensions,
+            model_dim: expected_dimensions,
+            recovery: RecoveryHint(
+                "Reindex the project after changing the configured embedding dimensions",
+            ),
+        });
+    }
+
+    Ok(manifest)
 }
 
 fn resolve_project_path(project_root: &Path, relative_path: &Path) -> Result<PathBuf> {
@@ -164,6 +214,16 @@ fn reject_path_escape(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn manifest_with_schema(
+        schema_version: u32,
+        embedding_model: &str,
+        dimensions: u16,
+    ) -> Manifest {
+        let mut manifest = Manifest::new(embedding_model, dimensions);
+        manifest.schema_version = schema_version;
+        manifest
+    }
 
     #[test]
     fn manifest_new_uses_schema_defaults() {
@@ -273,5 +333,80 @@ mod tests {
 
         let store = Store::new(project_root.path(), &config);
         assert!(matches!(store, Err(ClaudixError::PathTraversal { .. })));
+    }
+
+    #[test]
+    fn manifest_compatibility_accepts_matching_state() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+
+        let store = Store::new(project_root.path(), &Config::default());
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let manifest = Manifest::new("stub-model", 512);
+        assert!(store.write_manifest(&manifest).is_ok());
+
+        let loaded = store.validate_manifest_compatibility("stub-model", 512);
+        assert!(loaded.is_ok());
+        assert_eq!(
+            loaded.ok().unwrap_or_else(|| unreachable!()),
+            Some(manifest)
+        );
+    }
+
+    #[test]
+    fn manifest_compatibility_rejects_schema_mismatch() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+
+        let store = Store::new(project_root.path(), &Config::default());
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let manifest = manifest_with_schema(SCHEMA_VERSION + 1, "stub-model", 512);
+        assert!(store.write_manifest(&manifest).is_ok());
+
+        let error = store.validate_manifest_compatibility("stub-model", 512);
+        assert!(matches!(error, Err(ClaudixError::SchemaMismatch { .. })));
+    }
+
+    #[test]
+    fn manifest_compatibility_rejects_model_mismatch() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+
+        let store = Store::new(project_root.path(), &Config::default());
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let manifest = Manifest::new("old-model", 512);
+        assert!(store.write_manifest(&manifest).is_ok());
+
+        let error = store.validate_manifest_compatibility("new-model", 512);
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingModelMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn manifest_compatibility_rejects_dimension_mismatch() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+
+        let store = Store::new(project_root.path(), &Config::default());
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let manifest = Manifest::new("stub-model", 384);
+        assert!(store.write_manifest(&manifest).is_ok());
+
+        let error = store.validate_manifest_compatibility("stub-model", 512);
+        assert!(matches!(error, Err(ClaudixError::DimensionMismatch { .. })));
     }
 }

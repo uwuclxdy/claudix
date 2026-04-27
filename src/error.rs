@@ -40,9 +40,36 @@ pub enum ClaudixError {
         recovery: RecoveryHint,
     },
 
+    #[error("embedding model mismatch: store={store_model}, active={active_model}")]
+    EmbeddingModelMismatch {
+        store_model: String,
+        active_model: String,
+        recovery: RecoveryHint,
+    },
+
     #[error("path traversal: {path:?} is outside project root")]
     PathTraversal {
         path: PathBuf,
+        recovery: RecoveryHint,
+    },
+
+    #[error("bundled assets missing for model {model_id}")]
+    BundledAssetsMissing {
+        model_id: String,
+        recovery: RecoveryHint,
+    },
+
+    #[error("bundled download confirmation required for model {model_id}")]
+    BundledDownloadConfirmationRequired {
+        model_id: String,
+        recovery: RecoveryHint,
+    },
+
+    #[error("sha256 mismatch for bundled asset {asset}")]
+    BundledAssetChecksumMismatch {
+        asset: String,
+        expected_sha256: String,
+        actual_sha256: String,
         recovery: RecoveryHint,
     },
 
@@ -81,7 +108,11 @@ impl ClaudixError {
             Self::EmbeddingUnreachable { recovery, .. } => Some(recovery.0),
             Self::SchemaMismatch { recovery, .. } => Some(recovery.0),
             Self::DimensionMismatch { recovery, .. } => Some(recovery.0),
+            Self::EmbeddingModelMismatch { recovery, .. } => Some(recovery.0),
             Self::PathTraversal { recovery, .. } => Some(recovery.0),
+            Self::BundledAssetsMissing { recovery, .. } => Some(recovery.0),
+            Self::BundledDownloadConfirmationRequired { recovery, .. } => Some(recovery.0),
+            Self::BundledAssetChecksumMismatch { recovery, .. } => Some(recovery.0),
             _ => None,
         }
     }

@@ -1,3 +1,4 @@
+pub mod bundled;
 pub mod http;
 #[cfg(any(test, feature = "test-stub"))]
 pub mod stub;
@@ -7,6 +8,7 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::types::Dimension;
 
+pub use bundled::BundledProvider;
 pub use http::HttpProvider;
 #[cfg(any(test, feature = "test-stub"))]
 pub use stub::StubProvider;

@@ -15,6 +15,32 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    if matches!(config.embedding.provider, EmbeddingProvider::Bundled)
+        && config.embedding.model != crate::embedding::bundled::BUNDLED_MODEL_ID
+    {
+        return Err(ClaudixError::ConfigInvalid {
+            message: format!(
+                "embedding.model must be {} when embedding.provider = \"bundled\"",
+                crate::embedding::bundled::BUNDLED_MODEL_ID
+            ),
+            recovery: RecoveryHint(
+                "Set [embedding].model = \"bge-small-en-v1.5\" for the bundled provider",
+            ),
+        });
+    }
+
+    if matches!(config.embedding.provider, EmbeddingProvider::Bundled)
+        && config.embedding.dimensions != crate::embedding::bundled::BUNDLED_DIMENSIONS.0
+    {
+        return Err(ClaudixError::ConfigInvalid {
+            message: format!(
+                "embedding.dimensions must be {} when embedding.provider = \"bundled\"",
+                crate::embedding::bundled::BUNDLED_DIMENSIONS.0
+            ),
+            recovery: RecoveryHint("Set [embedding].dimensions = 384 for the bundled provider"),
+        });
+    }
+
     if config.embedding.dimensions == 0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "embedding.dimensions must be > 0".into(),

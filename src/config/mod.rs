@@ -78,8 +78,8 @@ impl Default for Config {
             embedding: EmbeddingConfig {
                 provider: EmbeddingProvider::Bundled,
                 endpoint: String::new(),
-                model: "jina-embeddings-v2-small-en".into(),
-                dimensions: 512,
+                model: "bge-small-en-v1.5".into(),
+                dimensions: 384,
                 batch_size: 32,
                 timeout_ms: 30_000,
             },
