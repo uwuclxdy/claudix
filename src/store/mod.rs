@@ -16,6 +16,7 @@ use lancedb::{Connection, Table};
 use crate::config::Config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::types::{Dimension, EmbeddedChunk, RelativePath};
+use crate::util::now_rfc3339;
 
 pub const SCHEMA_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -230,7 +231,7 @@ impl Store {
 
         let stats = stats_from_rows(&merged_rows);
         self.persist_rows(merged_rows, dimension).await?;
-        self.sync_manifest(config, &stats)?;
+        self.sync_manifest_with_timestamp(config, &stats, false)?;
         Ok(stats)
     }
 
@@ -250,7 +251,7 @@ impl Store {
 
         let stats = stats_from_rows(&remaining_rows);
         self.persist_rows(remaining_rows, dimension).await?;
-        self.sync_manifest(config, &stats)?;
+        self.sync_manifest_with_timestamp(config, &stats, false)?;
         Ok(stats)
     }
 
@@ -267,6 +268,7 @@ impl Store {
             .unwrap_or_else(|| Manifest::new(&config.embedding.model, config.embedding.dimensions));
         manifest.chunk_count = 0;
         manifest.file_count = 0;
+        manifest.last_incremental_at = Some(now_rfc3339());
         self.write_manifest(&manifest)
     }
 
@@ -323,13 +325,27 @@ impl Store {
     }
 
     fn sync_manifest(&self, config: &Config, stats: &StoreStats) -> Result<()> {
+        self.sync_manifest_with_timestamp(config, stats, true)
+    }
+
+    fn sync_manifest_with_timestamp(
+        &self,
+        config: &Config,
+        stats: &StoreStats,
+        full_index: bool,
+    ) -> Result<()> {
         let mut manifest = self
             .read_manifest()?
             .unwrap_or_else(|| Manifest::new(&config.embedding.model, config.embedding.dimensions));
+        let timestamp = now_rfc3339();
         manifest.embedding_model = config.embedding.model.clone();
         manifest.dimensions = config.embedding.dimensions;
         manifest.chunk_count = u64::try_from(stats.chunk_count).unwrap_or(u64::MAX);
         manifest.file_count = u64::try_from(stats.file_count).unwrap_or(u64::MAX);
+        manifest.last_incremental_at = Some(timestamp.clone());
+        if full_index {
+            manifest.last_full_index_at = Some(timestamp);
+        }
         self.write_manifest(&manifest)
     }
 }
@@ -944,6 +960,67 @@ mod tests {
         let manifest = manifest.unwrap_or_else(|| unreachable!());
         assert_eq!(manifest.chunk_count, 2);
         assert_eq!(manifest.file_count, 1);
+        assert!(manifest.last_full_index_at.is_some());
+        assert_eq!(manifest.last_full_index_at, manifest.last_incremental_at);
+    }
+
+    #[tokio::test]
+    async fn incremental_updates_refresh_only_incremental_timestamp() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+
+        let store = Store::new(project_root.path(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let initial = vec![sample_chunk(
+            1,
+            "src/lib.rs",
+            "alpha",
+            "pub fn alpha() {}",
+            &[1.0; 384],
+        )];
+        assert!(store.replace_chunks(&initial, &config).await.is_ok());
+
+        let manifest = store.read_manifest();
+        assert!(manifest.is_ok());
+        let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
+        assert!(manifest.is_some());
+        let manifest = manifest.unwrap_or_else(|| unreachable!());
+        let original_full = manifest.last_full_index_at.clone();
+        assert!(original_full.is_some());
+
+        let mut seed_manifest = manifest.clone();
+        seed_manifest.last_incremental_at = Some("2026-04-26T00:00:00Z".to_owned());
+        assert!(store.write_manifest(&seed_manifest).is_ok());
+
+        let replacement = vec![sample_chunk(
+            2,
+            "src/lib.rs",
+            "beta",
+            "pub fn beta() {}",
+            &[2.0; 384],
+        )];
+        assert!(
+            store
+                .replace_file_chunks(&replacement, &config)
+                .await
+                .is_ok()
+        );
+
+        let manifest = store.read_manifest();
+        assert!(manifest.is_ok());
+        let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
+        assert!(manifest.is_some());
+        let manifest = manifest.unwrap_or_else(|| unreachable!());
+        assert_eq!(manifest.last_full_index_at, original_full);
+        assert_ne!(
+            manifest.last_incremental_at,
+            Some("2026-04-26T00:00:00Z".to_owned())
+        );
+        assert!(manifest.last_incremental_at.is_some());
     }
 
     #[tokio::test]

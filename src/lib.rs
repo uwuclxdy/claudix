@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod search;
 pub mod store;
 pub mod types;
+pub mod util;
 
 pub use error::{ClaudixError, Result};
 pub use types::{
