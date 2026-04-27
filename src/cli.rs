@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
+use tokio::fs;
 
 use crate::Claudix;
 use crate::config;
@@ -59,6 +60,13 @@ pub struct DoctorOutput {
     pub dimensions: Option<u16>,
     pub embedding_provider: String,
     pub embedding_healthy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InstallOutput {
+    pub binary_path: String,
+    pub config_path: String,
+    pub wrote_config: bool,
 }
 
 pub async fn run_search(
@@ -145,6 +153,27 @@ pub async fn run_clear_index(project_root: impl AsRef<Path>) -> Result<ClearOutp
     Ok(ClearOutput { cleared: true })
 }
 
+pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput> {
+    let project_root = canonical_project_root(project_root.as_ref())?;
+    let plugin_root = plugin_root()?;
+    let binary_path = plugin_root.join("bin").join(binary_name());
+    let config_path = global_config_path()?;
+
+    if let Some(parent) = binary_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    copy_current_exe(&binary_path).await?;
+
+    let wrote_config = ensure_global_config(&config_path).await?;
+
+    let _ = project_root;
+    Ok(InstallOutput {
+        binary_path: binary_path.display().to_string(),
+        config_path: config_path.display().to_string(),
+        wrote_config,
+    })
+}
+
 pub fn parse_hook_event(value: &str) -> Result<HookEvent> {
     match value {
         "SessionStart" => Ok(HookEvent::SessionStart),
@@ -209,6 +238,65 @@ async fn status_from_store(store: &Store) -> Result<StatusOutput> {
     })
 }
 
+async fn copy_current_exe(destination: &Path) -> Result<()> {
+    let source = std::env::current_exe().map_err(ClaudixError::from)?;
+    fs::copy(&source, destination).await?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(destination).await?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(destination, permissions).await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_global_config(config_path: &Path) -> Result<bool> {
+    if fs::try_exists(config_path).await? {
+        return Ok(false);
+    }
+
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    fs::write(config_path, default_global_config()).await?;
+    Ok(true)
+}
+
+fn default_global_config() -> &'static str {
+    "# Global claudix configuration\n# Uncomment and edit values as needed.\n\n[embedding]\n# provider = \"bundled\"\n# model = \"bge-small-en-v1.5\"\n# dimensions = 384\n# endpoint = \"http://localhost:11434\"\n\n[indexing]\n# reindex_after_hours = 24\n"
+}
+
+fn plugin_root() -> Result<PathBuf> {
+    std::env::var_os("CLAUDE_PLUGIN_ROOT")
+        .map(PathBuf::from)
+        .ok_or_else(|| ClaudixError::ConfigInvalid {
+            message: "CLAUDE_PLUGIN_ROOT is not set".into(),
+            recovery: RecoveryHint("Run claudix install from the plugin environment"),
+        })
+}
+
+fn global_config_path() -> Result<PathBuf> {
+    dirs::home_dir()
+        .map(|home| home.join(".claude").join("claudix.toml"))
+        .ok_or_else(|| ClaudixError::ConfigInvalid {
+            message: "home directory is not available".into(),
+            recovery: RecoveryHint("Set HOME before running claudix install"),
+        })
+}
+
+fn binary_name() -> &'static str {
+    if cfg!(windows) {
+        "claudix.exe"
+    } else {
+        "claudix"
+    }
+}
+
 fn canonical_project_root(project_root: &Path) -> Result<PathBuf> {
     project_root.canonicalize().map_err(ClaudixError::from)
 }
@@ -255,6 +343,7 @@ mod tests {
     use crate::enumeration::FileEnumerator;
     use crate::store::Store;
     use crate::types::{Dimension, EmbeddedChunk};
+    use tempfile::tempdir;
     use tokio::{fs, task};
 
     mod fixture {
@@ -458,5 +547,42 @@ mod tests {
         assert_eq!(output.model.as_deref(), Some("stub-v1"));
         assert_eq!(output.embedding_provider, "bundled");
         assert!(output.embedding_healthy);
+    }
+
+    #[tokio::test]
+    async fn ensure_global_config_writes_default_once() {
+        let temp = tempdir();
+        assert!(temp.is_ok());
+        let temp = temp.ok().unwrap_or_else(|| unreachable!());
+        let config_path = temp.path().join(".claude").join("claudix.toml");
+
+        let wrote_config = ensure_global_config(&config_path).await;
+        assert!(wrote_config.is_ok());
+        assert!(wrote_config.ok().unwrap_or(false));
+
+        let contents = fs::read_to_string(&config_path).await;
+        assert!(contents.is_ok());
+        assert!(contents.ok().unwrap_or_default().contains("[embedding]"));
+
+        let wrote_config = ensure_global_config(&config_path).await;
+        assert!(wrote_config.is_ok());
+        assert!(!wrote_config.ok().unwrap_or(true));
+    }
+
+    #[test]
+    fn default_global_config_includes_commented_defaults() {
+        let config = default_global_config();
+        assert!(config.contains("[embedding]"));
+        assert!(config.contains("provider = \"bundled\""));
+        assert!(config.contains("reindex_after_hours = 24"));
+    }
+
+    #[test]
+    fn binary_name_matches_platform() {
+        if cfg!(windows) {
+            assert_eq!(binary_name(), "claudix.exe");
+        } else {
+            assert_eq!(binary_name(), "claudix");
+        }
     }
 }

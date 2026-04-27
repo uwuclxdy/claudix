@@ -148,7 +148,10 @@ async fn main() -> Result<()> {
             println!("embedding_healthy: {}", output.embedding_healthy);
         }
         Command::Install => {
-            println!("install not implemented");
+            let output = cli::run_install(&project_root).await?;
+            println!("binary_path: {}", output.binary_path);
+            println!("config_path: {}", output.config_path);
+            println!("wrote_config: {}", output.wrote_config);
         }
         Command::Mcp => {
             mcp::run(&project_root).await?;
