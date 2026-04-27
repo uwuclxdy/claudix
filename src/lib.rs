@@ -1,4 +1,5 @@
 pub mod chunking;
+pub mod cli;
 pub mod config;
 pub mod embedding;
 pub mod enumeration;
@@ -21,6 +22,8 @@ use std::time::Duration;
 
 use chunking::{Chunker, MultiLanguageChunker};
 use config::{Config, EmbeddingProvider};
+#[cfg(feature = "test-stub")]
+use embedding::StubProvider;
 use embedding::{BundledProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator};
 use error::RecoveryHint;
@@ -201,6 +204,14 @@ impl Claudix {
 
 fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
     let dimensions = Dimension(config.embedding.dimensions);
+
+    #[cfg(feature = "test-stub")]
+    if config.embedding.model.starts_with("stub") {
+        return Ok(Arc::new(StubProvider::with_model_id(
+            config.embedding.model.clone(),
+            dimensions,
+        )));
+    }
 
     match config.embedding.provider {
         EmbeddingProvider::Bundled => Ok(Arc::new(BundledProvider::new(

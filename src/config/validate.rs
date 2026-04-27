@@ -6,6 +6,10 @@ pub fn validate(config: &Config) -> Result<()> {
     validate_project_relative_path(&config.paths.index_dir, "paths.index_dir")?;
     validate_project_relative_path(&config.paths.log_dir, "paths.log_dir")?;
 
+    if allow_stub_embedding_model(config) {
+        return Ok(());
+    }
+
     if matches!(config.embedding.provider, EmbeddingProvider::Http)
         && config.embedding.endpoint.trim().is_empty()
     {
@@ -70,4 +74,14 @@ pub fn validate(config: &Config) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(feature = "test-stub")]
+fn allow_stub_embedding_model(config: &Config) -> bool {
+    config.embedding.model.starts_with("stub")
+}
+
+#[cfg(not(feature = "test-stub"))]
+fn allow_stub_embedding_model(_config: &Config) -> bool {
+    false
 }
