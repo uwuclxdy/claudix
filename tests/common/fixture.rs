@@ -5,7 +5,7 @@ use std::process::Command;
 use tempfile::TempDir;
 
 pub struct TestFixture {
-    tempdir: TempDir,
+    _tempdir: TempDir,
     root: PathBuf,
 }
 
@@ -17,15 +17,14 @@ impl TestFixture {
         copy_dir_recursive(&source, &root)?;
         init_git_repo(&root)?;
 
-        Ok(Self { tempdir, root })
+        Ok(Self {
+            _tempdir: tempdir,
+            root,
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    pub fn tempdir_path(&self) -> &Path {
-        self.tempdir.path()
     }
 }
 
