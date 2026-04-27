@@ -42,9 +42,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # LanceDB for storage and FTS
 lancedb = "0.14"
-arrow = { version = "54", features = ["prettyprint"] }
-arrow-array = "54"
-arrow-schema = "54"
+arrow = { version = "53", features = ["prettyprint"] }
+arrow-array = "53"
+arrow-schema = "53"
 
 # Tree-sitter for chunking
 tree-sitter = "0.25"
