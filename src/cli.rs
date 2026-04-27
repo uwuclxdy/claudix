@@ -49,6 +49,18 @@ pub struct StatusOutput {
     pub last_incremental_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DoctorOutput {
+    pub project_root: String,
+    pub index_present: bool,
+    pub chunk_count: usize,
+    pub file_count: usize,
+    pub model: Option<String>,
+    pub dimensions: Option<u16>,
+    pub embedding_provider: String,
+    pub embedding_healthy: bool,
+}
+
 pub async fn run_search(
     project_root: impl AsRef<Path>,
     query: String,
@@ -95,6 +107,32 @@ pub async fn run_reindex_file(
     Ok(IndexOutput {
         file_count: stats.file_count,
         chunk_count: stats.chunk_count,
+    })
+}
+
+pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> {
+    let project_root = canonical_project_root(project_root.as_ref())?;
+    let config = config::load(&project_root)?;
+    let store = Store::new(&project_root, &config)?;
+    let status = status_from_store(&store).await?;
+    let claudix = Claudix::new(project_root.clone(), Arc::new(config.clone())).await;
+    let embedding_healthy = match claudix {
+        Ok(claudix) => claudix.embedder_health_check().await.is_ok(),
+        Err(_) => false,
+    };
+
+    Ok(DoctorOutput {
+        project_root: project_root.display().to_string(),
+        index_present: status.chunk_count > 0 || status.model.is_some(),
+        chunk_count: status.chunk_count,
+        file_count: status.file_count,
+        model: status.model,
+        dimensions: status.dimensions,
+        embedding_provider: match config.embedding.provider {
+            config::EmbeddingProvider::Bundled => "bundled".to_owned(),
+            config::EmbeddingProvider::Http => "http".to_owned(),
+        },
+        embedding_healthy,
     })
 }
 
@@ -388,5 +426,37 @@ mod tests {
         assert_eq!(status.file_count, 2);
         assert_eq!(status.model.as_deref(), Some("stub-v1"));
         assert_eq!(status.dimensions, Some(8));
+    }
+
+    #[tokio::test]
+    async fn run_doctor_reports_index_and_embedding_health() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let mut config = test_config();
+        config.hooks.session_start_warmup = false;
+        let claude_dir = harness.claudix.project_root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        let config_text = toml::to_string(&config);
+        assert!(config_text.is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                config_text.ok().unwrap_or_default(),
+            )
+            .is_ok()
+        );
+
+        let output = run_doctor(harness.claudix.project_root()).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(output.index_present);
+        assert_eq!(output.chunk_count, 3);
+        assert_eq!(output.file_count, 2);
+        assert_eq!(output.model.as_deref(), Some("stub-v1"));
+        assert_eq!(output.embedding_provider, "bundled");
+        assert!(output.embedding_healthy);
     }
 }

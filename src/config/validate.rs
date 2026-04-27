@@ -76,12 +76,12 @@ pub fn validate(config: &Config) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "test-stub")]
+#[cfg(any(test, feature = "test-stub"))]
 fn allow_stub_embedding_model(config: &Config) -> bool {
     config.embedding.model.starts_with("stub")
 }
 
-#[cfg(not(feature = "test-stub"))]
+#[cfg(not(any(test, feature = "test-stub")))]
 fn allow_stub_embedding_model(_config: &Config) -> bool {
     false
 }

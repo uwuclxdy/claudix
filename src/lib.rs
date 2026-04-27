@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use chunking::{Chunker, MultiLanguageChunker};
 use config::{Config, EmbeddingProvider};
-#[cfg(feature = "test-stub")]
+#[cfg(any(test, feature = "test-stub"))]
 use embedding::StubProvider;
 use embedding::{BundledProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator};
@@ -124,6 +124,10 @@ impl Claudix {
         searcher.search(query).await
     }
 
+    pub async fn embedder_health_check(&self) -> Result<()> {
+        self.embedder.health_check().await
+    }
+
     async fn collect_chunks(&self, files: &[EnumeratedFile]) -> Result<Vec<Chunk>> {
         let mut chunks = Vec::new();
 
@@ -206,7 +210,7 @@ impl Claudix {
 fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
     let dimensions = Dimension(config.embedding.dimensions);
 
-    #[cfg(feature = "test-stub")]
+    #[cfg(any(test, feature = "test-stub"))]
     if config.embedding.model.starts_with("stub") {
         return Ok(Arc::new(StubProvider::with_model_id(
             config.embedding.model.clone(),
