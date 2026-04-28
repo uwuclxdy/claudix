@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn format_and_parse_round_trip() {
-        let timestamp = UNIX_EPOCH + Duration::from_secs(1_745_760_000);
+        let timestamp = UNIX_EPOCH + Duration::from_secs(1_746_057_600);
         let formatted = format_rfc3339(timestamp);
         assert_eq!(formatted, "2025-05-01T00:00:00Z");
 

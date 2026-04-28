@@ -1,3 +1,8 @@
 {
-  "name": "claudix"
+  "name": "claudix",
+  "version": "0.1.0",
+  "description": "Local semantic search plugin for Claude Code",
+  "author": {
+    "name": "cloudy"
+  }
 }
