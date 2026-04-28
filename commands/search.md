@@ -1,6 +1,6 @@
 ---
 description: Search code semantically with claudix.
-argument-hint: <query> [--top-k N] [--lang rust,python]
+argument-hint: <query> [--top-k N] [--language rust --language python]
 allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/claudix:*)
 ---
 
