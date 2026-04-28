@@ -9,7 +9,7 @@ use crate::cli;
 use crate::error::{ClaudixError, RecoveryHint, Result};
 
 const JSONRPC_VERSION: &str = "2.0";
-const PROTOCOL_VERSION: &str = "2025-11-25";
+const PROTOCOL_VERSION: &str = "2024-11-05";
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SearchCodeRequest {
@@ -114,7 +114,7 @@ async fn handle_line(project_root: &Path, line: &str) -> Result<Option<Value>> {
 
     let id = request.id.clone();
     let response = match request.method.as_str() {
-        "initialize" => success_response(id, initialize_result()),
+        "initialize" => success_response(id, initialize_result(&request.params)),
         "tools/list" => success_response(id, tools_list_result()),
         "tools/call" => handle_tools_call(project_root, id, request.params).await?,
         _ => error_response(
@@ -181,6 +181,12 @@ async fn search_code(project_root: &Path, arguments: Value) -> Result<Value> {
         "search_code",
         "Pass query plus optional top_k, language_filter, and path_prefix",
     )?;
+    if request.query.trim().is_empty() {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "query cannot be empty".to_owned(),
+            recovery: RecoveryHint("Pass a non-empty query string to search_code"),
+        });
+    }
     let output = cli::run_search(
         project_root,
         request.query,
@@ -247,7 +253,7 @@ where
     })
 }
 
-fn initialize_result() -> Value {
+fn initialize_result(_params: &Value) -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {
@@ -397,7 +403,7 @@ mod tests {
 
     #[test]
     fn initialize_result_advertises_server_info() {
-        let result = initialize_result();
+        let result = initialize_result(&Value::Null);
 
         assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
         assert_eq!(result["serverInfo"]["name"], env!("CARGO_PKG_NAME"));

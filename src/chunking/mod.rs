@@ -15,12 +15,34 @@ pub trait Chunker {
     ) -> Result<Vec<Chunk>>;
 }
 
-#[derive(Debug, Default)]
-pub struct MultiLanguageChunker;
+const DEFAULT_CHUNK_LINES: usize = 60;
+const DEFAULT_OVERLAP_LINES: usize = 5;
+
+#[derive(Debug)]
+pub struct MultiLanguageChunker {
+    fallback_chunk_lines: usize,
+    fallback_overlap_lines: usize,
+}
+
+impl Default for MultiLanguageChunker {
+    fn default() -> Self {
+        Self {
+            fallback_chunk_lines: DEFAULT_CHUNK_LINES,
+            fallback_overlap_lines: DEFAULT_OVERLAP_LINES,
+        }
+    }
+}
 
 impl MultiLanguageChunker {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    pub fn with_fallback_params(chunk_lines: usize, overlap_lines: usize) -> Self {
+        Self {
+            fallback_chunk_lines: chunk_lines,
+            fallback_overlap_lines: overlap_lines,
+        }
     }
 }
 
@@ -39,9 +61,15 @@ impl Chunker for MultiLanguageChunker {
                 chunk_typescript(path, language, file_hash, content)
             }
             Language::Go => chunk_go(path, file_hash, content),
-            // Java, C, Cpp, Unknown: no chunker yet; return empty rather than
-            // producing noisy sliding-window chunks for unrecognised file types.
-            _ => Ok(Vec::new()),
+            Language::Java | Language::C | Language::Cpp => chunk_fallback(
+                path,
+                language,
+                file_hash,
+                content,
+                self.fallback_chunk_lines,
+                self.fallback_overlap_lines,
+            ),
+            Language::Unknown => Ok(Vec::new()),
         }
     }
 }
@@ -921,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn non_rust_languages_now_return_chunks() {
+    fn python_chunker_returns_function_chunk() {
         let chunker = MultiLanguageChunker::new();
         let source = "def greet(name):\n    return f'hello {name}'\n";
 
@@ -935,8 +963,71 @@ mod tests {
             .ok()
             .unwrap_or_else(|| unreachable!());
 
-        // Python chunker is now implemented — should find the function.
         assert!(!chunks.is_empty());
         assert_eq!(chunks[0].kind, ChunkKind::Function);
+    }
+
+    #[test]
+    fn unknown_language_returns_empty() {
+        let chunker = MultiLanguageChunker::new();
+        let source = "some text\n";
+
+        let chunks = chunker
+            .chunk(
+                &RelativePath::new("data.txt"),
+                Language::Unknown,
+                hash_for(source),
+                source,
+            )
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+
+        assert!(
+            chunks.is_empty(),
+            "Unknown language should return empty (config files etc.)"
+        );
+    }
+
+    #[test]
+    fn java_language_falls_back_to_sliding_window() {
+        let chunker = MultiLanguageChunker::new();
+        let source = "public class Hello {\n    public static void main(String[] args) {\n        System.out.println(\"Hello\");\n    }\n}\n";
+
+        let chunks = chunker
+            .chunk(
+                &RelativePath::new("Hello.java"),
+                Language::Java,
+                hash_for(source),
+                source,
+            )
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+
+        assert!(
+            !chunks.is_empty(),
+            "Java should fall back to sliding-window chunker"
+        );
+        assert_eq!(chunks[0].kind, ChunkKind::Other);
+    }
+
+    #[test]
+    fn c_language_falls_back_to_sliding_window() {
+        let chunker = MultiLanguageChunker::new();
+        let source = "int add(int a, int b) { return a + b; }\n";
+
+        let chunks = chunker
+            .chunk(
+                &RelativePath::new("math.c"),
+                Language::C,
+                hash_for(source),
+                source,
+            )
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+
+        assert!(
+            !chunks.is_empty(),
+            "C should fall back to sliding-window chunker"
+        );
     }
 }

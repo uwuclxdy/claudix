@@ -17,26 +17,41 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(about = "Index or re-index the current repository")]
     Index,
+    #[command(about = "Search indexed code semantically")]
     Search {
+        #[arg(help = "Natural-language or identifier query")]
         query: String,
-        #[arg(long)]
+        #[arg(long, help = "Maximum results to return (default: from config)")]
         top_k: Option<usize>,
-        #[arg(long = "language")]
+        #[arg(
+            long = "language",
+            help = "Filter by language (rust, python, go, …); repeatable"
+        )]
         language_filter: Vec<String>,
-        #[arg(long)]
+        #[arg(long, help = "Restrict results to paths starting with this prefix")]
         path_prefix: Option<String>,
     },
+    #[command(about = "Show index status (chunk count, model, last indexed)")]
     Status,
+    #[command(about = "Re-embed a single file after editing")]
     ReindexFile {
+        #[arg(help = "Path to the file, relative or absolute inside the project")]
         path: String,
     },
+    #[command(about = "Drop the entire index dataset")]
     Clear,
+    #[command(about = "Handle a Claude Code hook event (SessionStart | PostToolUse | PreToolUse)")]
     Hook {
+        #[arg(help = "Hook event name from Claude Code")]
         event: String,
     },
+    #[command(about = "Diagnose binary, index, and embedding health")]
     Doctor,
+    #[command(about = "Bootstrap plugin files and download the bundled embedding model")]
     Install,
+    #[command(about = "Run as an MCP server over stdio (invoked by Claude Code)")]
     Mcp,
 }
 
@@ -128,17 +143,19 @@ async fn main() -> Result<()> {
             let output = cli::run_clear_index(&project_root).await?;
             println!("cleared: {}", output.cleared);
         }
-        Command::Hook { event } => {
-            let event = cli::parse_hook_event(&event)?;
-            run_hook_command(&project_root, event).await;
-        }
+        Command::Hook { event } => match cli::parse_hook_event(&event) {
+            Ok(event) => run_hook_command(&project_root, event).await,
+            Err(_) => {
+                eprintln!("claudix: unknown hook event '{event}', ignoring (fail-open)");
+            }
+        },
         Command::Doctor => {
             let output = cli::run_doctor(&project_root).await?;
             println!("project_root: {}", output.project_root);
             println!("index_present: {}", output.index_present);
             println!("chunks: {}", output.chunk_count);
             println!("files: {}", output.file_count);
-            if let Some(model) = output.model {
+            if let Some(model) = &output.model {
                 println!("model: {model}");
             }
             if let Some(dimensions) = output.dimensions {
@@ -146,6 +163,16 @@ async fn main() -> Result<()> {
             }
             println!("embedding_provider: {}", output.embedding_provider);
             println!("embedding_healthy: {}", output.embedding_healthy);
+
+            if !output.embedding_healthy {
+                eprintln!(
+                    "\nembedding not ready — run `claudix install` to download the bundled model,\n\
+                     or set [embedding] provider = \"http\" in ~/.claude/claudix.toml to use LM Studio/Ollama."
+                );
+            }
+            if !output.index_present {
+                eprintln!("\nindex not built — run `claudix index` to index the repository.");
+            }
         }
         Command::Install => {
             let output = cli::run_install(&project_root).await?;

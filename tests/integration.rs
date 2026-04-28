@@ -340,11 +340,8 @@ fn hook_exits_zero_with_corrupt_manifest() {
     let mkdir = std::fs::create_dir_all(root.join(".claudix/index"));
     assert!(mkdir.is_ok(), "create index dir failed");
 
-    // Manifest lives at <index_dir>/manifest.json (default: .claudix/index/manifest.json)
-    let write_manifest = std::fs::write(
-        root.join(".claudix/index/manifest.json"),
-        "not valid json {{{{",
-    );
+    // Manifest lives at <state_dir>/manifest.json (default: .claudix/manifest.json)
+    let write_manifest = std::fs::write(root.join(".claudix/manifest.json"), "not valid json {{{{");
     assert!(write_manifest.is_ok(), "write corrupt manifest failed");
 
     let output = Command::new(cargo_bin("claudix"))
