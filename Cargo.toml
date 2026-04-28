@@ -9,6 +9,11 @@ license = "MIT"
 name = "claudix"
 path = "src/main.rs"
 
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["test-stub"]
+
 [lib]
 name = "claudix"
 path = "src/lib.rs"
