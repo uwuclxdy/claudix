@@ -29,6 +29,8 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
 }
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
+    let pending_update = consume_pending_restart().await;
+
     let config = config::load(project_root)?;
     let store = Store::new(project_root, &config)?;
     let manifest = store.read_manifest()?;
@@ -70,7 +72,11 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         }
     }
 
-    Ok(Some(session_start_response(notes.join(". "))))
+    let mut response = session_start_response(notes.join(". "));
+    if let Some(msg) = pending_update {
+        response["systemMessage"] = Value::String(msg);
+    }
+    Ok(Some(response))
 }
 
 async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Result<Option<Value>> {
@@ -136,6 +142,29 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
         stats.chunk_count,
         stats.file_count,
     )))
+}
+
+async fn consume_pending_restart() -> Option<String> {
+    let data_dir = pending_restart_path()?;
+    let content = tokio::fs::read_to_string(&data_dir).await.ok()?;
+    let version = content.trim();
+    if version.is_empty() {
+        return None;
+    }
+    let msg = format!("claudix updated to v{version} — restart Claude Code to activate");
+    let _ = tokio::fs::remove_file(&data_dir).await;
+    Some(msg)
+}
+
+fn pending_restart_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("CLAUDIX_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(|p| std::path::PathBuf::from(p).join("claudix"))
+        })
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share").join("claudix")))?;
+    Some(base.join("pending-restart"))
 }
 
 fn session_start_response(additional_context: String) -> Value {
