@@ -178,10 +178,6 @@ acquire_lock() {
   done
   printf '%s\n' "$$" > "$pid_file"
   trap 'rm -rf "${TEMP_DIR:-}" "$pid_file"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
-  # Purge orphaned temp dirs from previously interrupted downloads
-  for stale in "${STABLE_DIR}"/download.*; do
-    [[ -d "$stale" ]] && rm -rf "$stale" 2>/dev/null || true
-  done
 }
 
 try_cargo() {
@@ -278,6 +274,19 @@ do_update() {
   acquire_lock
   install_from_release "$platform" "$latest" >/dev/null
 }
+
+# Unconditional startup cleanup — runs on every invocation, no lock needed
+if [[ -d "$STABLE_DIR" ]]; then
+  for _stale in "${STABLE_DIR}"/download.*; do
+    [[ -d "$_stale" ]] && rm -rf "$_stale" 2>/dev/null || true
+  done
+  # Remove stale lock if its owner process is gone
+  _pid_file="${LOCK_DIR}.pid"
+  if [[ -d "$LOCK_DIR" && -f "$_pid_file" ]] \
+      && ! kill -0 "$(cat "$_pid_file" 2>/dev/null)" 2>/dev/null; then
+    rm -rf "$LOCK_DIR" "$_pid_file" 2>/dev/null || true
+  fi
+fi
 
 case "$MODE" in
   check-only)
