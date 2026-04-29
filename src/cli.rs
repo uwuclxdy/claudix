@@ -734,7 +734,7 @@ mod tests {
             wrapper
                 .ok()
                 .unwrap_or_default()
-                .contains("ensure-binary.sh --print-path")
+                .contains("--check-only")
         );
 
         let search_command =

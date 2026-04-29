@@ -12,5 +12,16 @@ if [[ -z "${CLAUDE_PLUGIN_DATA:-}" ]]; then
   export CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_ROOT}/.claudix-data"
 fi
 
-binary="$(${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh --print-path)"
-exec "$binary" "$@"
+ensure_script="${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh"
+
+# Fast path: use binary if already installed (never blocks)
+if binary="$("$ensure_script" --check-only 2>/dev/null)"; then
+  # Check for newer version in background — never blocks the hook
+  { "$ensure_script" --update >/dev/null 2>&1; } &
+  exec "$binary" "$@"
+fi
+
+# Binary not yet installed: spawn install in background, fail open
+{ "$ensure_script" >/dev/null 2>&1; } &
+printf 'claudix: binary installing in background; hooks activate on next session start\n' >&2
+exit 0
