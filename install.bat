@@ -29,11 +29,11 @@ if errorlevel 1 (
     echo.
     echo claudix binary installed. Open Claude Code and run:
     echo   claude plugin marketplace add uwuclxdy/claudix
-    echo   claude plugin install claudix@uwuclxdy
+    echo   claude plugin install claudix@claudix
     echo Then restart Claude Code.
 ) else (
     claude plugin marketplace add uwuclxdy/claudix
-    claude plugin install claudix@uwuclxdy
+    claude plugin install claudix@claudix
     echo.
     echo claudix installed. Restart Claude Code to activate.
 )
