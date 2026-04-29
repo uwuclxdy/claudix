@@ -17,6 +17,59 @@ Core design goal: never break the session, always recover gracefully.
 
 ## Installation
 
+**Requires**: Rust 1.83+ (`rustup.rs`) and Claude Code.
+
+Two install variants:
+
+| Variant | Binary size | Embedding |
+|---------|-------------|-----------|
+| Default (no `--bundled`) | Small | Requires LM Studio or Ollama running locally |
+| `--bundled` | Large (~100 MB) | Ships `bge-small-en-v1.5` via ONNX — zero config |
+
+Use `--bundled` if you want zero-setup. Use the default if you already run LM Studio or Ollama and prefer a smaller binary or a different model.
+
+### Linux / macOS
+
+```bash
+# default — bring your own embedding server
+curl -fsSL https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.sh | bash
+```
+
+```bash
+# bundled — works out of the box, larger binary
+curl -fsSL https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.sh | bash -s -- --bundled
+```
+
+### Windows
+
+```powershell
+# default
+irm https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.bat | iex
+```
+
+```powershell
+# bundled
+irm https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.bat | iex --bundled
+```
+
+### Manual
+
+```bash
+# default — http embedder only
+cargo install --git https://github.com/uwuclxdy/claudix --no-default-features
+
+# bundled — includes ONNX runtime + bge-small-en-v1.5 weights
+cargo install --git https://github.com/uwuclxdy/claudix
+```
+
+Then register the plugin:
+
+```bash
+claude plugin marketplace add uwuclxdy/claudix
+claude plugin install claudix@uwuclxdy
+```
+
+Restart Claude Code. Run `/claudix:doctor` to verify.
 
 ## Configuration
 
