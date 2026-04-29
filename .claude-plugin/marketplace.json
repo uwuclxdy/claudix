@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "claudix",
-      "source": ".",
+      "source": "./",
       "description": "Local semantic search plugin for Claude Code.",
       "version": "0.1.0",
       "license": "MIT",
