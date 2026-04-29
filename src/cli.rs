@@ -174,6 +174,17 @@ pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput
     })
 }
 
+pub async fn run_auto_install() -> Option<String> {
+    let config_path = global_config_path().ok()?;
+    match ensure_global_config(&config_path).await {
+        Ok(true) => Some(format!(
+            "claudix: first-time setup complete — config written to {}. Run /claudix:index to index this repository.",
+            config_path.display()
+        )),
+        _ => None,
+    }
+}
+
 pub fn parse_hook_event(value: &str) -> Result<HookEvent> {
     match value {
         "SessionStart" => Ok(HookEvent::SessionStart),
@@ -744,7 +755,7 @@ mod tests {
             updater
                 .ok()
                 .unwrap_or_default()
-                .contains("crates.io")
+                .contains("github.com")
         );
     }
 

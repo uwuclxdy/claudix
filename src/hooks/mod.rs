@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::Claudix;
+use crate::cli;
 use crate::config::{self, Config};
 use crate::error::Result;
 use crate::store::{Manifest, Store};
@@ -30,6 +31,7 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
     let pending_update = consume_pending_restart().await;
+    let install_msg = cli::run_auto_install().await;
 
     let config = config::load(project_root)?;
     let store = Store::new(project_root, &config)?;
@@ -73,7 +75,7 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
     }
 
     let mut response = session_start_response(notes.join(". "));
-    if let Some(msg) = pending_update {
+    if let Some(msg) = pending_update.or(install_msg) {
         response["systemMessage"] = Value::String(msg);
     }
     Ok(Some(response))
