@@ -19,6 +19,7 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    #[cfg(feature = "bundled-embedder")]
     if matches!(config.embedding.provider, EmbeddingProvider::Bundled)
         && config.embedding.model != crate::embedding::bundled::BUNDLED_MODEL_ID
     {
@@ -33,6 +34,7 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    #[cfg(feature = "bundled-embedder")]
     if matches!(config.embedding.provider, EmbeddingProvider::Bundled)
         && config.embedding.dimensions != crate::embedding::bundled::BUNDLED_DIMENSIONS.0
     {

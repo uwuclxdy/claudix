@@ -24,6 +24,8 @@ name = "claudix"
 path = "src/lib.rs"
 
 [features]
+default = ["bundled-embedder"]
+bundled-embedder = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 test-stub = []
 
 [dependencies]
@@ -80,10 +82,10 @@ dirs = "6"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 sha2 = "0.10"
 
-# ONNX inference for bundled embedder
-ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
-tokenizers = { version = "0.21", default-features = false, features = ["http", "fancy-regex"] }
-ndarray = "0.17"
+# ONNX inference for bundled embedder (optional — enabled by bundled-embedder feature)
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"], optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["http", "fancy-regex"], optional = true }
+ndarray = { version = "0.17", optional = true }
 
 # Tempfile for tests
 tempfile = "3"

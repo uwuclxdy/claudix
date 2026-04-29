@@ -1,3 +1,4 @@
+#[cfg(feature = "bundled-embedder")]
 pub mod bundled;
 pub mod http;
 #[cfg(any(test, feature = "test-stub"))]
@@ -8,6 +9,7 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::types::Dimension;
 
+#[cfg(feature = "bundled-embedder")]
 pub use bundled::BundledProvider;
 pub use http::HttpProvider;
 #[cfg(any(test, feature = "test-stub"))]
