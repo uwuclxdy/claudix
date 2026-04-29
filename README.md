@@ -17,30 +17,6 @@ Core design goal: never break the session, always recover gracefully.
 
 ## Installation
 
-### Via Claude Code Plugin Manager
-
-1. Open Claude Code settings (`/config`)
-2. Navigate to Plugins
-3. Add plugin: `https://github.com/your-org/claudix` (or local path)
-4. On session start, the binary is downloaded and installed to `${CLAUDE_PLUGIN_ROOT}/bin/claudix`
-5. Run `/claudix:doctor` if the binary fails to install
-
-First run will prompt to download the binary (~50MB). Prebuilt binaries are available for Linux x86_64, macOS Apple Silicon, and Windows x86_64. SessionStart hook verifies the installation and reports status via `additionalContext`.
-
-### Building from Source
-
-```bash
-git clone https://github.com/your-org/claudix
-cd claudix
-cargo build --release
-# Binary: target/release/claudix
-```
-
-Copy to plugin bin directory:
-```bash
-mkdir -p ~/.claude/plugins/claudix/bin
-cp target/release/claudix ~/.claude/plugins/claudix/bin/
-```
 
 ## Configuration
 
@@ -51,7 +27,7 @@ Configuration lives in two TOML files (project overrides global):
 
 Both optional. If neither exists, bundled defaults and `bge-small-en-v1.5` embedder are used. Run `/claudix:doctor` to see active configuration.
 
-### Full Schema with Defaults
+### Full Schema (defaults)
 
 ```toml
 [embedding]

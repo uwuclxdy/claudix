@@ -2,8 +2,13 @@
 name = "claudix"
 version = "0.1.0"
 edition = "2024"
-description = "Local semantic search plugin for Claude Code"
 license = "MIT"
+description = "Local semantic search plugin for Claude Code"
+homepage = "https://github.com/uwuclxdy/claudix"
+repository = "https://github.com/uwuclxdy/claudix"
+readme = "README.md"
+keywords = ["semantic-search", "embedding", "claude-code"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "claudix"
