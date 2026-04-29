@@ -137,14 +137,22 @@ fetch_latest_version() {
   fi
 }
 
+cargo_bin() {
+  # Explicit cargo bin path — avoids false positives from other plugins that
+  # ship an unrelated binary named "claudix" somewhere in PATH
+  printf '%s\n' "${CARGO_HOME:-${HOME}/.cargo}/bin/${PLUGIN_NAME}"
+}
+
 installed_path() {
   # Prints path of installed binary; exits 1 if not found
-  # Priority 1: cargo-installed binary already in PATH
-  if command -v "$PLUGIN_NAME" >/dev/null 2>&1; then
-    printf '%s\n' "$(command -v "$PLUGIN_NAME")"
+  # Priority 1: cargo-installed binary in the cargo bin dir (not generic PATH)
+  local cb
+  cb="$(cargo_bin)"
+  if [[ -x "$cb" ]]; then
+    printf '%s\n' "$cb"
     return 0
   fi
-  # Priority 2: previously downloaded release binary
+  # Priority 2: previously downloaded release binary in the stable dir
   local platform version_file installed_version binary
   platform="$(detect_platform 2>/dev/null)" || return 1
   version_file="${VERSION_DIR}/${PLUGIN_NAME}-${platform}.version"
@@ -244,9 +252,11 @@ do_update() {
   latest="$(fetch_latest_version 2>/dev/null || true)"
   [[ -n "$latest" ]] || return 0  # can't reach GitHub, skip silently
 
-  if command -v "$PLUGIN_NAME" >/dev/null 2>&1; then
+  local cb
+  cb="$(cargo_bin)"
+  if [[ -x "$cb" ]]; then
     local installed
-    installed="$("$PLUGIN_NAME" --version 2>/dev/null \
+    installed="$("$cb" --version 2>/dev/null \
       | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo '0.0.0')"
     semver_gt "$latest" "$installed" || return 0
     log "updating claudix ${installed} → ${latest}"
