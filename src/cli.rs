@@ -174,14 +174,26 @@ pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput
     })
 }
 
-pub async fn run_auto_install() -> Option<String> {
+pub async fn run_auto_install(project_root: impl AsRef<Path>) -> Option<String> {
+    let project_root = project_root.as_ref();
+    let source_root = plugin_asset_source(project_root).ok()?;
+    let plugin_root =
+        plugin_root_from_env(project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT")).ok()?;
     let config_path = global_config_path().ok()?;
-    match ensure_global_config(&config_path).await {
-        Ok(true) => Some(format!(
-            "claudix: first-time setup complete — config written to {}. Run /claudix:index to index this repository.",
+
+    let installed_assets = source_root != plugin_root;
+    install_plugin_assets(&source_root, &plugin_root)
+        .await
+        .ok()?;
+    let wrote_config = ensure_global_config(&config_path).await.ok()?;
+
+    if installed_assets || wrote_config {
+        Some(format!(
+            "claudix: setup complete — config at {}. Restart Claude Code to load MCP, then run /claudix:index.",
             config_path.display()
-        )),
-        _ => None,
+        ))
+    } else {
+        None
     }
 }
 
@@ -281,6 +293,10 @@ async fn copy_plugin_asset(
 ) -> Result<()> {
     let source = required_plugin_asset(project_root, source_relative).await?;
 
+    if source == destination {
+        return Ok(());
+    }
+
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -294,6 +310,9 @@ async fn copy_plugin_directory(
     destination: PathBuf,
 ) -> Result<()> {
     let source = required_plugin_asset(project_root, source_relative).await?;
+    if source == destination {
+        return Ok(());
+    }
 
     if fs::try_exists(&destination).await? {
         fs::remove_dir_all(&destination).await?;
@@ -380,6 +399,19 @@ fn default_global_config() -> &'static str {
 
 fn plugin_root(project_root: &Path) -> Result<PathBuf> {
     plugin_root_from_env(project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT"))
+}
+
+fn plugin_asset_source(project_root: &Path) -> Result<PathBuf> {
+    if is_claudix_plugin_root(project_root) {
+        return Ok(project_root.to_path_buf());
+    }
+
+    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if is_claudix_plugin_root(&source_root) {
+        return Ok(source_root);
+    }
+
+    plugin_root(project_root)
 }
 
 fn plugin_root_from_env(
@@ -713,12 +745,10 @@ mod tests {
         let plugin_manifest =
             fs::read_to_string(plugin_root.join(".claude-plugin").join("plugin.json")).await;
         assert!(plugin_manifest.is_ok());
-        assert!(
-            plugin_manifest
-                .ok()
-                .unwrap_or_default()
-                .contains("\"name\": \"claudix\"")
-        );
+        let plugin_manifest = plugin_manifest.ok().unwrap_or_default();
+        assert!(plugin_manifest.contains("\"name\": \"claudix\""));
+        assert!(plugin_manifest.contains("\"mcpServers\""));
+        assert!(plugin_manifest.contains("\"args\": [\"mcp\"]"));
 
         let hooks_manifest = fs::read_to_string(plugin_root.join("hooks").join("hooks.json")).await;
         assert!(hooks_manifest.is_ok());
@@ -731,32 +761,18 @@ mod tests {
 
         let wrapper = fs::read_to_string(plugin_root.join("bin").join("claudix")).await;
         assert!(wrapper.is_ok());
-        assert!(
-            wrapper
-                .ok()
-                .unwrap_or_default()
-                .contains("CARGO_BIN")
-        );
+        assert!(wrapper.ok().unwrap_or_default().contains("CARGO_BIN"));
 
         let search_command =
             fs::read_to_string(plugin_root.join("commands").join("search.md")).await;
         assert!(search_command.is_ok());
-        assert!(
-            search_command
-                .ok()
-                .unwrap_or_default()
-                .contains("claudix search")
-        );
+        let search_command = search_command.ok().unwrap_or_default();
+        assert!(search_command.contains("!`claudix search"));
+        assert!(!search_command.contains("CLAUDE_PLUGIN_ROOT"));
 
-        let updater =
-            fs::read_to_string(plugin_root.join("scripts").join("check-update.sh")).await;
+        let updater = fs::read_to_string(plugin_root.join("scripts").join("check-update.sh")).await;
         assert!(updater.is_ok());
-        assert!(
-            updater
-                .ok()
-                .unwrap_or_default()
-                .contains("github.com")
-        );
+        assert!(updater.ok().unwrap_or_default().contains("github.com"));
     }
 
     #[test]

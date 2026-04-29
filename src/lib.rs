@@ -23,10 +23,10 @@ use std::time::Duration;
 
 use chunking::{Chunker, MultiLanguageChunker};
 use config::{Config, EmbeddingProvider};
-#[cfg(any(test, feature = "test-stub"))]
-use embedding::StubProvider;
 #[cfg(feature = "bundled-embedder")]
 use embedding::BundledProvider;
+#[cfg(any(test, feature = "test-stub"))]
+use embedding::StubProvider;
 use embedding::{HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator};
 use error::RecoveryHint;
@@ -156,7 +156,11 @@ impl Claudix {
     }
 
     async fn collect_file_chunks(&self, file: &EnumeratedFile) -> Result<Vec<Chunk>> {
-        let content = fs::read_to_string(&file.absolute_path).await?;
+        let content = match fs::read_to_string(&file.absolute_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
         let path = file.relative_path.clone();
         let language = file.language;
         let file_hash = file.file_hash;
@@ -445,6 +449,33 @@ mod tests {
         assert!(names.contains("greet"));
         assert!(names.contains("multiply"));
         assert!(!names.contains("add"));
+    }
+
+    #[tokio::test]
+    async fn index_full_skips_invalid_utf8_files() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            fs::write(fixture.root().join("binary.rs"), [0xff, 0xfe, 0xfd])
+                .await
+                .is_ok()
+        );
+
+        let config = test_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config);
+        assert!(claudix.is_ok());
+        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+
+        let stats = claudix.index_full().await;
+        assert!(stats.is_ok());
+        assert_eq!(
+            stats.ok().unwrap_or_else(|| unreachable!()),
+            IndexStats {
+                file_count: 2,
+                chunk_count: 3,
+            }
+        );
     }
 
     #[tokio::test]

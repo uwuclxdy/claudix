@@ -31,7 +31,7 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
     let pending_update = consume_pending_restart().await;
-    let install_msg = cli::run_auto_install().await;
+    let install_msg = cli::run_auto_install(project_root).await;
 
     let config = config::load(project_root)?;
     let store = Store::new(project_root, &config)?;
@@ -162,8 +162,7 @@ fn pending_restart_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("CLAUDIX_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("XDG_DATA_HOME")
-                .map(|p| std::path::PathBuf::from(p).join("claudix"))
+            std::env::var_os("XDG_DATA_HOME").map(|p| std::path::PathBuf::from(p).join("claudix"))
         })
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share").join("claudix")))?;
     Some(base.join("pending-restart"))
