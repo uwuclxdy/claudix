@@ -158,11 +158,18 @@ installed_path() {
 acquire_lock() {
   local attempts=0
   mkdir -p "$STABLE_DIR"
+  local pid_file="${LOCK_DIR}.pid"
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    # Stale lock: if owning PID no longer exists, remove and retry
+    if [[ -f "$pid_file" ]] && ! kill -0 "$(cat "$pid_file" 2>/dev/null)" 2>/dev/null; then
+      rm -rf "$LOCK_DIR" "$pid_file" 2>/dev/null || true
+      continue
+    fi
     (( ++attempts > 90 )) && fail "install lock stuck; remove ${LOCK_DIR} and retry"
     sleep 1
   done
-  trap 'rm -rf "${TEMP_DIR:-}"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  printf '%s\n' "$$" > "$pid_file"
+  trap 'rm -rf "${TEMP_DIR:-}" "$pid_file"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 }
 
 try_cargo() {
