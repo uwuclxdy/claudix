@@ -178,6 +178,10 @@ acquire_lock() {
   done
   printf '%s\n' "$$" > "$pid_file"
   trap 'rm -rf "${TEMP_DIR:-}" "$pid_file"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  # Purge orphaned temp dirs from previously interrupted downloads
+  for stale in "${STABLE_DIR}"/download.*; do
+    [[ -d "$stale" ]] && rm -rf "$stale" 2>/dev/null || true
+  done
 }
 
 try_cargo() {
