@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+default_plugin_root="$(cd -- "${script_dir}/.." && pwd)"
+
+if [[ -z "${CLAUDE_PLUGIN_ROOT:-}" || ! -x "${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh" ]]; then
+  export CLAUDE_PLUGIN_ROOT="$default_plugin_root"
+fi
+
+if [[ -z "${CLAUDE_PLUGIN_DATA:-}" ]]; then
+  export CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_ROOT}/.claudix-data"
+fi
+
+binary="$(${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh --print-path)"
+exec "$binary" "$@"

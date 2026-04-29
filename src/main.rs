@@ -176,9 +176,13 @@ async fn main() -> Result<()> {
         }
         Command::Install => {
             let output = cli::run_install(&project_root).await?;
+            println!("plugin_root: {}", output.plugin_root);
             println!("binary_path: {}", output.binary_path);
             println!("config_path: {}", output.config_path);
             println!("wrote_config: {}", output.wrote_config);
+            if let Some(next_step) = output.next_step {
+                println!("next_step: {next_step}");
+            }
         }
         Command::Mcp => {
             mcp::run(&project_root).await?;

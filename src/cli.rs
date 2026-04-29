@@ -64,9 +64,11 @@ pub struct DoctorOutput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InstallOutput {
+    pub plugin_root: String,
     pub binary_path: String,
     pub config_path: String,
     pub wrote_config: bool,
+    pub next_step: Option<String>,
 }
 
 pub async fn run_search(
@@ -155,22 +157,20 @@ pub async fn run_clear_index(project_root: impl AsRef<Path>) -> Result<ClearOutp
 
 pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
-    let plugin_root = plugin_root()?;
+    let plugin_root = plugin_root(&project_root)?;
     let binary_path = plugin_root.join("bin").join(binary_name());
     let config_path = global_config_path()?;
 
-    if let Some(parent) = binary_path.parent() {
-        fs::create_dir_all(parent).await?;
-    }
-    copy_current_exe(&binary_path).await?;
+    install_plugin_assets(&project_root, &plugin_root).await?;
 
     let wrote_config = ensure_global_config(&config_path).await?;
 
-    let _ = project_root;
     Ok(InstallOutput {
+        plugin_root: plugin_root.display().to_string(),
         binary_path: binary_path.display().to_string(),
         config_path: config_path.display().to_string(),
         wrote_config,
+        next_step: install_next_step(&plugin_root),
     })
 }
 
@@ -238,17 +238,114 @@ async fn status_from_store(store: &Store) -> Result<StatusOutput> {
     })
 }
 
-async fn copy_current_exe(destination: &Path) -> Result<()> {
-    let source = std::env::current_exe().map_err(ClaudixError::from)?;
-    fs::copy(&source, destination).await?;
+async fn install_plugin_assets(project_root: &Path, plugin_root: &Path) -> Result<()> {
+    copy_plugin_asset(
+        project_root,
+        ".claude-plugin/plugin.json",
+        plugin_root.join(".claude-plugin").join("plugin.json"),
+    )
+    .await?;
+    copy_plugin_asset(
+        project_root,
+        "hooks/hooks.json",
+        plugin_root.join("hooks").join("hooks.json"),
+    )
+    .await?;
+    copy_plugin_asset(project_root, ".mcp.json", plugin_root.join(".mcp.json")).await?;
+    copy_plugin_asset(
+        project_root,
+        "bin/claudix",
+        plugin_root.join("bin").join(binary_name()),
+    )
+    .await?;
+    make_executable(&plugin_root.join("bin").join(binary_name())).await?;
+    copy_plugin_directory(project_root, "commands", plugin_root.join("commands")).await?;
+    copy_plugin_directory(project_root, "scripts", plugin_root.join("scripts")).await?;
+    Ok(())
+}
 
+async fn copy_plugin_asset(
+    project_root: &Path,
+    source_relative: &str,
+    destination: PathBuf,
+) -> Result<()> {
+    let source = required_plugin_asset(project_root, source_relative).await?;
+
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::copy(source, &destination).await?;
+    Ok(())
+}
+
+async fn copy_plugin_directory(
+    project_root: &Path,
+    source_relative: &str,
+    destination: PathBuf,
+) -> Result<()> {
+    let source = required_plugin_asset(project_root, source_relative).await?;
+
+    if fs::try_exists(&destination).await? {
+        fs::remove_dir_all(&destination).await?;
+    }
+    fs::create_dir_all(&destination).await?;
+
+    let mut entries = fs::read_dir(source).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let file_type = entry.file_type().await?;
+        if file_type.is_file() {
+            let destination_file = destination.join(entry.file_name());
+            fs::copy(entry.path(), &destination_file).await?;
+            if destination_file
+                .extension()
+                .is_some_and(|extension| extension == "sh")
+            {
+                make_executable(&destination_file).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn required_plugin_asset(project_root: &Path, source_relative: &str) -> Result<PathBuf> {
+    let source = project_root.join(source_relative);
+    if fs::try_exists(&source).await? {
+        return Ok(source);
+    }
+
+    Err(ClaudixError::ConfigInvalid {
+        message: format!("required plugin asset missing: {}", source.display()),
+        recovery: RecoveryHint("Restore the plugin metadata files before running claudix install"),
+    })
+}
+
+fn install_next_step(plugin_root: &Path) -> Option<String> {
+    if !plugin_root.starts_with(local_plugin_root()) {
+        return None;
+    }
+
+    Some(format!(
+        "Run `claude --plugin-dir {}` or install this path with `/plugin install {}`.",
+        plugin_root.display(),
+        plugin_root.display()
+    ))
+}
+
+fn local_plugin_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("claudix-plugin")
+}
+
+async fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mut permissions = fs::metadata(destination).await?.permissions();
+        let mut permissions = fs::metadata(path).await?.permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(destination, permissions).await?;
+        fs::set_permissions(path, permissions).await?;
     }
 
     Ok(())
@@ -271,13 +368,40 @@ fn default_global_config() -> &'static str {
     "# Global claudix configuration\n# Uncomment and edit values as needed.\n\n[embedding]\n# provider = \"bundled\"\n# model = \"bge-small-en-v1.5\"\n# dimensions = 384\n# endpoint = \"http://localhost:11434\"\n\n[indexing]\n# reindex_after_hours = 24\n"
 }
 
-fn plugin_root() -> Result<PathBuf> {
-    std::env::var_os("CLAUDE_PLUGIN_ROOT")
-        .map(PathBuf::from)
-        .ok_or_else(|| ClaudixError::ConfigInvalid {
-            message: "CLAUDE_PLUGIN_ROOT is not set".into(),
-            recovery: RecoveryHint("Run claudix install from the plugin environment"),
-        })
+fn plugin_root(project_root: &Path) -> Result<PathBuf> {
+    plugin_root_from_env(project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT"))
+}
+
+fn plugin_root_from_env(
+    project_root: &Path,
+    plugin_root_env: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    if is_claudix_plugin_root(project_root) {
+        return Ok(local_plugin_root());
+    }
+
+    if let Some(path) = plugin_root_env {
+        let plugin_root = PathBuf::from(path);
+        if is_claudix_plugin_root(&plugin_root) {
+            return Ok(plugin_root);
+        }
+    }
+
+    Err(ClaudixError::ConfigInvalid {
+        message: "CLAUDE_PLUGIN_ROOT is not set".into(),
+        recovery: RecoveryHint(
+            "Run claudix install from the plugin directory or plugin environment",
+        ),
+    })
+}
+
+fn is_claudix_plugin_root(path: &Path) -> bool {
+    let manifest_path = path.join(".claude-plugin").join("plugin.json");
+    let Ok(manifest) = std::fs::read_to_string(manifest_path) else {
+        return false;
+    };
+
+    manifest.contains("\"name\": \"claudix\"")
 }
 
 fn global_config_path() -> Result<PathBuf> {
@@ -370,17 +494,13 @@ mod tests {
 
     fn test_claudix(project_root: PathBuf, config: Config) -> Result<Claudix> {
         let store = Store::new(&project_root, &config)?;
+        let config = Arc::new(config);
         let embedder: Arc<dyn Provider> = Arc::new(StubProvider::with_model_id(
             config.embedding.model.clone(),
             Dimension(config.embedding.dimensions),
         ));
 
-        Ok(Claudix {
-            config: Arc::new(config),
-            project_root,
-            embedder,
-            store,
-        })
+        Ok(Claudix::from_parts(project_root, config, embedder, store))
     }
 
     async fn cli_harness() -> Result<CliHarness> {
@@ -567,6 +687,153 @@ mod tests {
         let wrote_config = ensure_global_config(&config_path).await;
         assert!(wrote_config.is_ok());
         assert!(!wrote_config.ok().unwrap_or(true));
+    }
+
+    #[tokio::test]
+    async fn install_copies_plugin_assets_into_plugin_root() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let plugin_root = fixture.root().join("plugin-root");
+
+        let result =
+            install_plugin_assets(Path::new(env!("CARGO_MANIFEST_DIR")), &plugin_root).await;
+        assert!(result.is_ok());
+
+        let plugin_manifest =
+            fs::read_to_string(plugin_root.join(".claude-plugin").join("plugin.json")).await;
+        assert!(plugin_manifest.is_ok());
+        assert!(
+            plugin_manifest
+                .ok()
+                .unwrap_or_default()
+                .contains("\"name\": \"claudix\"")
+        );
+
+        let hooks_manifest = fs::read_to_string(plugin_root.join("hooks").join("hooks.json")).await;
+        assert!(hooks_manifest.is_ok());
+        assert!(
+            hooks_manifest
+                .ok()
+                .unwrap_or_default()
+                .contains("scripts/session-start.sh")
+        );
+
+        let mcp_manifest = fs::read_to_string(plugin_root.join(".mcp.json")).await;
+        assert!(mcp_manifest.is_ok());
+        assert!(
+            mcp_manifest
+                .ok()
+                .unwrap_or_default()
+                .contains("\"claudix\"")
+        );
+
+        let wrapper = fs::read_to_string(plugin_root.join("bin").join("claudix")).await;
+        assert!(wrapper.is_ok());
+        assert!(
+            wrapper
+                .ok()
+                .unwrap_or_default()
+                .contains("ensure-binary.sh --print-path")
+        );
+
+        let search_command =
+            fs::read_to_string(plugin_root.join("commands").join("search.md")).await;
+        assert!(search_command.is_ok());
+        assert!(
+            search_command
+                .ok()
+                .unwrap_or_default()
+                .contains("claudix search")
+        );
+
+        let downloader =
+            fs::read_to_string(plugin_root.join("scripts").join("ensure-binary.sh")).await;
+        assert!(downloader.is_ok());
+        assert!(
+            downloader
+                .ok()
+                .unwrap_or_default()
+                .contains("CLAUDIX_RELEASE_BASE_URL")
+        );
+    }
+
+    #[test]
+    fn plugin_root_uses_claudix_environment_value_outside_local_checkout() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let env_root = fixture.root().join("env-plugin-root");
+        assert!(std::fs::create_dir_all(env_root.join(".claude-plugin")).is_ok());
+        assert!(
+            std::fs::write(
+                env_root.join(".claude-plugin").join("plugin.json"),
+                "{\"name\": \"claudix\"}",
+            )
+            .is_ok()
+        );
+        let project_root = fixture.root().join("project");
+        assert!(std::fs::create_dir_all(&project_root).is_ok());
+
+        let result = plugin_root_from_env(&project_root, Some(env_root.clone().into_os_string()));
+        assert!(result.is_ok());
+        assert_eq!(result.ok().unwrap_or_default(), env_root);
+    }
+
+    #[test]
+    fn plugin_root_ignores_foreign_environment_value() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let result = plugin_root_from_env(root, Some(fixture.root().as_os_str().to_os_string()));
+        assert!(result.is_ok());
+        assert_eq!(
+            result.ok().unwrap_or_default(),
+            root.join("target").join("claudix-plugin")
+        );
+    }
+
+    #[test]
+    fn plugin_root_falls_back_to_local_manifest() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let result = plugin_root_from_env(root, None);
+        assert!(result.is_ok());
+        assert_eq!(
+            result.ok().unwrap_or_default(),
+            root.join("target").join("claudix-plugin")
+        );
+    }
+
+    #[test]
+    fn plugin_root_requires_environment_or_local_manifest() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let result = plugin_root_from_env(fixture.root(), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn install_next_step_is_present_for_local_bundle() {
+        let plugin_root = local_plugin_root();
+
+        let next_step = install_next_step(&plugin_root);
+        assert!(next_step.is_some());
+        assert!(next_step.unwrap_or_default().contains("/plugin install"));
+    }
+
+    #[test]
+    fn install_next_step_is_absent_for_enabled_plugin_root() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let next_step = install_next_step(fixture.root());
+        assert!(next_step.is_none());
     }
 
     #[test]

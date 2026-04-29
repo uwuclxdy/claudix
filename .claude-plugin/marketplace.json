@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "claudix",
+  "description": "Local semantic search tools for Claude Code.",
+  "owner": {
+    "name": "uwuclxdy"
+  },
+  "plugins": [
+    {
+      "name": "claudix",
+      "source": ".",
+      "description": "Local semantic search plugin for Claude Code.",
+      "version": "0.1.0",
+      "license": "MIT",
+      "category": "development",
+      "tags": ["semantic-search", "rust", "mcp", "local-first"],
+      "repository": "https://github.com/uwuclxdy/claudix"
+    }
+  ]
+}

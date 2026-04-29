@@ -1,7 +1,7 @@
 ---
 description: Clear the claudix search index.
-allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/claudix:*)
+allowed-tools: Bash(claudix:*)
 ---
 
 Run:
-!`${CLAUDE_PLUGIN_ROOT}/bin/claudix clear`
+!`claudix clear`

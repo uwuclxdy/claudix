@@ -47,7 +47,7 @@ pub struct IndexStats {
 
 impl Claudix {
     pub async fn new(project_root: PathBuf, config: Arc<Config>) -> Result<Self> {
-        let embedder = build_provider(config.as_ref())?;
+        let embedder = build_provider(config.as_ref()).await?;
         let store = Store::new(&project_root, config.as_ref())?;
         store.validate_manifest_compatibility(embedder.model_id(), embedder.dimensions().0)?;
 
@@ -57,6 +57,21 @@ impl Claudix {
             embedder,
             store,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(
+        project_root: PathBuf,
+        config: Arc<Config>,
+        embedder: Arc<dyn Provider>,
+        store: Store,
+    ) -> Self {
+        Self {
+            config,
+            project_root,
+            embedder,
+            store,
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -209,7 +224,7 @@ impl Claudix {
     }
 }
 
-fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
+async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
     let dimensions = Dimension(config.embedding.dimensions);
 
     #[cfg(any(test, feature = "test-stub"))]
@@ -221,10 +236,9 @@ fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
     }
 
     match config.embedding.provider {
-        EmbeddingProvider::Bundled => Ok(Arc::new(BundledProvider::new(
-            config.embedding.model.clone(),
-            dimensions,
-        )?)),
+        EmbeddingProvider::Bundled => Ok(Arc::new(
+            BundledProvider::new(config.embedding.model.clone(), dimensions).await?,
+        )),
         EmbeddingProvider::Http => Ok(Arc::new(HttpProvider::new(
             config.embedding.endpoint.clone(),
             config.embedding.model.clone(),

@@ -2,12 +2,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use ort::{session::Session, value::Tensor};
 use tokenizers::{
     PaddingParams, PaddingStrategy, Tokenizer, TruncationDirection, TruncationParams,
     TruncationStrategy,
 };
-use tokio::task;
+use tokio::io::AsyncWriteExt;
+use tokio::{fs, task};
 
 use crate::embedding::Provider;
 use crate::error::{ClaudixError, RecoveryHint, Result};
@@ -19,6 +21,11 @@ pub const BUNDLED_TOKENIZER_FILENAME: &str = "tokenizer.json";
 pub const BUNDLED_OUTPUT_NAME: &str = "last_hidden_state";
 pub const BUNDLED_MAX_SEQUENCE_LENGTH: usize = 512;
 pub const BUNDLED_DIMENSIONS: Dimension = Dimension(384);
+const BUNDLED_MODEL_URL: &str =
+    "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/onnx/model.onnx";
+const BUNDLED_TOKENIZER_URL: &str =
+    "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main/tokenizer.json";
+const DOWNLOAD_TIMEOUT_SECS: u64 = 600;
 
 #[derive(Debug, Clone)]
 pub struct BundledProvider {
@@ -46,11 +53,11 @@ struct AssetPaths {
 }
 
 impl BundledProvider {
-    pub fn new(model_id: impl Into<String>, dimensions: Dimension) -> Result<Self> {
-        Self::from_cache_dir(default_cache_dir()?, model_id, dimensions)
+    pub async fn new(model_id: impl Into<String>, dimensions: Dimension) -> Result<Self> {
+        Self::from_cache_dir(default_cache_dir()?, model_id, dimensions).await
     }
 
-    pub fn from_cache_dir(
+    pub async fn from_cache_dir(
         cache_dir: impl AsRef<Path>,
         model_id: impl Into<String>,
         dimensions: Dimension,
@@ -59,7 +66,7 @@ impl BundledProvider {
         validate_model_contract(&model_id, dimensions)?;
 
         let paths = AssetPaths::new(cache_dir.as_ref());
-        ensure_assets_exist(&paths, &model_id)?;
+        ensure_assets_exist(&paths, &model_id).await?;
 
         let tokenizer = load_tokenizer(&paths.tokenizer)?;
         let session = Session::builder()
@@ -233,17 +240,47 @@ fn validate_model_contract(model_id: &str, dimensions: Dimension) -> Result<()> 
     Ok(())
 }
 
-fn ensure_assets_exist(paths: &AssetPaths, model_id: &str) -> Result<()> {
+async fn ensure_assets_exist(paths: &AssetPaths, model_id: &str) -> Result<()> {
     if paths.model.exists() && paths.tokenizer.exists() {
         return Ok(());
     }
 
-    Err(ClaudixError::BundledDownloadConfirmationRequired {
+    if let Some(parent) = paths.model.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+
+    download_asset(BUNDLED_MODEL_URL, &paths.model).await?;
+    download_asset(BUNDLED_TOKENIZER_URL, &paths.tokenizer).await?;
+
+    if paths.model.exists() && paths.tokenizer.exists() {
+        return Ok(());
+    }
+
+    Err(ClaudixError::BundledAssetsMissing {
         model_id: model_id.to_owned(),
         recovery: RecoveryHint(
-            "Confirm the first-use bundled model download via the explicit install or doctor flow",
+            "Run claudix again after restoring network access, or switch to [embedding] provider = \"http\"",
         ),
     })
+}
+
+async fn download_asset(url: &str, destination: &Path) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(DOWNLOAD_TIMEOUT_SECS))
+        .build()?;
+    let response = client.get(url).send().await?.error_for_status()?;
+    let mut stream = response.bytes_stream();
+    let temp_path = destination.with_extension("download");
+    let mut file = fs::File::create(&temp_path).await?;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    drop(file);
+    fs::rename(temp_path, destination).await?;
+    Ok(())
 }
 
 fn default_cache_dir() -> Result<PathBuf> {
@@ -393,32 +430,28 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    #[test]
-    fn missing_model_returns_confirmation_required() {
+    #[tokio::test]
+    async fn missing_model_triggers_download_or_network_error() {
         let tempdir = tempdir().ok().unwrap_or_else(|| unreachable!());
 
-        let error =
-            BundledProvider::from_cache_dir(tempdir.path(), BUNDLED_MODEL_ID, BUNDLED_DIMENSIONS);
-        assert!(matches!(
-            error,
-            Err(ClaudixError::BundledDownloadConfirmationRequired { .. })
-        ));
+        let result =
+            BundledProvider::from_cache_dir(tempdir.path(), BUNDLED_MODEL_ID, BUNDLED_DIMENSIONS)
+                .await;
+        assert!(matches!(result, Ok(_) | Err(ClaudixError::Http(_))));
     }
 
-    #[test]
-    fn missing_tokenizer_returns_confirmation_required() {
+    #[tokio::test]
+    async fn missing_tokenizer_triggers_download_or_network_error() {
         let tempdir = tempdir().ok().unwrap_or_else(|| unreachable!());
         let model_path = tempdir.path().join(BUNDLED_MODEL_FILENAME);
         std::fs::write(model_path, b"placeholder")
             .ok()
             .unwrap_or_else(|| unreachable!());
 
-        let error =
-            BundledProvider::from_cache_dir(tempdir.path(), BUNDLED_MODEL_ID, BUNDLED_DIMENSIONS);
-        assert!(matches!(
-            error,
-            Err(ClaudixError::BundledDownloadConfirmationRequired { .. })
-        ));
+        let result =
+            BundledProvider::from_cache_dir(tempdir.path(), BUNDLED_MODEL_ID, BUNDLED_DIMENSIONS)
+                .await;
+        assert!(matches!(result, Ok(_) | Err(ClaudixError::Http(_))));
     }
 
     #[test]
