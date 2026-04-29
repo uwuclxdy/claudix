@@ -11,8 +11,8 @@ Core design goal: never break the session, always recover gracefully.
 ## Requirements
 
 - **Claude Code** (version TBD; plugin API v1)
-- **macOS 11+**, **Linux** (glibc 2.28+ or musl), **Windows 10+**
-- **Rust 1.75+** (if building from source)
+- **macOS 11+ (Apple Silicon)**, **Linux x86_64** (glibc 2.28+ or musl), **Windows 10+ x86_64**
+- **Rust 1.83+** (if building from source; Intel Mac must build from source — no prebuilt)
 - **Optional**: LM Studio or Ollama for custom embedding backends (bundled `bge-small-en-v1.5` via ONNX requires only `libonnxruntime` or `onnxruntime.dll`)
 
 ## Installation
@@ -25,7 +25,7 @@ Core design goal: never break the session, always recover gracefully.
 4. On session start, the binary is downloaded and installed to `${CLAUDE_PLUGIN_ROOT}/bin/claudix`
 5. Run `/claudix:doctor` if the binary fails to install
 
-First run will prompt to download the binary (platform-specific, ~50MB). SessionStart hook verifies the installation and reports status via `additionalContext`.
+First run will prompt to download the binary (~50MB). Prebuilt binaries are available for Linux x86_64, macOS Apple Silicon, and Windows x86_64. SessionStart hook verifies the installation and reports status via `additionalContext`.
 
 ### Building from Source
 
@@ -197,7 +197,7 @@ All three backends return 384-dimensional vectors (for bge-small); other models 
 
 ## Building from Source
 
-Requires **Rust 1.75+** and **Cargo**.
+Requires **Rust 1.83+** and **Cargo**.
 
 ```bash
 git clone <repo>

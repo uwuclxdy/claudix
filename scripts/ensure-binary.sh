@@ -74,7 +74,18 @@ detect_platform() {
     *) fail "unsupported CPU architecture: $(uname -m)" ;;
   esac
 
-  printf '%s-%s\n' "$os" "$arch"
+  local platform="${os}-${arch}"
+  case "$platform" in
+    linux-x86_64|darwin-aarch64|windows-x86_64) ;;
+    darwin-x86_64)
+      fail "no prebuilt binary for macOS Intel; build from source: cargo build --release (https://github.com/${GITHUB_REPO})"
+      ;;
+    *)
+      fail "no prebuilt binary for ${platform}; build from source: cargo build --release (https://github.com/${GITHUB_REPO})"
+      ;;
+  esac
+
+  printf '%s\n' "$platform"
 }
 
 binary_name_for_platform() {
