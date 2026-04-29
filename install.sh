@@ -27,7 +27,7 @@ if command -v claude >/dev/null 2>&1; then
   printf '\nclaudix installed. Restart Claude Code to activate.\n'
 else
   printf '\nclaudix binary installed. Open Claude Code and run:\n'
-  printf '  claude plugin marketplace add uwuclxdy/claudix\n'
-  printf '  claude plugin install claudix@claudix\n'
+  printf '  /plugin marketplace add uwuclxdy/claudix\n'
+  printf '  /plugin install claudix@claudix\n'
   printf 'Then restart Claude Code.\n'
 fi

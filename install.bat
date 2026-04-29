@@ -28,8 +28,8 @@ where claude >nul 2>&1
 if errorlevel 1 (
     echo.
     echo claudix binary installed. Open Claude Code and run:
-    echo   claude plugin marketplace add uwuclxdy/claudix
-    echo   claude plugin install claudix@claudix
+    echo   /plugin marketplace add uwuclxdy/claudix
+    echo   /plugin install claudix@claudix
     echo Then restart Claude Code.
 ) else (
     claude plugin marketplace add uwuclxdy/claudix
