@@ -1,7 +1,7 @@
 ---
 description: Build or refresh the claudix index.
-allowed-tools: Bash(claudix:*)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/claudix:*)
 ---
 
 Run:
-!`claudix index`
+!`${CLAUDE_PLUGIN_ROOT}/bin/claudix index`

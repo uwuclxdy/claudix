@@ -1,7 +1,7 @@
 ---
 description: Show claudix index status.
-allowed-tools: Bash(claudix:*)
+allowed-tools: Bash(${CLAUDE_PLUGIN_ROOT}/bin/claudix:*)
 ---
 
 Run:
-!`claudix status`
+!`${CLAUDE_PLUGIN_ROOT}/bin/claudix status`
