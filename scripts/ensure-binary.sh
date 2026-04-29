@@ -177,7 +177,7 @@ acquire_lock() {
     sleep 1
   done
   printf '%s\n' "$$" > "$pid_file"
-  trap 'rm -rf "${TEMP_DIR:-}" "$pid_file"; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  trap 'rm -rf "${TEMP_DIR:-}" 2>/dev/null || true; rm -f "${LOCK_DIR}.pid" 2>/dev/null || true; rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 }
 
 try_cargo() {
