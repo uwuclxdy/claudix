@@ -1,29 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-default_plugin_root="$(cd -- "${script_dir}/.." && pwd)"
-
-if [[ -z "${CLAUDE_PLUGIN_ROOT:-}" || ! -x "${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh" ]]; then
-  export CLAUDE_PLUGIN_ROOT="$default_plugin_root"
+CARGO_BIN="${CARGO_HOME:-${HOME}/.cargo}/bin/claudix"
+if [[ -x "$CARGO_BIN" ]]; then
+  exec "$CARGO_BIN" "$@"
 fi
-
-if [[ -z "${CLAUDE_PLUGIN_DATA:-}" ]]; then
-  export CLAUDE_PLUGIN_DATA="${CLAUDE_PLUGIN_ROOT}/.claudix-data"
+if command -v claudix >/dev/null 2>&1; then
+  exec claudix "$@"
 fi
-
-ensure_script="${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh"
-
-# Fast path: use binary if already installed (never blocks)
-if binary="$("$ensure_script" --check-only 2>/dev/null)"; then
-  # Check for newer version in background — survives parent exit
-  nohup "$ensure_script" --update >/dev/null 2>&1 &
-  disown 2>/dev/null || true
-  exec "$binary" "$@"
-fi
-
-# Binary not yet installed: spawn install in background, fail open
-nohup "$ensure_script" >/dev/null 2>&1 &
-disown 2>/dev/null || true
-printf 'claudix: binary installing in background; hooks activate on next session start\n' >&2
+printf 'claudix: binary not found; run install.sh to install\n' >&2
 exit 0

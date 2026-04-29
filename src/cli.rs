@@ -251,7 +251,6 @@ async fn install_plugin_assets(project_root: &Path, plugin_root: &Path) -> Resul
         plugin_root.join("hooks").join("hooks.json"),
     )
     .await?;
-    copy_plugin_asset(project_root, ".mcp.json", plugin_root.join(".mcp.json")).await?;
     copy_plugin_asset(
         project_root,
         "bin/claudix",
@@ -719,22 +718,13 @@ mod tests {
                 .contains("scripts/session-start.sh")
         );
 
-        let mcp_manifest = fs::read_to_string(plugin_root.join(".mcp.json")).await;
-        assert!(mcp_manifest.is_ok());
-        assert!(
-            mcp_manifest
-                .ok()
-                .unwrap_or_default()
-                .contains("\"claudix\"")
-        );
-
         let wrapper = fs::read_to_string(plugin_root.join("bin").join("claudix")).await;
         assert!(wrapper.is_ok());
         assert!(
             wrapper
                 .ok()
                 .unwrap_or_default()
-                .contains("--check-only")
+                .contains("CARGO_BIN")
         );
 
         let search_command =
@@ -747,14 +737,14 @@ mod tests {
                 .contains("claudix search")
         );
 
-        let downloader =
-            fs::read_to_string(plugin_root.join("scripts").join("ensure-binary.sh")).await;
-        assert!(downloader.is_ok());
+        let updater =
+            fs::read_to_string(plugin_root.join("scripts").join("check-update.sh")).await;
+        assert!(updater.is_ok());
         assert!(
-            downloader
+            updater
                 .ok()
                 .unwrap_or_default()
-                .contains("CLAUDIX_RELEASE_BASE_URL")
+                .contains("crates.io")
         );
     }
 
