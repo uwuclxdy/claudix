@@ -23,9 +23,8 @@ jobs:
             runner: macos-latest
             asset: claudix-darwin-aarch64
           - target: x86_64-pc-windows-msvc
-            runner: ubuntu-latest
+            runner: windows-latest
             asset: claudix-windows-x86_64.exe
-            xwin: true
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -37,23 +36,13 @@ jobs:
       - name: Install macOS dependencies
         if: runner.os == 'macOS'
         run: brew install protobuf
-      - name: Install cargo-xwin
-        if: matrix.xwin
-        run: cargo install cargo-xwin --locked
+      - name: Install Windows dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install protoc --no-progress
       - name: Build
         shell: bash
-        run: |
-          if [[ "${{ matrix.xwin }}" == "true" ]]; then
-            # First pass downloads the MSVC SDK; link may fail due to Linux case-sensitive fs
-            cargo xwin build --release --locked --target "${{ matrix.target }}" || true
-            # lld-link expects mixed-case names; xwin downloads ALLCAPS — create symlinks
-            SDK="$HOME/.cache/cargo-xwin/xwin/sdk/lib/um/x86_64"
-            ln -sf "$SDK/DIRECTML.lib" "$SDK/DirectML.lib"
-            ln -sf "$SDK/PATHCCH.lib"  "$SDK/PathCch.lib"
-            cargo xwin build --release --locked --target "${{ matrix.target }}"
-          else
-            cargo build --release --locked --target "${{ matrix.target }}"
-          fi
+        run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Stage asset
         shell: bash
         run: |
