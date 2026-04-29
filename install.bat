@@ -15,10 +15,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+set REPO=https://github.com/uwuclxdy/claudix
+
 if "%BUNDLED%"=="1" (
-    cargo install claudix
+    cargo install --git %REPO%
 ) else (
-    cargo install claudix --no-default-features
+    cargo install --git %REPO% --no-default-features
 )
 if errorlevel 1 exit /b 1
 

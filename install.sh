@@ -13,10 +13,12 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
+REPO="https://github.com/uwuclxdy/claudix"
+
 if [[ "$BUNDLED" == "true" ]]; then
-  cargo install claudix
+  cargo install --git "$REPO"
 else
-  cargo install claudix --no-default-features
+  cargo install --git "$REPO" --no-default-features
 fi
 
 if command -v claude >/dev/null 2>&1; then

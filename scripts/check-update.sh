@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs in the background from session-start.sh.
-# Checks crates.io once per day; installs via cargo if a newer version exists;
-# writes a pending-restart flag for the next SessionStart to announce.
+# Checks GitHub releases once per day; installs via cargo --git if a newer
+# version exists; writes a pending-restart flag for the next SessionStart.
 set -uo pipefail
 
 CLAUDIX_DATA="${CLAUDIX_HOME:-${XDG_DATA_HOME:-${HOME}/.local/share}/claudix}"
@@ -20,15 +20,16 @@ if [[ -f "$CHECK_CACHE" ]]; then
   (( age < 86400 )) && exit 0
 fi
 
-installed_ver="$("$CARGO_BIN" --version 2>/dev/null \
+installed_ver="$(cargo install --list 2>/dev/null \
+  | grep -E '^claudix v' | head -1 \
   | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo '')"
 [[ -n "$installed_ver" ]] || exit 0
 
 latest_ver="$(curl --fail --silent --max-time 10 \
   -H 'User-Agent: claudix-update-check/1 (https://github.com/uwuclxdy/claudix)' \
-  'https://crates.io/api/v1/crates/claudix' 2>/dev/null \
-  | grep -o '"newest_version":"[^"]*"' | head -1 \
-  | sed 's/"newest_version":"//;s/"//' || echo '')"
+  'https://api.github.com/repos/uwuclxdy/claudix/releases/latest' 2>/dev/null \
+  | grep '"tag_name"' \
+  | sed 's/.*"v\([^"]*\)".*/\1/' | head -1 || echo '')"
 [[ -n "$latest_ver" ]] || exit 0
 
 mkdir -p "$CLAUDIX_DATA"
@@ -36,6 +37,6 @@ touch "$CHECK_CACHE"
 
 [[ "$latest_ver" != "$installed_ver" ]] || exit 0
 
-if cargo install claudix --quiet 2>/dev/null; then
+if cargo install --git 'https://github.com/uwuclxdy/claudix' --tag "v${latest_ver}" --quiet 2>/dev/null; then
   printf '%s\n' "$latest_ver" > "$PENDING_RESTART"
 fi
