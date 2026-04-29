@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
-  "name": "uwuclxdy",
-  "description": "Local semantic search tools for Claude Code.",
+  "name": "claudix",
+  "description": "Local semantic search for Claude Code.",
   "owner": {
     "name": "uwuclxdy"
   },
@@ -9,7 +9,7 @@
     {
       "name": "claudix",
       "source": "./",
-      "description": "Local semantic search plugin for Claude Code.",
+      "description": "Local semantic search for Claude Code.",
       "version": "0.1.0",
       "license": "MIT",
       "category": "development",
