@@ -176,11 +176,7 @@ async fn main() -> Result<()> {
         }
         Command::Install => {
             let output = cli::run_install(&project_root).await?;
-            println!("plugin_root: {}", output.plugin_root);
-            println!("binary_path: {}", output.binary_path);
-            println!("config_path: {}", output.config_path);
-            println!("wrote_config: {}", output.wrote_config);
-            println!("embedding_healthy: {}", output.embedding_healthy);
+            println!("plugin config: {}", output.config_path);
         }
         Command::Mcp => {
             mcp::run(&project_root).await?;
