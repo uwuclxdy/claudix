@@ -494,7 +494,7 @@ fn chunk_id(file_hash: FileHash, byte_range: ByteRange) -> ChunkId {
     payload[16..20].copy_from_slice(&byte_range.start.to_be_bytes());
     payload[20..24].copy_from_slice(&byte_range.end.to_be_bytes());
 
-    ChunkId(xxhash_rust::xxh3::xxh3_128(&payload) as u64)
+    ChunkId(xxhash_rust::xxh3::xxh3_64(&payload))
 }
 
 fn extend_start_for_rust_docs(content: &str, node_start: usize) -> usize {
