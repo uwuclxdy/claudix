@@ -181,8 +181,7 @@ pub async fn run_auto_install(project_root: impl AsRef<Path>) -> Option<String> 
         plugin_root_from_env(project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT")).ok()?;
     let config_path = global_config_path().ok()?;
 
-    let installed_assets = source_root != plugin_root;
-    install_plugin_assets(&source_root, &plugin_root)
+    let installed_assets = install_plugin_assets(&source_root, &plugin_root)
         .await
         .ok()?;
     let wrote_config = ensure_global_config(&config_path).await.ok()?;
@@ -261,57 +260,59 @@ async fn status_from_store(store: &Store) -> Result<StatusOutput> {
     })
 }
 
-async fn install_plugin_assets(project_root: &Path, plugin_root: &Path) -> Result<()> {
-    copy_plugin_asset(
+async fn install_plugin_assets(project_root: &Path, plugin_root: &Path) -> Result<bool> {
+    let mut changed = false;
+    changed |= copy_plugin_asset(
         project_root,
         ".claude-plugin/plugin.json",
         plugin_root.join(".claude-plugin").join("plugin.json"),
     )
     .await?;
-    copy_plugin_asset(
+    changed |= copy_plugin_asset(
         project_root,
         "hooks/hooks.json",
         plugin_root.join("hooks").join("hooks.json"),
     )
     .await?;
-    copy_plugin_asset(
+    changed |= copy_plugin_asset(
         project_root,
         "bin/claudix",
         plugin_root.join("bin").join(binary_name()),
     )
     .await?;
     make_executable(&plugin_root.join("bin").join(binary_name())).await?;
-    copy_plugin_directory(project_root, "commands", plugin_root.join("commands")).await?;
-    copy_plugin_directory(project_root, "scripts", plugin_root.join("scripts")).await?;
-    Ok(())
+    changed |=
+        copy_plugin_directory(project_root, "commands", plugin_root.join("commands")).await?;
+    changed |= copy_plugin_directory(project_root, "scripts", plugin_root.join("scripts")).await?;
+    Ok(changed)
 }
 
 async fn copy_plugin_asset(
     project_root: &Path,
     source_relative: &str,
     destination: PathBuf,
-) -> Result<()> {
+) -> Result<bool> {
     let source = required_plugin_asset(project_root, source_relative).await?;
 
-    if source == destination {
-        return Ok(());
+    if source == destination || files_match(&source, &destination).await? {
+        return Ok(false);
     }
 
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).await?;
     }
     fs::copy(source, &destination).await?;
-    Ok(())
+    Ok(true)
 }
 
 async fn copy_plugin_directory(
     project_root: &Path,
     source_relative: &str,
     destination: PathBuf,
-) -> Result<()> {
+) -> Result<bool> {
     let source = required_plugin_asset(project_root, source_relative).await?;
-    if source == destination {
-        return Ok(());
+    if source == destination || directories_match(&source, &destination).await? {
+        return Ok(false);
     }
 
     if fs::try_exists(&destination).await? {
@@ -334,7 +335,54 @@ async fn copy_plugin_directory(
         }
     }
 
-    Ok(())
+    Ok(true)
+}
+
+async fn files_match(left: &Path, right: &Path) -> Result<bool> {
+    if !fs::try_exists(right).await? {
+        return Ok(false);
+    }
+
+    let left_metadata = fs::metadata(left).await?;
+    let right_metadata = fs::metadata(right).await?;
+    if left_metadata.len() != right_metadata.len() {
+        return Ok(false);
+    }
+
+    Ok(fs::read(left).await? == fs::read(right).await?)
+}
+
+async fn directories_match(left: &Path, right: &Path) -> Result<bool> {
+    if !fs::try_exists(right).await? {
+        return Ok(false);
+    }
+
+    let mut left_entries = directory_file_names(left).await?;
+    let mut right_entries = directory_file_names(right).await?;
+    left_entries.sort();
+    right_entries.sort();
+    if left_entries != right_entries {
+        return Ok(false);
+    }
+
+    for entry in left_entries {
+        if !files_match(&left.join(&entry), &right.join(&entry)).await? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+async fn directory_file_names(path: &Path) -> Result<Vec<std::ffi::OsString>> {
+    let mut file_names = Vec::new();
+    let mut entries = fs::read_dir(path).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_type().await?.is_file() {
+            file_names.push(entry.file_name());
+        }
+    }
+    Ok(file_names)
 }
 
 async fn required_plugin_asset(project_root: &Path, source_relative: &str) -> Result<PathBuf> {
@@ -741,6 +789,12 @@ mod tests {
         let result =
             install_plugin_assets(Path::new(env!("CARGO_MANIFEST_DIR")), &plugin_root).await;
         assert!(result.is_ok());
+        assert!(result.ok().unwrap_or(false));
+
+        let second_result =
+            install_plugin_assets(Path::new(env!("CARGO_MANIFEST_DIR")), &plugin_root).await;
+        assert!(second_result.is_ok());
+        assert!(!second_result.ok().unwrap_or(true));
 
         let plugin_manifest =
             fs::read_to_string(plugin_root.join(".claude-plugin").join("plugin.json")).await;

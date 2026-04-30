@@ -23,11 +23,9 @@ use std::time::Duration;
 
 use chunking::{Chunker, MultiLanguageChunker};
 use config::{Config, EmbeddingProvider};
-#[cfg(feature = "bundled-embedder")]
-use embedding::BundledProvider;
 #[cfg(any(test, feature = "test-stub"))]
 use embedding::StubProvider;
-use embedding::{HttpProvider, Provider};
+use embedding::{BundledProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator};
 use error::RecoveryHint;
 use search::{SearchQuery, SearchResult, Searcher};
@@ -242,21 +240,9 @@ async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
     }
 
     match config.embedding.provider {
-        EmbeddingProvider::Bundled => {
-            #[cfg(feature = "bundled-embedder")]
-            {
-                Ok(Arc::new(
-                    BundledProvider::new(config.embedding.model.clone(), dimensions).await?,
-                ))
-            }
-            #[cfg(not(feature = "bundled-embedder"))]
-            {
-                Err(ClaudixError::ConfigInvalid {
-                    message: "this binary was compiled without the bundled embedder; set embedding.provider = \"http\" in claudix.toml".into(),
-                    recovery: RecoveryHint("Set embedding.provider = \"http\" and configure embedding.endpoint"),
-                })
-            }
-        }
+        EmbeddingProvider::Bundled => Ok(Arc::new(
+            BundledProvider::new(config.embedding.model.clone(), dimensions).await?,
+        )),
         EmbeddingProvider::Http => Ok(Arc::new(HttpProvider::new(
             config.embedding.endpoint.clone(),
             config.embedding.model.clone(),

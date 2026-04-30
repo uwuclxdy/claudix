@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BUNDLED=false
-for arg in "$@"; do
-  case "$arg" in
-    --bundled) BUNDLED=true ;;
-  esac
-done
-
 if ! command -v cargo >/dev/null 2>&1; then
   printf 'claudix: cargo is required. Install Rust from https://rustup.rs/\n' >&2
   exit 1
@@ -15,11 +8,7 @@ fi
 
 REPO="https://github.com/uwuclxdy/claudix"
 
-if [[ "$BUNDLED" == "true" ]]; then
-  cargo install --git "$REPO"
-else
-  cargo install --git "$REPO" --no-default-features
-fi
+cargo install --git "$REPO"
 
 if command -v claude >/dev/null 2>&1; then
   claude plugin marketplace add uwuclxdy/claudix

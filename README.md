@@ -10,55 +10,32 @@ Core design goal: never break the session, always recover gracefully.
 
 ## Requirements
 
-- **Claude Code** (version TBD; plugin API v1)
 - **macOS 11+ (Apple Silicon)**, **Linux x86_64** (glibc 2.28+ or musl), **Windows 10+ x86_64**
 - **Rust 1.83+** (if building from source; Intel Mac must build from source — no prebuilt)
-- **Optional**: LM Studio or Ollama for custom embedding backends (bundled `bge-small-en-v1.5` via ONNX requires only `libonnxruntime` or `onnxruntime.dll`)
+- **Optional**: LM Studio or Ollama for custom embedding backends (
+  - bundled `bge-small-en-v1.5` requires `libonnxruntime` or `onnxruntime.dll`)
 
 ## Installation
 
 **Requires**: Rust 1.83+ (`rustup.rs`) and Claude Code.
 
-Two install variants:
-
-| Variant | Binary size | Embedding |
-|---------|-------------|-----------|
-| Default (no `--bundled`) | Small | Requires LM Studio or Ollama running locally |
-| `--bundled` | Large (~100 MB) | Ships `bge-small-en-v1.5` via ONNX — zero config |
-
-Use `--bundled` if you want zero-setup. Use the default if you already run LM Studio or Ollama and prefer a smaller binary or a different model.
+claudix ships the bundled `bge-small-en-v1.5` embedder and uses it as the fallback when no embedding provider is configured. Set `embedding.provider = "http"` if you prefer LM Studio, Ollama, or another OpenAI-compatible embedding server.
 
 ### Linux / macOS
 
 ```bash
-# default — bring your own embedding server
 curl -fsSL https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.sh | bash
-```
-
-```bash
-# bundled — works out of the box, larger binary
-curl -fsSL https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.sh | bash -s -- --bundled
 ```
 
 ### Windows
 
 ```powershell
-# default
 irm https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.bat | iex
-```
-
-```powershell
-# bundled
-irm https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.bat | iex --bundled
 ```
 
 ### Manual
 
 ```bash
-# default — http embedder only
-cargo install --git https://github.com/uwuclxdy/claudix --no-default-features
-
-# bundled — includes ONNX runtime + bge-small-en-v1.5 weights
 cargo install --git https://github.com/uwuclxdy/claudix
 ```
 
@@ -78,7 +55,7 @@ Configuration lives in two TOML files (project overrides global):
 - **Global**: `~/.claude/claudix.toml`
 - **Project**: `<repo>/.claude/claudix.toml`
 
-Both optional. If neither exists, bundled defaults and `bge-small-en-v1.5` embedder are used. Run `/claudix:doctor` to see active configuration.
+Both optional. If neither file sets an embedding provider, bundled defaults and the `bge-small-en-v1.5` embedder are used. Run `/claudix:doctor` to see active configuration.
 
 ### Full Schema (defaults)
 
