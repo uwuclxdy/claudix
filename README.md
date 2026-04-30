@@ -120,12 +120,10 @@ Results show file path, line range, language, definition kind, name, and relevan
 
 On first session or after plugin upgrade, the `SessionStart` hook:
 
-1. Verifies binary exists (downloads if missing)
-2. Checks manifest schema matches binary version
-3. Pings embedding endpoint
-4. Counts indexed chunks
-5. Emits user-visible status via `systemMessage` and lightweight model context via `additionalContext`
-6. Kicks off background reindex if stale (>24 hours by default)
+1. Checks that plugin files and global config are present
+2. Emits `claudix ready` via `systemMessage` when setup is complete
+3. Tells the user to rerun the install script if setup is incomplete
+4. Kicks off the background update check
 
 If anything fails, the hook exits 0 (fail-open): session continues unaffected.
 

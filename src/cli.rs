@@ -68,6 +68,13 @@ pub struct InstallOutput {
     pub binary_path: String,
     pub config_path: String,
     pub wrote_config: bool,
+    pub embedding_healthy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetupState {
+    Ready,
+    Missing(Vec<&'static str>),
 }
 
 pub async fn run_search(
@@ -156,53 +163,46 @@ pub async fn run_clear_index(project_root: impl AsRef<Path>) -> Result<ClearOutp
 
 pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
-    let plugin_root = plugin_root(&project_root)?;
+    let source_root = install_source_root(&project_root)?;
+    let plugin_root = plugin_root_from_env(&project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT"))?;
     let binary_path = plugin_root.join("bin").join(binary_name());
     let config_path = global_config_path()?;
 
-    install_plugin_assets(&project_root, &plugin_root).await?;
+    install_plugin_assets(&source_root, &plugin_root).await?;
 
     let wrote_config = ensure_global_config(&config_path).await?;
+    let config = config::load(&project_root)?;
+    let claudix = Claudix::new(project_root, Arc::new(config)).await?;
+    let embedding_healthy = claudix.embedder_health_check().await.is_ok();
 
     Ok(InstallOutput {
         plugin_root: plugin_root.display().to_string(),
         binary_path: binary_path.display().to_string(),
         config_path: config_path.display().to_string(),
         wrote_config,
+        embedding_healthy,
     })
 }
 
-pub async fn run_auto_install(project_root: impl AsRef<Path>) -> Option<String> {
+pub async fn setup_state(project_root: impl AsRef<Path>) -> SetupState {
     let project_root = project_root.as_ref();
-    let source_root = plugin_asset_source(project_root).ok()?;
-    let plugin_root =
-        plugin_root_from_env(project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT")).ok()?;
-    let config_path = global_config_path().ok()?;
+    let mut missing = Vec::new();
 
-    let installed_assets = install_plugin_assets(&source_root, &plugin_root)
-        .await
-        .ok()?;
-    let wrote_config = ensure_global_config(&config_path).await.ok()?;
+    if plugin_root_from_env(project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT")).is_err() {
+        missing.push("plugin files");
+    }
+    match global_config_path() {
+        Ok(config_path) if config_path.try_exists().unwrap_or(false) => {}
+        _ => missing.push("global config"),
+    }
+    if config::load(project_root).is_err() {
+        missing.push("valid config");
+    }
 
-    auto_install_message(installed_assets, wrote_config, &config_path)
-}
-
-fn auto_install_message(
-    installed_assets: bool,
-    wrote_config: bool,
-    config_path: &Path,
-) -> Option<String> {
-    match (installed_assets, wrote_config) {
-        (_, true) => Some(format!(
-            "please configure {} and restart Claude Code",
-            config_path.display()
-        )),
-        (true, false) => Some(format!(
-            "claudix semantic search ready."
-        )),
-        (false, false) => Some(format!(
-            "claudix is downloading embeddings"
-        )),
+    if missing.is_empty() {
+        SetupState::Ready
+    } else {
+        SetupState::Missing(missing)
     }
 }
 
@@ -443,36 +443,30 @@ fn default_global_config() -> &'static str {
     "# Global claudix configuration\n# Uncomment and edit values as needed.\n\n[embedding]\n# provider = \"bundled\"\n# model = \"bge-small-en-v1.5\"\n# dimensions = 384\n# endpoint = \"http://localhost:11434\"\n\n[indexing]\n# reindex_after_hours = 24\n"
 }
 
-fn plugin_root(project_root: &Path) -> Result<PathBuf> {
-    plugin_root_from_env(project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT"))
-}
-
-fn plugin_asset_source(project_root: &Path) -> Result<PathBuf> {
+fn install_source_root(project_root: &Path) -> Result<PathBuf> {
     if is_claudix_plugin_root(project_root) {
         return Ok(project_root.to_path_buf());
     }
 
-    let source_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    if is_claudix_plugin_root(&source_root) {
-        return Ok(source_root);
+    match std::env::var_os("CLAUDE_PLUGIN_ROOT") {
+        Some(path) => Ok(PathBuf::from(path)),
+        None => Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
     }
-
-    plugin_root(project_root)
 }
 
 fn plugin_root_from_env(
     project_root: &Path,
     plugin_root_env: Option<std::ffi::OsString>,
 ) -> Result<PathBuf> {
-    if is_claudix_plugin_root(project_root) {
-        return Ok(local_plugin_root());
-    }
-
     if let Some(path) = plugin_root_env {
         let plugin_root = PathBuf::from(path);
         if is_claudix_plugin_root(&plugin_root) {
             return Ok(plugin_root);
         }
+    }
+
+    if is_claudix_plugin_root(project_root) {
+        return Ok(local_plugin_root());
     }
 
     Err(ClaudixError::ConfigInvalid {
@@ -886,36 +880,16 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[test]
-    fn install_next_step_is_present_for_local_bundle() {
-        let plugin_root = local_plugin_root();
-
-        let next_step = install_next_step(&plugin_root);
-        assert!(next_step.is_some());
-        assert!(next_step.unwrap_or_default().contains("/plugin install"));
-    }
-
-    #[test]
-    fn install_next_step_is_absent_for_enabled_plugin_root() {
+    #[tokio::test]
+    async fn setup_state_reports_missing_plugin_files() {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
 
-        let next_step = install_next_step(fixture.root());
-        assert!(next_step.is_none());
-    }
-
-    #[test]
-    fn auto_install_message_distinguishes_setup_from_refresh() {
-        let config_path = Path::new("/tmp/claudix.toml");
-
-        let setup = auto_install_message(true, true, config_path);
-        assert!(setup.is_some_and(|message| message.contains("setup complete")));
-
-        let refresh = auto_install_message(true, false, config_path);
-        assert!(refresh.is_some_and(|message| message.contains("already set up")));
-
-        assert!(auto_install_message(false, false, config_path).is_none());
+        let setup_state = setup_state(fixture.root()).await;
+        assert!(
+            matches!(setup_state, SetupState::Missing(parts) if parts.contains(&"plugin files"))
+        );
     }
 
     #[test]

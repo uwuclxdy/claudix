@@ -30,57 +30,24 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
 }
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
-    let pending_update = consume_pending_restart().await;
-    let install_msg = cli::run_auto_install(project_root).await;
-
-    let config = config::load(project_root)?;
-    let store = Store::new(project_root, &config)?;
-    let manifest = store.read_manifest()?;
-    let stats = store.chunk_stats().await?;
-    let mut notes = Vec::new();
-
-    notes.push(format!(
-        "claudix index: {} chunks across {} files",
-        stats.chunk_count, stats.file_count
-    ));
-
-    if let Some(manifest) = manifest.as_ref() {
-        notes.push(format!(
-            "model {} ({} dims)",
-            manifest.embedding_model, manifest.dimensions
-        ));
-        if let Some(last_full_index_at) = manifest.last_full_index_at.as_deref() {
-            notes.push(format!("last full index {last_full_index_at}"));
-        }
-        if index_is_stale(manifest, &config) {
-            notes.push(format!(
-                "index is stale; run `claudix index` to refresh it (threshold {}h)",
-                config.indexing.reindex_after_hours
-            ));
-        }
-    } else {
-        notes.push("index missing; run `claudix index` to build it".to_owned());
-    }
-
-    if config.hooks.session_start_warmup {
-        let claudix = Claudix::new(project_root.to_path_buf(), Arc::new(config)).await;
-        match claudix {
-            Ok(claudix) => {
-                if let Err(error) = claudix.embedder_health_check().await {
-                    notes.push(format!("embedding health check failed: {error}"));
-                }
-            }
-            Err(error) => notes.push(format!("embedding unavailable: {error}")),
-        }
-    }
-
     let mut response =
         session_start_response("claudix semantic search status available".to_owned());
-    let user_message = pending_update
-        .or(install_msg)
-        .unwrap_or_else(|| notes.join(". "));
+    let user_message = match consume_pending_restart().await {
+        Some(message) => message,
+        None => session_start_message(cli::setup_state(project_root).await),
+    };
     response["systemMessage"] = Value::String(user_message);
     Ok(Some(response))
+}
+
+fn session_start_message(setup_state: cli::SetupState) -> String {
+    match setup_state {
+        cli::SetupState::Ready => "claudix ready".to_owned(),
+        cli::SetupState::Missing(parts) => format!(
+            "claudix setup incomplete (missing {}); run the install script again",
+            parts.join(", ")
+        ),
+    }
 }
 
 async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Result<Option<Value>> {
@@ -299,13 +266,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_reports_missing_index() {
+    async fn session_start_reports_incomplete_setup() {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        let mut config = stub_config();
-        config.hooks.session_start_warmup = false;
-        write_config(fixture.root(), &config);
+        write_config(fixture.root(), &stub_config());
 
         let response = run(fixture.root(), HookEvent::SessionStart, "{}").await;
         assert!(response.is_ok());
@@ -313,12 +278,18 @@ mod tests {
         assert!(response.is_some());
         let response = response.unwrap_or(Value::Null);
         let user_message = response["systemMessage"].as_str().unwrap_or_default();
-        assert!(user_message.contains("index missing"));
+        assert!(user_message.contains("run the install script again"));
 
         let model_context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
         assert_eq!(model_context, "claudix semantic search status available");
+    }
+
+    #[test]
+    fn session_start_message_reports_ready_setup() {
+        let message = session_start_message(cli::SetupState::Ready);
+        assert_eq!(message, "claudix ready");
     }
 
     #[tokio::test]

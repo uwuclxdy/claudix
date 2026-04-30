@@ -180,6 +180,7 @@ async fn main() -> Result<()> {
             println!("binary_path: {}", output.binary_path);
             println!("config_path: {}", output.config_path);
             println!("wrote_config: {}", output.wrote_config);
+            println!("embedding_healthy: {}", output.embedding_healthy);
         }
         Command::Mcp => {
             mcp::run(&project_root).await?;
