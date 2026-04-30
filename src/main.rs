@@ -180,9 +180,6 @@ async fn main() -> Result<()> {
             println!("binary_path: {}", output.binary_path);
             println!("config_path: {}", output.config_path);
             println!("wrote_config: {}", output.wrote_config);
-            if let Some(next_step) = output.next_step {
-                println!("next_step: {next_step}");
-            }
         }
         Command::Mcp => {
             mcp::run(&project_root).await?;

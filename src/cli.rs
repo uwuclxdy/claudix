@@ -68,7 +68,6 @@ pub struct InstallOutput {
     pub binary_path: String,
     pub config_path: String,
     pub wrote_config: bool,
-    pub next_step: Option<String>,
 }
 
 pub async fn run_search(
@@ -170,7 +169,6 @@ pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput
         binary_path: binary_path.display().to_string(),
         config_path: config_path.display().to_string(),
         wrote_config,
-        next_step: install_next_step(&plugin_root),
     })
 }
 
@@ -196,14 +194,15 @@ fn auto_install_message(
 ) -> Option<String> {
     match (installed_assets, wrote_config) {
         (_, true) => Some(format!(
-            "claudix: setup complete — config at {}. Restart Claude Code to load MCP, then run /claudix:index.",
+            "please configure {} and restart Claude Code",
             config_path.display()
         )),
         (true, false) => Some(format!(
-            "claudix: already set up — refreshed plugin files; config at {}.",
-            config_path.display()
+            "claudix semantic search ready."
         )),
-        (false, false) => None,
+        (false, false) => Some(format!(
+            "claudix is downloading embeddings"
+        )),
     }
 }
 
@@ -406,18 +405,6 @@ async fn required_plugin_asset(project_root: &Path, source_relative: &str) -> Re
         message: format!("required plugin asset missing: {}", source.display()),
         recovery: RecoveryHint("Restore the plugin metadata files before running claudix install"),
     })
-}
-
-fn install_next_step(plugin_root: &Path) -> Option<String> {
-    if !plugin_root.starts_with(local_plugin_root()) {
-        return None;
-    }
-
-    Some(format!(
-        "Run `claude --plugin-dir {}` or install this path with `/plugin install {}`.",
-        plugin_root.display(),
-        plugin_root.display()
-    ))
 }
 
 fn local_plugin_root() -> PathBuf {
