@@ -441,7 +441,7 @@ async fn ensure_global_config(config_path: &Path) -> Result<bool> {
 }
 
 fn default_global_config() -> &'static str {
-    "# Global claudix configuration\n# Uncomment and edit values as needed.\n\n[embedding]\n# provider = \"bundled\"\n# model = \"bge-small-en-v1.5\"\n# dimensions = 384\n# endpoint = \"http://localhost:11434\"\n\n[indexing]\n# reindex_after_hours = 24\n"
+    "# Global claudix configuration\n# Uncomment and edit values as needed.\n\n[embedding]\n# provider = \"bundled\"\n# model = \"bge-small-en-v1.5\"\n# dimensions = 384\n# endpoint = \"http://localhost:11434\"\n\n[indexing]\n# reindex_after_hours = 24\n\n[hooks]\n# auto_index_on_session_start = true\n"
 }
 
 fn install_source_root(project_root: &Path) -> Result<PathBuf> {

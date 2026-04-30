@@ -55,6 +55,7 @@ pub struct HooksConfig {
     pub intercept_grep: bool,
     pub auto_reembed_on_edit: bool,
     pub session_start_warmup: bool,
+    pub auto_index_on_session_start: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +105,7 @@ impl Default for Config {
                 intercept_grep: true,
                 auto_reembed_on_edit: true,
                 session_start_warmup: true,
+                auto_index_on_session_start: true,
             },
             paths: PathsConfig {
                 index_dir: PathBuf::from(".claudix/index"),
@@ -311,6 +313,10 @@ impl Config {
                     .hooks
                     .session_start_warmup
                     .unwrap_or(defaults.hooks.session_start_warmup),
+                auto_index_on_session_start: partial
+                    .hooks
+                    .auto_index_on_session_start
+                    .unwrap_or(defaults.hooks.auto_index_on_session_start),
             },
             paths: PathsConfig {
                 index_dir: path_from_partial(partial.paths.index_dir, defaults.paths.index_dir),

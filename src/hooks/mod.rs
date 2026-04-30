@@ -29,7 +29,52 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
     }
 }
 
+fn is_git_repo(path: &Path) -> bool {
+    let mut current = path;
+    loop {
+        if current.join(".git").exists() {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+}
+
+fn spawn_background_index(project_root: &Path, config: &crate::config::Config) {
+    let Ok(store) = Store::new(project_root, config) else {
+        return;
+    };
+    let needs_index = store
+        .read_manifest()
+        .ok()
+        .flatten()
+        .as_ref()
+        .map(|m| index_is_stale(m, config))
+        .unwrap_or(true);
+    if !needs_index {
+        return;
+    }
+    let Ok(binary) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(binary)
+        .arg("index")
+        .current_dir(project_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
+    if let Ok(ref config) = config::load(project_root) {
+        if config.hooks.auto_index_on_session_start && is_git_repo(project_root) {
+            spawn_background_index(project_root, config);
+        }
+    }
+
     let mut response =
         session_start_response("claudix semantic search status available".to_owned());
     let user_message = match consume_pending_restart().await {
