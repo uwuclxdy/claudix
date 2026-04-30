@@ -91,6 +91,12 @@ pub enum ClaudixError {
     #[error("lance error: {0}")]
     Lance(#[from] lancedb::Error),
 
+    #[error("not a git repository: {path:?}")]
+    NotAGitRepository {
+        path: PathBuf,
+        recovery: RecoveryHint,
+    },
+
     #[error("git enumeration error: {0}")]
     Git(String),
 
@@ -109,6 +115,7 @@ impl ClaudixError {
             Self::SchemaMismatch { recovery, .. } => Some(recovery.0),
             Self::DimensionMismatch { recovery, .. } => Some(recovery.0),
             Self::EmbeddingModelMismatch { recovery, .. } => Some(recovery.0),
+            Self::NotAGitRepository { recovery, .. } => Some(recovery.0),
             Self::PathTraversal { recovery, .. } => Some(recovery.0),
             Self::BundledAssetsMissing { recovery, .. } => Some(recovery.0),
             Self::BundledDownloadConfirmationRequired { recovery, .. } => Some(recovery.0),

@@ -94,6 +94,7 @@ pub async fn run_search(
 
 pub async fn run_index(project_root: impl AsRef<Path>) -> Result<IndexOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
+    require_git_repo(&project_root)?;
     let config = config::load(&project_root)?;
     let claudix = Claudix::new(project_root, Arc::new(config)).await?;
     let stats = claudix.index_full().await?;
@@ -500,6 +501,29 @@ fn binary_name() -> &'static str {
         "claudix.exe"
     } else {
         "claudix"
+    }
+}
+
+fn require_git_repo(project_root: &Path) -> Result<()> {
+    if !is_git_repo(project_root) {
+        return Err(ClaudixError::NotAGitRepository {
+            path: project_root.to_path_buf(),
+            recovery: RecoveryHint("Run claudix index from inside a git repository"),
+        });
+    }
+    Ok(())
+}
+
+pub fn is_git_repo(path: &Path) -> bool {
+    let mut current = path;
+    loop {
+        if current.join(".git").exists() {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return false,
+        }
     }
 }
 
