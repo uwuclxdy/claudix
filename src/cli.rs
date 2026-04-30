@@ -186,13 +186,24 @@ pub async fn run_auto_install(project_root: impl AsRef<Path>) -> Option<String> 
         .ok()?;
     let wrote_config = ensure_global_config(&config_path).await.ok()?;
 
-    if installed_assets || wrote_config {
-        Some(format!(
+    auto_install_message(installed_assets, wrote_config, &config_path)
+}
+
+fn auto_install_message(
+    installed_assets: bool,
+    wrote_config: bool,
+    config_path: &Path,
+) -> Option<String> {
+    match (installed_assets, wrote_config) {
+        (_, true) => Some(format!(
             "claudix: setup complete — config at {}. Restart Claude Code to load MCP, then run /claudix:index.",
             config_path.display()
-        ))
-    } else {
-        None
+        )),
+        (true, false) => Some(format!(
+            "claudix: already set up — refreshed plugin files; config at {}.",
+            config_path.display()
+        )),
+        (false, false) => None,
     }
 }
 
@@ -905,6 +916,19 @@ mod tests {
 
         let next_step = install_next_step(fixture.root());
         assert!(next_step.is_none());
+    }
+
+    #[test]
+    fn auto_install_message_distinguishes_setup_from_refresh() {
+        let config_path = Path::new("/tmp/claudix.toml");
+
+        let setup = auto_install_message(true, true, config_path);
+        assert!(setup.is_some_and(|message| message.contains("setup complete")));
+
+        let refresh = auto_install_message(true, false, config_path);
+        assert!(refresh.is_some_and(|message| message.contains("already set up")));
+
+        assert!(auto_install_message(false, false, config_path).is_none());
     }
 
     #[test]
