@@ -46,6 +46,25 @@ impl MultiLanguageChunker {
     }
 }
 
+impl MultiLanguageChunker {
+    pub fn chunk_as_text(
+        &self,
+        path: &RelativePath,
+        language: Language,
+        file_hash: FileHash,
+        content: &str,
+    ) -> Result<Vec<Chunk>> {
+        chunk_fallback(
+            path,
+            language,
+            file_hash,
+            content,
+            self.fallback_chunk_lines,
+            self.fallback_overlap_lines,
+        )
+    }
+}
+
 impl Chunker for MultiLanguageChunker {
     fn chunk(
         &self,

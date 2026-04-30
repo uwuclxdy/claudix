@@ -16,6 +16,7 @@ pub struct EnumeratedFile {
     pub relative_path: RelativePath,
     pub language: Language,
     pub file_hash: FileHash,
+    pub force_indexed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +45,8 @@ impl FileEnumerator {
                 continue;
             }
 
-            if let Some(file) = self.enumerate_one(relative_path)? {
+            let force_indexed = filters.is_force_included(&relative_path);
+            if let Some(file) = self.enumerate_one(relative_path, force_indexed)? {
                 files.push(file);
             }
         }
@@ -52,7 +54,11 @@ impl FileEnumerator {
         Ok(files)
     }
 
-    fn enumerate_one(&self, relative_path: RelativePath) -> Result<Option<EnumeratedFile>> {
+    fn enumerate_one(
+        &self,
+        relative_path: RelativePath,
+        force_indexed: bool,
+    ) -> Result<Option<EnumeratedFile>> {
         let absolute_path = self.resolve_relative_path(&relative_path)?;
         let metadata = match fs::symlink_metadata(&absolute_path) {
             Ok(metadata) => metadata,
@@ -81,6 +87,7 @@ impl FileEnumerator {
             relative_path,
             language,
             file_hash,
+            force_indexed,
         }))
     }
 
@@ -236,6 +243,38 @@ mod tests {
         assert!(paths.contains("src/keep.rs"));
         assert!(paths.contains("src/reinclude.rs"));
         assert!(!paths.contains("src/skip.rs"));
+    }
+
+    #[test]
+    fn indexinclude_sets_force_indexed_for_unknown_language_files() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let readme = fixture.root().join("README.md");
+        assert!(fs::write(&readme, "# hello\nsome docs\n").is_ok());
+        let indexinclude = fixture.root().join(".indexinclude");
+        assert!(fs::write(&indexinclude, "*.md\n").is_ok());
+
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), Config::default());
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let files = enumerator.enumerate();
+        assert!(files.is_ok());
+        let files = files.ok().unwrap_or_else(|| unreachable!());
+
+        let readme_file = files
+            .iter()
+            .find(|f| f.relative_path.as_str() == "README.md");
+        assert!(readme_file.is_some());
+        let readme_file = readme_file.unwrap_or_else(|| unreachable!());
+        assert_eq!(readme_file.language, Language::Unknown);
+        assert!(readme_file.force_indexed);
+
+        let rs_file = files.iter().find(|f| f.relative_path.as_str() == "src/lib.rs");
+        assert!(rs_file.is_some());
+        assert!(!rs_file.unwrap_or_else(|| unreachable!()).force_indexed);
     }
 
     #[test]

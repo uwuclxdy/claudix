@@ -30,6 +30,12 @@ impl PathFilters {
 
         !ignored
     }
+
+    pub fn is_force_included(&self, path: &RelativePath) -> bool {
+        self.indexinclude
+            .matched(&path.to_path_buf(), false)
+            .is_ignore()
+    }
 }
 
 fn load_matcher(project_root: &Path, file_name: &str) -> Result<Gitignore> {

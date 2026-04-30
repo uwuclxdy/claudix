@@ -162,11 +162,16 @@ impl Claudix {
         let path = file.relative_path.clone();
         let language = file.language;
         let file_hash = file.file_hash;
+        let force_indexed = file.force_indexed;
         let overlap_lines = self.config.indexing.chunk_overlap_lines;
 
         task::spawn_blocking(move || {
-            MultiLanguageChunker::with_fallback_params(60, overlap_lines)
-                .chunk(&path, language, file_hash, &content)
+            let chunker = MultiLanguageChunker::with_fallback_params(60, overlap_lines);
+            if force_indexed && language == Language::Unknown {
+                chunker.chunk_as_text(&path, language, file_hash, &content)
+            } else {
+                chunker.chunk(&path, language, file_hash, &content)
+            }
         })
         .await
         .map_err(|error| ClaudixError::TreeSitter(error.to_string()))?
