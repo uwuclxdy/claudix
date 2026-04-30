@@ -127,7 +127,12 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
     };
 
     let query = match tool_name {
-        "Grep" => tool_input.pattern,
+        "Grep" => {
+            if tool_input.path.is_some() || tool_input.include.is_some() {
+                return Ok(None);
+            }
+            tool_input.pattern
+        }
         "Bash" => extract_search_command(tool_input.command.as_deref()),
         _ => None,
     };
@@ -270,6 +275,8 @@ struct ToolInput {
     file_path: Option<String>,
     pattern: Option<String>,
     command: Option<String>,
+    path: Option<String>,
+    include: Option<String>,
 }
 
 #[cfg(test)]
