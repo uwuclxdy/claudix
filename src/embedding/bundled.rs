@@ -249,6 +249,7 @@ async fn ensure_assets_exist(paths: &AssetPaths, model_id: &str) -> Result<()> {
         fs::create_dir_all(parent).await?;
     }
 
+    eprintln!("downloading default embeddings model (~120MB)...");
     download_asset(BUNDLED_MODEL_URL, &paths.model).await?;
     download_asset(BUNDLED_TOKENIZER_URL, &paths.tokenizer).await?;
 
