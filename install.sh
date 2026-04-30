@@ -11,6 +11,8 @@ REPO="https://github.com/uwuclxdy/claudix"
 cargo install --git "$REPO"
 
 if command -v claude >/dev/null 2>&1; then
+  claude plugin uninstall claudix@claudix || true
+  claude plugin marketplace rm uwuclxdy/claudix || true
   claude plugin marketplace add uwuclxdy/claudix
   claude plugin install claudix@claudix
   printf '\nclaudix installed. Restart Claude Code to activate.\n'

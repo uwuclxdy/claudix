@@ -20,6 +20,8 @@ if errorlevel 1 (
     echo   /plugin install claudix@claudix
     echo Then restart Claude Code.
 ) else (
+	claude plugin uninstall claudix@claudix >nul 2>&1
+	claude plugin marketplace rm uwuclxdy/claudix >nul 2>&1
     claude plugin marketplace add uwuclxdy/claudix
     claude plugin install claudix@claudix
     echo.
