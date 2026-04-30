@@ -124,7 +124,7 @@ On first session or after plugin upgrade, the `SessionStart` hook:
 2. Checks manifest schema matches binary version
 3. Pings embedding endpoint
 4. Counts indexed chunks
-5. Emits status via `additionalContext` (Claude sees "semantic search available")
+5. Emits user-visible status via `systemMessage` and lightweight model context via `additionalContext`
 6. Kicks off background reindex if stale (>24 hours by default)
 
 If anything fails, the hook exits 0 (fail-open): session continues unaffected.

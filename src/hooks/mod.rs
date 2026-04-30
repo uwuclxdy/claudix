@@ -74,10 +74,12 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         }
     }
 
-    let mut response = session_start_response(notes.join(". "));
-    if let Some(msg) = pending_update.or(install_msg) {
-        response["systemMessage"] = Value::String(msg);
-    }
+    let mut response =
+        session_start_response("claudix semantic search status available".to_owned());
+    let user_message = pending_update
+        .or(install_msg)
+        .unwrap_or_else(|| notes.join(". "));
+    response["systemMessage"] = Value::String(user_message);
     Ok(Some(response))
 }
 
@@ -310,10 +312,13 @@ mod tests {
         let response = response.ok().unwrap_or_else(|| unreachable!());
         assert!(response.is_some());
         let response = response.unwrap_or(Value::Null);
-        let message = response["hookSpecificOutput"]["additionalContext"]
+        let user_message = response["systemMessage"].as_str().unwrap_or_default();
+        assert!(user_message.contains("index missing"));
+
+        let model_context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
-        assert!(message.contains("index missing"));
+        assert_eq!(model_context, "claudix semantic search status available");
     }
 
     #[tokio::test]
