@@ -70,24 +70,6 @@ pub struct StorePaths {
     gitignore_path: PathBuf,
 }
 
-impl StorePaths {
-    pub fn state_dir(&self) -> &Path {
-        &self.state_dir
-    }
-
-    pub fn index_dir(&self) -> &Path {
-        &self.index_dir
-    }
-
-    pub fn manifest_path(&self) -> &Path {
-        &self.manifest_path
-    }
-
-    pub fn gitignore_path(&self) -> &Path {
-        &self.gitignore_path
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreStats {
     pub chunk_count: usize,
@@ -140,10 +122,6 @@ impl Store {
 
     pub fn project_root(&self) -> &Path {
         &self.project_root
-    }
-
-    pub fn paths(&self) -> &StorePaths {
-        &self.paths
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
@@ -758,17 +736,14 @@ mod tests {
         let store = store.ok().unwrap_or_else(|| unreachable!());
 
         assert_eq!(store.project_root(), project_root.path());
+        assert_eq!(store.paths.state_dir, project_root.path().join(".claudix"));
         assert_eq!(
-            store.paths().state_dir(),
-            project_root.path().join(".claudix").as_path()
+            store.paths.index_dir,
+            project_root.path().join(".claudix/index")
         );
         assert_eq!(
-            store.paths().index_dir(),
-            project_root.path().join(".claudix/index").as_path()
-        );
-        assert_eq!(
-            store.paths().manifest_path(),
-            project_root.path().join(".claudix/manifest.json").as_path()
+            store.paths.manifest_path,
+            project_root.path().join(".claudix/manifest.json")
         );
     }
 
@@ -782,11 +757,15 @@ mod tests {
         assert!(store.is_ok());
         let store = store.ok().unwrap_or_else(|| unreachable!());
 
-        assert!(store.ensure_layout().is_ok());
-        assert!(store.paths().state_dir().exists());
-        assert!(store.paths().index_dir().exists());
+        let state_dir = project_root.path().join(".claudix");
+        let index_dir = state_dir.join("index");
+        let gitignore_path = state_dir.join(".gitignore");
 
-        let gitignore = fs::read_to_string(store.paths().gitignore_path());
+        assert!(store.ensure_layout().is_ok());
+        assert!(state_dir.exists());
+        assert!(index_dir.exists());
+
+        let gitignore = fs::read_to_string(gitignore_path);
         assert!(gitignore.is_ok());
         assert_eq!(gitignore.ok().unwrap_or_else(|| unreachable!()), "*\n");
     }

@@ -175,6 +175,10 @@ async fn handle_tools_call(project_root: &Path, id: Option<Value>, params: Value
     Ok(success_response(id, tool_result))
 }
 
+fn to_value<T: Serialize>(value: T) -> Result<Value> {
+    serde_json::to_value(value).map_err(ClaudixError::from)
+}
+
 async fn search_code(project_root: &Path, arguments: Value) -> Result<Value> {
     let request: SearchCodeRequest = parse_tool_arguments(
         arguments,
@@ -195,19 +199,19 @@ async fn search_code(project_root: &Path, arguments: Value) -> Result<Value> {
         request.path_prefix,
     )
     .await?;
-    serde_json::to_value(output).map_err(ClaudixError::from)
+    to_value(output)
 }
 
 async fn get_index_status(project_root: &Path) -> Result<Value> {
     let output = cli::run_status(project_root).await?;
-    serde_json::to_value(output).map_err(ClaudixError::from)
+    to_value(output)
 }
 
 async fn reindex(project_root: &Path, arguments: Value) -> Result<Value> {
     let request: ReindexRequest =
         parse_tool_arguments(arguments, "reindex", "Pass force as an optional boolean")?;
     let output = cli::run_index(project_root).await?;
-    let mut payload = match serde_json::to_value(output).map_err(ClaudixError::from)? {
+    let mut payload = match to_value(output)? {
         Value::Object(object) => object,
         value => {
             let mut object = Map::new();
@@ -221,7 +225,7 @@ async fn reindex(project_root: &Path, arguments: Value) -> Result<Value> {
 
 async fn clear_index(project_root: &Path) -> Result<Value> {
     let output = cli::run_clear_index(project_root).await?;
-    serde_json::to_value(output).map_err(ClaudixError::from)
+    to_value(output)
 }
 
 async fn reindex_file(project_root: &Path, arguments: Value) -> Result<Value> {
@@ -231,7 +235,7 @@ async fn reindex_file(project_root: &Path, arguments: Value) -> Result<Value> {
         "Pass path for a file inside $CLAUDE_PROJECT_DIR",
     )?;
     let output = cli::run_reindex_file(project_root, Path::new(&request.path)).await?;
-    serde_json::to_value(output).map_err(ClaudixError::from)
+    to_value(output)
 }
 
 fn parse_tool_arguments<T>(

@@ -59,20 +59,6 @@ pub enum ClaudixError {
         recovery: RecoveryHint,
     },
 
-    #[error("bundled download confirmation required for model {model_id}")]
-    BundledDownloadConfirmationRequired {
-        model_id: String,
-        recovery: RecoveryHint,
-    },
-
-    #[error("sha256 mismatch for bundled asset {asset}")]
-    BundledAssetChecksumMismatch {
-        asset: String,
-        expected_sha256: String,
-        actual_sha256: String,
-        recovery: RecoveryHint,
-    },
-
     #[error("embedding error: {0}")]
     Embedding(String),
 
@@ -118,8 +104,6 @@ impl ClaudixError {
             Self::NotAGitRepository { recovery, .. } => Some(recovery.0),
             Self::PathTraversal { recovery, .. } => Some(recovery.0),
             Self::BundledAssetsMissing { recovery, .. } => Some(recovery.0),
-            Self::BundledDownloadConfirmationRequired { recovery, .. } => Some(recovery.0),
-            Self::BundledAssetChecksumMismatch { recovery, .. } => Some(recovery.0),
             _ => None,
         }
     }

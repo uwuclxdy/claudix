@@ -287,14 +287,17 @@ mod tests {
         ));
     }
 
-    use fixture::TestFixture;
+    mod config_support {
+        use crate as claudix;
 
-    fn test_config() -> Config {
-        let mut config = Config::default();
-        config.embedding.model = "stub-v1".to_owned();
-        config.embedding.dimensions = 8;
-        config
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/config_support.rs"
+        ));
     }
+
+    use config_support::stub_config;
+    use fixture::TestFixture;
 
     fn test_claudix(project_root: PathBuf, config: Config) -> Result<Claudix> {
         let store = Store::new(&project_root, &config)?;
@@ -316,7 +319,7 @@ mod tests {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        let config = test_config();
+        let config = stub_config();
 
         let claudix = test_claudix(fixture.root().to_path_buf(), config.clone());
         assert!(claudix.is_ok());
@@ -360,7 +363,7 @@ mod tests {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        let config = test_config();
+        let config = stub_config();
 
         let claudix = test_claudix(fixture.root().to_path_buf(), config);
         assert!(claudix.is_ok());
@@ -403,7 +406,7 @@ mod tests {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        let config = test_config();
+        let config = stub_config();
 
         let claudix = test_claudix(fixture.root().to_path_buf(), config);
         assert!(claudix.is_ok());
@@ -453,7 +456,7 @@ mod tests {
                 .is_ok()
         );
 
-        let config = test_config();
+        let config = stub_config();
         let claudix = test_claudix(fixture.root().to_path_buf(), config);
         assert!(claudix.is_ok());
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
@@ -474,7 +477,7 @@ mod tests {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        let config = test_config();
+        let config = stub_config();
 
         let claudix = test_claudix(fixture.root().to_path_buf(), config);
         assert!(claudix.is_ok());

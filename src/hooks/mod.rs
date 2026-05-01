@@ -60,10 +60,11 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) {
 }
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
-    if let Ok(ref config) = config::load(project_root) {
-        if config.hooks.auto_index_on_session_start && is_git_repo(project_root) {
-            spawn_background_index(project_root, config);
-        }
+    if let Ok(ref config) = config::load(project_root)
+        && config.hooks.auto_index_on_session_start
+        && is_git_repo(project_root)
+    {
+        spawn_background_index(project_root, config);
     }
 
     let mut response =
@@ -285,14 +286,17 @@ mod tests {
         ));
     }
 
-    use fixture::TestFixture;
+    mod config_support {
+        use crate as claudix;
 
-    fn stub_config() -> Config {
-        let mut config = Config::default();
-        config.embedding.model = "stub-v1".to_owned();
-        config.embedding.dimensions = 8;
-        config
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/config_support.rs"
+        ));
     }
+
+    use config_support::stub_config;
+    use fixture::TestFixture;
 
     fn write_config(project_root: &Path, config: &Config) {
         let claude_dir = project_root.join(".claude");

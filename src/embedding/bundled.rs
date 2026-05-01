@@ -57,7 +57,7 @@ impl BundledProvider {
         Self::from_cache_dir(default_cache_dir()?, model_id, dimensions).await
     }
 
-    pub async fn from_cache_dir(
+    async fn from_cache_dir(
         cache_dir: impl AsRef<Path>,
         model_id: impl Into<String>,
         dimensions: Dimension,

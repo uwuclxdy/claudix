@@ -158,35 +158,15 @@ mod tests {
     use crate::types::RelativePath;
     use std::collections::BTreeSet;
     use std::fs;
-    use std::path::{Path, PathBuf};
-    use std::process::Command;
-    use tempfile::TempDir;
 
-    struct TestFixture {
-        _tempdir: TempDir,
-        root: PathBuf,
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fixture.rs"
+        ));
     }
 
-    impl TestFixture {
-        fn new(name: &str) -> std::io::Result<Self> {
-            let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("tests")
-                .join("fixtures")
-                .join(name);
-            let tempdir = tempfile::tempdir()?;
-            let root = tempdir.path().join(name);
-            copy_dir_recursive(&source, &root)?;
-            init_git_repo(&root)?;
-            Ok(Self {
-                _tempdir: tempdir,
-                root,
-            })
-        }
-
-        fn root(&self) -> &Path {
-            &self.root
-        }
-    }
+    use fixture::TestFixture;
 
     #[test]
     fn enumerates_tracked_and_untracked_files() {
@@ -272,7 +252,9 @@ mod tests {
         assert_eq!(readme_file.language, Language::Unknown);
         assert!(readme_file.force_indexed);
 
-        let rs_file = files.iter().find(|f| f.relative_path.as_str() == "src/lib.rs");
+        let rs_file = files
+            .iter()
+            .find(|f| f.relative_path.as_str() == "src/lib.rs");
         assert!(rs_file.is_some());
         assert!(!rs_file.unwrap_or_else(|| unreachable!()).force_indexed);
     }
@@ -316,45 +298,5 @@ mod tests {
             .map(|file| file.relative_path.as_str().to_owned())
             .collect();
         assert!(!paths.contains("src/oversized.rs"));
-    }
-
-    fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
-        fs::create_dir_all(destination)?;
-
-        for entry in fs::read_dir(source)? {
-            let entry = entry?;
-            let source_path = entry.path();
-            let destination_path = destination.join(entry.file_name());
-            let file_type = entry.file_type()?;
-
-            if file_type.is_dir() {
-                copy_dir_recursive(&source_path, &destination_path)?;
-            } else {
-                fs::copy(&source_path, &destination_path)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn init_git_repo(root: &Path) -> std::io::Result<()> {
-        run_git(root, ["init"])?;
-        run_git(root, ["config", "user.name", "Test User"])?;
-        run_git(root, ["config", "user.email", "test@example.com"])?;
-        run_git(root, ["add", "."])?;
-        run_git(root, ["commit", "-m", "fixture"])?;
-        Ok(())
-    }
-
-    fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> std::io::Result<()> {
-        let status = Command::new("git").current_dir(root).args(args).status()?;
-        if status.success() {
-            return Ok(());
-        }
-
-        Err(std::io::Error::other(format!(
-            "git command failed: {:?}",
-            args
-        )))
     }
 }

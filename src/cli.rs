@@ -567,14 +567,11 @@ fn parse_language(value: &str) -> Result<Language> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunking::{Chunker, MultiLanguageChunker};
     use crate::config::Config;
     use crate::embedding::{Provider, StubProvider};
-    use crate::enumeration::FileEnumerator;
     use crate::store::Store;
-    use crate::types::{Dimension, EmbeddedChunk};
+    use crate::types::Dimension;
     use tempfile::tempdir;
-    use tokio::{fs, task};
 
     mod fixture {
         include!(concat!(
@@ -583,19 +580,22 @@ mod tests {
         ));
     }
 
+    mod test_support {
+        use crate as claudix;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/test_support.rs"
+        ));
+    }
+
     use fixture::TestFixture;
+    use test_support::{index_fixture, stub_config};
 
     struct CliHarness {
         _fixture: TestFixture,
         claudix: Claudix,
         store: Store,
-    }
-
-    fn test_config() -> Config {
-        let mut config = Config::default();
-        config.embedding.model = "stub-v1".to_owned();
-        config.embedding.dimensions = 8;
-        config
     }
 
     fn test_claudix(project_root: PathBuf, config: Config) -> Result<Claudix> {
@@ -611,9 +611,15 @@ mod tests {
 
     async fn cli_harness() -> Result<CliHarness> {
         let fixture = TestFixture::new("small_rust")?;
-        let config = test_config();
+        let config = stub_config();
         let claudix = test_claudix(fixture.root().to_path_buf(), config.clone())?;
-        index_fixture(&claudix, &config).await?;
+        index_fixture(
+            &claudix.store,
+            claudix.embedder.as_ref(),
+            claudix.project_root(),
+            &config,
+        )
+        .await?;
         let store = Store::new(fixture.root(), &config)?;
 
         Ok(CliHarness {
@@ -621,43 +627,6 @@ mod tests {
             claudix,
             store,
         })
-    }
-
-    async fn index_fixture(claudix: &Claudix, config: &Config) -> Result<()> {
-        let enumerator = FileEnumerator::new(claudix.project_root().to_path_buf(), config.clone())?;
-        let files = enumerator.enumerate()?;
-        let mut chunks = Vec::new();
-
-        for file in files {
-            let content = fs::read_to_string(&file.absolute_path).await?;
-            let path = file.relative_path.clone();
-            let language = file.language;
-            let file_hash = file.file_hash;
-
-            let file_chunks = task::spawn_blocking(move || {
-                MultiLanguageChunker::new().chunk(&path, language, file_hash, &content)
-            })
-            .await
-            .map_err(|error| ClaudixError::TreeSitter(error.to_string()))??;
-            chunks.extend(file_chunks);
-        }
-
-        let inputs = chunks
-            .iter()
-            .map(|chunk| chunk.content.as_str())
-            .collect::<Vec<_>>();
-        let vectors = claudix.embedder.embed(&inputs).await?;
-        let embedded_chunks = chunks
-            .into_iter()
-            .zip(vectors)
-            .map(|(chunk, vector)| EmbeddedChunk { chunk, vector })
-            .collect::<Vec<_>>();
-
-        claudix
-            .store
-            .replace_chunks(&embedded_chunks, claudix.config())
-            .await?;
-        Ok(())
     }
 
     #[test]
@@ -749,8 +718,7 @@ mod tests {
         assert!(harness.is_ok());
         let harness = harness.ok().unwrap_or_else(|| unreachable!());
 
-        let mut config = test_config();
-        config.hooks.session_start_warmup = false;
+        let config = stub_config();
         let claude_dir = harness.claudix.project_root().join(".claude");
         assert!(std::fs::create_dir_all(&claude_dir).is_ok());
         let config_text = toml::to_string(&config);

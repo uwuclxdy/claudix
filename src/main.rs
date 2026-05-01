@@ -117,14 +117,12 @@ async fn main() -> Result<()> {
         }
         Command::Status => {
             let output = cli::run_status(&project_root).await?;
-            println!("chunks: {}", output.chunk_count);
-            println!("files: {}", output.file_count);
-            if let Some(model) = output.model {
-                println!("model: {model}");
-            }
-            if let Some(dimensions) = output.dimensions {
-                println!("dimensions: {dimensions}");
-            }
+            print_index_stats(
+                output.chunk_count,
+                output.file_count,
+                output.model.as_deref(),
+                output.dimensions,
+            );
             if let Some(last_full_index_at) = output.last_full_index_at {
                 println!("last_full_index_at: {last_full_index_at}");
             }
@@ -153,14 +151,12 @@ async fn main() -> Result<()> {
             let output = cli::run_doctor(&project_root).await?;
             println!("project_root: {}", output.project_root);
             println!("index_present: {}", output.index_present);
-            println!("chunks: {}", output.chunk_count);
-            println!("files: {}", output.file_count);
-            if let Some(model) = &output.model {
-                println!("model: {model}");
-            }
-            if let Some(dimensions) = output.dimensions {
-                println!("dimensions: {dimensions}");
-            }
+            print_index_stats(
+                output.chunk_count,
+                output.file_count,
+                output.model.as_deref(),
+                output.dimensions,
+            );
             println!("embedding_provider: {}", output.embedding_provider);
             println!("embedding_healthy: {}", output.embedding_healthy);
 
@@ -184,6 +180,22 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_index_stats(
+    chunk_count: usize,
+    file_count: usize,
+    model: Option<&str>,
+    dimensions: Option<u16>,
+) {
+    println!("chunks: {chunk_count}");
+    println!("files: {file_count}");
+    if let Some(model) = model {
+        println!("model: {model}");
+    }
+    if let Some(dimensions) = dimensions {
+        println!("dimensions: {dimensions}");
+    }
 }
 
 fn active_project_root() -> Result<std::path::PathBuf> {

@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use gix::Repository;
 use gix::bstr::BStr;
@@ -72,9 +72,4 @@ fn path_to_slash_string(path: &Path) -> String {
         .map(|component| component.as_os_str().to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join("/")
-}
-
-#[allow(dead_code)]
-fn _path_buf(_path: &Path) -> PathBuf {
-    _path.to_path_buf()
 }

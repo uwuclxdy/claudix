@@ -11,13 +11,6 @@ pub struct StubProvider {
 }
 
 impl StubProvider {
-    pub fn new(dimensions: Dimension) -> Self {
-        Self {
-            model_id: "stub".to_owned(),
-            dimensions,
-        }
-    }
-
     pub fn with_model_id(model_id: impl Into<String>, dimensions: Dimension) -> Self {
         Self {
             model_id: model_id.into(),
@@ -76,7 +69,7 @@ mod tests {
 
     #[tokio::test]
     async fn stub_provider_returns_requested_dimensions() {
-        let provider = StubProvider::new(Dimension(8));
+        let provider = StubProvider::with_model_id("stub-v1", Dimension(8));
 
         let vectors = provider.embed(&["alpha", "beta"]).await;
         assert!(vectors.is_ok());
@@ -89,7 +82,7 @@ mod tests {
 
     #[tokio::test]
     async fn stub_provider_is_deterministic() {
-        let provider = StubProvider::new(Dimension(6));
+        let provider = StubProvider::with_model_id("stub-v1", Dimension(6));
 
         let first = provider.embed(&["same input"]).await;
         assert!(first.is_ok());
@@ -104,7 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn stub_provider_distinguishes_inputs() {
-        let provider = StubProvider::new(Dimension(4));
+        let provider = StubProvider::with_model_id("stub-v1", Dimension(4));
 
         let vectors = provider.embed(&["alpha", "beta"]).await;
         assert!(vectors.is_ok());

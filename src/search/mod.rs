@@ -469,12 +469,8 @@ fn stored_chunk_kind(kind: &str) -> ChunkKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunking::{Chunker, MultiLanguageChunker};
-    use crate::config::Config;
     use crate::embedding::{Provider, StubProvider};
-    use crate::enumeration::FileEnumerator;
-    use crate::types::{Dimension, EmbeddedChunk};
-    use tokio::fs;
+    use crate::types::Dimension;
 
     mod fixture {
         include!(concat!(
@@ -483,23 +479,26 @@ mod tests {
         ));
     }
 
+    mod test_support {
+        use crate as claudix;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/test_support.rs"
+        ));
+    }
+
     use fixture::TestFixture;
+    use test_support::{index_fixture, stub_config};
 
     struct SearchHarness {
         _fixture: TestFixture,
         searcher: Searcher,
     }
 
-    fn test_config() -> Config {
-        let mut config = Config::default();
-        config.embedding.model = "stub-v1".to_owned();
-        config.embedding.dimensions = 8;
-        config
-    }
-
     async fn search_harness() -> Result<SearchHarness> {
         let fixture = TestFixture::new("small_rust")?;
-        let config = test_config();
+        let config = stub_config();
         let store = Store::new(fixture.root(), &config)?;
         let embedder: Arc<dyn Provider> = Arc::new(StubProvider::with_model_id(
             config.embedding.model.clone(),
@@ -512,45 +511,6 @@ mod tests {
             _fixture: fixture,
             searcher: Searcher::new(store, embedder, config.search.clone()),
         })
-    }
-
-    async fn index_fixture(
-        store: &Store,
-        embedder: &dyn Provider,
-        project_root: &std::path::Path,
-        config: &Config,
-    ) -> Result<()> {
-        let enumerator = FileEnumerator::new(project_root.to_path_buf(), config.clone())?;
-        let files = enumerator.enumerate()?;
-        let mut chunks = Vec::new();
-
-        for file in files {
-            let content = fs::read_to_string(&file.absolute_path).await?;
-            let path = file.relative_path.clone();
-            let language = file.language;
-            let file_hash = file.file_hash;
-
-            let file_chunks = task::spawn_blocking(move || {
-                MultiLanguageChunker::new().chunk(&path, language, file_hash, &content)
-            })
-            .await
-            .map_err(|error| ClaudixError::TreeSitter(error.to_string()))??;
-            chunks.extend(file_chunks);
-        }
-
-        let inputs = chunks
-            .iter()
-            .map(|chunk| chunk.content.as_str())
-            .collect::<Vec<_>>();
-        let vectors = embedder.embed(&inputs).await?;
-        let embedded_chunks = chunks
-            .into_iter()
-            .zip(vectors)
-            .map(|(chunk, vector)| EmbeddedChunk { chunk, vector })
-            .collect::<Vec<_>>();
-
-        store.replace_chunks(&embedded_chunks, config).await?;
-        Ok(())
     }
 
     #[tokio::test]

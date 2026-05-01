@@ -5,31 +5,24 @@ mod common {
             "/tests/common/fixture.rs"
         ));
     }
+
+    pub mod config_support {
+        use claudix;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/config_support.rs"
+        ));
+    }
 }
 
 use std::sync::Arc;
 
-use claudix::config::Config;
 use claudix::search::SearchQuery;
 use claudix::types::{Language, RelativePath};
 use claudix::{Claudix, ClaudixError, IndexStats};
+use common::config_support::{stub_config, stub_config_with_model};
 use common::fixture::TestFixture;
-
-fn stub_config() -> Config {
-    let mut config = Config::default();
-    config.embedding.model = "stub-v1".to_owned();
-    config.embedding.dimensions = 8;
-    config.hooks.session_start_warmup = false;
-    config
-}
-
-fn stub_config_v2() -> Config {
-    let mut config = Config::default();
-    config.embedding.model = "stub-v2".to_owned();
-    config.embedding.dimensions = 8;
-    config.hooks.session_start_warmup = false;
-    config
-}
 
 // ── a ──────────────────────────────────────────────────────────────────────
 
@@ -305,7 +298,11 @@ async fn schema_model_mismatch_errors_on_open() {
 
     drop(claudix_v1);
 
-    let claudix_v2 = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config_v2())).await;
+    let claudix_v2 = Claudix::new(
+        fixture.root().to_path_buf(),
+        Arc::new(stub_config_with_model("stub-v2")),
+    )
+    .await;
     assert!(
         claudix_v2.is_err(),
         "expected EmbeddingModelMismatch error, but Claudix::new succeeded"
