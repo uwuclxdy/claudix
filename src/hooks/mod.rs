@@ -4,9 +4,13 @@ use std::time::{Duration, SystemTime};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use std::sync::Arc;
+
+use crate::Claudix;
 use crate::cli;
 use crate::config::{self, Config};
 use crate::error::Result;
+use crate::search::SearchQuery;
 use crate::store::{Manifest, Store};
 use crate::util::parse_rfc3339;
 
@@ -178,6 +182,20 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
         return Ok(None);
     }
 
+    if let Ok(claudix) = Claudix::new(project_root.to_path_buf(), Arc::new(config.clone())).await {
+        let search_query = SearchQuery {
+            query: query.clone(),
+            top_k: 10,
+            language_filter: None,
+            path_prefix: None,
+        };
+        if let Ok(results) = claudix.search(search_query).await
+            && !results.is_empty()
+        {
+            return Ok(Some(pre_tool_use_search_response(&query, results)));
+        }
+    }
+
     Ok(Some(pre_tool_use_deny_response(
         &query,
         stats.chunk_count,
@@ -212,6 +230,34 @@ fn session_start_response(additional_context: String) -> Value {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": additional_context,
+        }
+    })
+}
+
+fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchResult>) -> Value {
+    let mut lines = vec![
+        format!("claudix search results for '{query}':"),
+        String::new(),
+    ];
+    for result in &results {
+        let chunk = &result.chunk;
+        let name_part = chunk.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
+        lines.push(format!(
+            "{}:{}-{} [{}]{name_part}",
+            chunk.file_path, chunk.line_range.start, chunk.line_range.end, chunk.language,
+        ));
+        if !chunk.content.is_empty() {
+            lines.push(chunk.content.clone());
+        }
+        lines.push(String::new());
+    }
+    let context = lines.join("\n");
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!("claudix ran semantic search for '{query}' — results below."),
+            "additionalContext": context,
         }
     })
 }
