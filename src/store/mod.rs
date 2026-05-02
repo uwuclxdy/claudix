@@ -10,7 +10,7 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
-use lancedb::query::ExecutableQuery;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table};
 
 use crate::config::Config;
@@ -576,6 +576,7 @@ fn record_batch_from_rows(rows: &[StoredChunk], dimension: Dimension) -> Result<
 async fn read_all_rows(table: &Table) -> Result<Vec<StoredChunk>> {
     let batches = table
         .query()
+        .limit(i64::MAX as usize)
         .execute()
         .await?
         .try_collect::<Vec<_>>()
@@ -1180,5 +1181,23 @@ mod tests {
             result,
             Err(ClaudixError::DimensionMismatch { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn read_chunks_returns_more_than_default_lancedb_limit() {
+        // Regression test: LanceDB Query::new() sets limit=Some(10) by default.
+        // read_all_rows must override it or >10 chunks are silently truncated.
+        let project_root = tempdir().unwrap();
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config).unwrap();
+
+        let chunks: Vec<_> = (1u64..=15)
+            .map(|i| sample_chunk(i, &format!("src/f{i}.rs"), &format!("fn{i}"), "fn body", &[i as f32 / 15.0; 384]))
+            .collect();
+
+        store.replace_chunks(&chunks, &config).await.unwrap();
+
+        let rows = store.read_chunks().await.unwrap();
+        assert_eq!(rows.len(), 15, "read_chunks must return all rows, not just the LanceDB default of 10");
     }
 }

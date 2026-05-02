@@ -146,17 +146,17 @@ fn rank_rows(
             let combined_score = config.hybrid_weights.dense * dense_normalized[index]
                 + config.hybrid_weights.bm25 * bm25_normalized[index]
                 + config.hybrid_weights.rrf * rrf_normalized[index];
+            if !lexical_hit && !dense_hit {
+                return None;
+            }
+
             let boosted_score = if identifier_hit {
-                combined_score * config.identifier_boost
+                (combined_score * config.identifier_boost).max(config.identifier_boost * 0.3)
             } else {
                 combined_score
             };
 
             if boosted_score <= 0.0 {
-                return None;
-            }
-
-            if !lexical_hit && !dense_hit {
                 return None;
             }
 
@@ -380,7 +380,7 @@ fn tokenize(text: &str) -> Vec<String> {
     let mut current = String::new();
 
     for ch in text.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
+        if ch.is_ascii_alphanumeric() {
             current.push(ch.to_ascii_lowercase());
         } else if !current.is_empty() {
             tokens.push(std::mem::take(&mut current));
@@ -490,6 +490,124 @@ mod tests {
 
     use fixture::TestFixture;
     use test_support::{index_fixture, stub_config};
+
+    #[test]
+    fn tokenize_splits_snake_case() {
+        assert_eq!(
+            tokenize("handle_session_start"),
+            vec!["handle", "session", "start"]
+        );
+        assert_eq!(tokenize("fn full_index_running"), vec!["fn", "full", "index", "running"]);
+    }
+
+    #[test]
+    fn bm25_scores_match_snake_case_content() {
+        let docs = vec![
+            DocumentStats::from_content("async fn handle_session_start(project_root: &Path)"),
+            DocumentStats::from_content("pub fn with_fallback_params(max: usize) -> Self"),
+        ];
+        let scores = bm25_scores(&docs, &tokenize("session start hook"));
+        assert!(scores[0] > 0.0, "handle_session_start should match 'session start'");
+        assert_eq!(scores[1], 0.0, "with_fallback_params should not match");
+    }
+
+    #[test]
+    fn rank_rows_handles_dominant_dense_with_bm25_hits() {
+        use crate::config::{HybridWeights, SearchConfig};
+        use crate::store::StoredChunk;
+
+        let config = SearchConfig {
+            top_k: 10,
+            hybrid_weights: HybridWeights { dense: 0.55, bm25: 0.30, rrf: 0.15 },
+            identifier_boost: 1.4,
+            similarity_threshold: 0.30,
+        };
+
+        let make_row = |name: &str, content: &str, vec: Vec<f32>| StoredChunk {
+            chunk_id: 0,
+            file_path: format!("src/{name}.rs"),
+            language: "rust".into(),
+            kind: "function".into(),
+            name: Some(name.into()),
+            line_start: 1, line_end: 5,
+            byte_start: 0, byte_end: 100,
+            file_hash: [0u8; 16],
+            content: content.into(),
+            vector: vec,
+        };
+
+        // Simulate: new() has high cosine (0.9 of max), but no BM25
+        // handle_session_start has lower cosine (0.3 of max), but strong BM25
+        // The BM25 + identifier_boost should push handle_session_start above new()
+        let rows = vec![
+            make_row("new", "pub fn new(max: usize) -> Self { Self { max } }", vec![0.9, 0.1, 0.0, 0.0]),
+            make_row("handle_session_start", "async fn handle_session_start(root: &Path) -> Result<Option<Value>> { let config = load(root); }", vec![0.3, 0.8, 0.0, 0.0]),
+        ];
+        let query_vector = vec![1.0, 0.0, 0.0, 0.0];
+        let query = SearchQuery {
+            query: "session start hook".into(),
+            top_k: 10,
+            language_filter: None,
+            path_prefix: None,
+        };
+
+        let results = rank_rows(query, rows, query_vector, config).unwrap();
+        assert_eq!(results.len(), 2, "both chunks should pass the filter");
+        assert_eq!(
+            results[0].chunk.name.as_deref(),
+            Some("handle_session_start"),
+            "identifier_boost should lift handle_session_start above new()"
+        );
+    }
+
+    #[test]
+    fn rank_rows_returns_multiple_results_for_code_query() {
+        use crate::config::{HybridWeights, SearchConfig};
+        use crate::store::StoredChunk;
+
+        let config = SearchConfig {
+            top_k: 10,
+            hybrid_weights: HybridWeights { dense: 0.55, bm25: 0.30, rrf: 0.15 },
+            identifier_boost: 1.4,
+            similarity_threshold: 0.30,
+        };
+
+        let make_row = |name: &str, content: &str, sim: f32| {
+            let v: Vec<f32> = vec![sim, 0.0, 0.0, 0.0];
+            StoredChunk {
+                chunk_id: 0,
+                file_path: format!("src/{name}.rs"),
+                language: "rust".into(),
+                kind: "function".into(),
+                name: Some(name.into()),
+                line_start: 1, line_end: 5,
+                byte_start: 0, byte_end: 100,
+                file_hash: [0u8; 16],
+                content: content.into(),
+                vector: v,
+            }
+        };
+
+        let rows = vec![
+            make_row("new", "pub fn new(max: usize) -> Self { Self { max } }", 0.8),
+            make_row("handle_session_start", "async fn handle_session_start(root: &Path) { let config = load(root); }", 0.2),
+            make_row("full_index_running", "pub fn full_index_running(&self) -> bool { let lock = self.lock_path(); }", 0.1),
+        ];
+
+        let query_vector = vec![1.0, 0.0, 0.0, 0.0];
+        let query = SearchQuery {
+            query: "session start hook message".into(),
+            top_k: 10,
+            language_filter: None,
+            path_prefix: None,
+        };
+
+        let results = rank_rows(query, rows, query_vector, config).unwrap();
+        assert!(results.len() >= 2, "BM25 should match handle_session_start and others: got {} results", results.len());
+        // handle_session_start should rank above new() because BM25 matches override low dense
+        let top_name = results[0].chunk.name.as_deref().unwrap_or("");
+        assert_ne!(top_name, "new", "trivial new() should not rank first when BM25 matches exist");
+    }
 
     struct SearchHarness {
         _fixture: TestFixture,
