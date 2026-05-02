@@ -55,6 +55,10 @@ impl Provider for HttpProvider {
     }
 
     async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let response = self
             .client
             .post(self.embeddings_url())
@@ -243,6 +247,23 @@ mod tests {
             body.len(),
             body,
         )
+    }
+
+    #[tokio::test]
+    async fn http_provider_returns_empty_for_empty_batch() {
+        let provider = HttpProvider::new(
+            "http://127.0.0.1:1",
+            "test-model",
+            Dimension(2),
+            Duration::from_millis(50),
+            None,
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
+
+        let result = provider.embed(&[]).await;
+        assert!(result.is_ok());
+        assert!(result.ok().unwrap_or_else(|| unreachable!()).is_empty());
     }
 
     #[tokio::test]

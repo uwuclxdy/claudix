@@ -200,19 +200,10 @@ async fn get_index_status(project_root: &Path) -> Result<Value> {
 }
 
 async fn reindex(project_root: &Path, arguments: Value) -> Result<Value> {
-    let request: ReindexRequest =
+    let _request: ReindexRequest =
         parse_tool_arguments(arguments, "reindex", "Pass force as an optional boolean")?;
     let output = cli::run_index(project_root).await?;
-    let mut payload = match to_value(output)? {
-        Value::Object(object) => object,
-        value => {
-            let mut object = Map::new();
-            object.insert("value".to_owned(), value);
-            object
-        }
-    };
-    payload.insert("force".to_owned(), Value::Bool(request.force));
-    Ok(Value::Object(payload))
+    to_value(output)
 }
 
 async fn clear_index(project_root: &Path) -> Result<Value> {
