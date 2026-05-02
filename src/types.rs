@@ -35,6 +35,7 @@ pub struct Dimension(pub u16);
 pub struct RelativePath(String);
 
 pub(crate) fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
     let Some(rest) = path.strip_prefix(prefix) else {
         return false;
     };
@@ -259,5 +260,9 @@ mod tests {
         assert!(RelativePath::new("src/math").starts_with(&prefix));
         assert!(!RelativePath::new("src/mathematics.rs").starts_with(&prefix));
         assert!(!RelativePath::new("src/mathx").starts_with(&prefix));
+
+        let prefix_slash = RelativePath::new("src/math/");
+        assert!(RelativePath::new("src/math/util.rs").starts_with(&prefix_slash));
+        assert!(!RelativePath::new("src/mathematics.rs").starts_with(&prefix_slash));
     }
 }
