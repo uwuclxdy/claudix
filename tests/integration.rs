@@ -328,8 +328,7 @@ fn hook_exits_zero_with_corrupt_manifest() {
     let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
     let root = fixture.root();
 
-    let config_contents =
-        "[embedding]\nmodel = \"stub-v1\"\ndimensions = 8\n[hooks]\nsession_start_warmup = false\n";
+    let config_contents = "[embedding]\nmodel = \"stub-v1\"\ndimensions = 8\n";
     let config_path = root.join("test-config.toml");
     let write_cfg = std::fs::write(&config_path, config_contents);
     assert!(write_cfg.is_ok(), "write test config failed");
