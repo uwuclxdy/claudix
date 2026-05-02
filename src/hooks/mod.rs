@@ -203,11 +203,27 @@ fn pre_tool_use_deny_response(query: &str, chunk_count: usize, file_count: usize
 
 fn extract_search_command(command: Option<&str>) -> Option<String> {
     let command = command?.trim();
-    if !(command.starts_with("rg ") || command.starts_with("grep ") || command.starts_with("ag ")) {
-        return None;
-    }
+    let args = command
+        .strip_prefix("rg ")
+        .or_else(|| command.strip_prefix("grep "))
+        .or_else(|| command.strip_prefix("ag "))?;
+    extract_quoted_pattern(args.trim())
+}
 
-    Some(command.to_owned())
+fn extract_quoted_pattern(args: &str) -> Option<String> {
+    for &quote in b"\"'" {
+        let bytes = args.as_bytes();
+        if let Some(start) = bytes.iter().position(|&b| b == quote) {
+            let after = &args[start + 1..];
+            if let Some(end) = after.as_bytes().iter().position(|&b| b == quote) {
+                let pattern = after[..end].trim();
+                if !pattern.is_empty() {
+                    return Some(pattern.to_owned());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn should_passthrough(query: &str) -> bool {
@@ -436,6 +452,155 @@ mod tests {
         let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
         assert!(response.is_ok());
         assert!(response.ok().unwrap_or_else(|| unreachable!()).is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_denies_conceptual_bash_rg_when_index_ready() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full()
+                .await
+                .is_ok()
+        );
+
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg \"where is the config loaded\""
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        let response = response.ok().unwrap_or_else(|| unreachable!());
+        assert!(response.is_some());
+        let response = response.unwrap_or(Value::Null);
+        assert_eq!(
+            response["hookSpecificOutput"]["permissionDecision"],
+            Value::String("deny".to_owned())
+        );
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("where is the config loaded"),
+            "deny message should reference the extracted pattern, not the full command"
+        );
+        assert!(
+            !context.contains("rg "),
+            "deny message must not expose the raw tool invocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_bash_rg_with_path_arg_through_when_no_conceptual_pattern() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full()
+                .await
+                .is_ok()
+        );
+
+        // Unquoted single-word pattern — passes through (token_count < 3 after extraction fails)
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg add src/"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "unquoted single-word rg command should pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_bash_rg_with_regex_pattern_through() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full()
+                .await
+                .is_ok()
+        );
+
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg \"^pub fn\" src/"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "regex pattern in rg command should pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_denies_conceptual_bash_rg_regardless_of_path_arg() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full()
+                .await
+                .is_ok()
+        );
+
+        // Even with src/ path argument, a conceptual quoted pattern must be denied
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg \"where is the config loaded\" src/"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        let response = response.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            response.is_some(),
+            "conceptual rg query must be denied even when a path arg is present"
+        );
+        assert_eq!(
+            response.unwrap_or(Value::Null)["hookSpecificOutput"]["permissionDecision"],
+            Value::String("deny".to_owned())
+        );
     }
 
     #[test]
