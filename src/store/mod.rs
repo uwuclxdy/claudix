@@ -284,6 +284,7 @@ impl Store {
             .unwrap_or_else(|| Manifest::new(&config.embedding.model, config.embedding.dimensions));
         manifest.chunk_count = 0;
         manifest.file_count = 0;
+        manifest.last_full_index_at = None;
         manifest.last_incremental_at = Some(now_rfc3339());
         self.write_manifest(&manifest)
     }
@@ -1199,5 +1200,35 @@ mod tests {
 
         let rows = store.read_chunks().await.unwrap();
         assert_eq!(rows.len(), 15, "read_chunks must return all rows, not just the LanceDB default of 10");
+    }
+
+    #[tokio::test]
+    async fn clear_chunks_resets_last_full_index_at() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+
+        let store = Store::new(project_root.path(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let chunks = vec![sample_chunk(1, "src/lib.rs", "foo", "pub fn foo() {}", &[1.0; 384])];
+        assert!(store.replace_chunks(&chunks, &config).await.is_ok());
+
+        let manifest = store.read_manifest();
+        assert!(manifest.is_ok());
+        let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
+        assert!(manifest.unwrap_or_else(|| unreachable!()).last_full_index_at.is_some());
+
+        assert!(store.clear_chunks(&config).await.is_ok());
+
+        let manifest = store.read_manifest();
+        assert!(manifest.is_ok());
+        let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
+        let manifest = manifest.unwrap_or_else(|| unreachable!());
+        assert!(manifest.last_full_index_at.is_none(), "clear must reset last_full_index_at so auto-reindex triggers on next session");
+        assert_eq!(manifest.chunk_count, 0);
+        assert_eq!(manifest.file_count, 0);
     }
 }
