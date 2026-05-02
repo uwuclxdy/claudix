@@ -22,7 +22,11 @@ pub enum HookEvent {
 }
 
 pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result<Option<Value>> {
-    let payload: HookPayload = serde_json::from_str(payload)?;
+    let payload: HookPayload = if payload.trim().is_empty() {
+        HookPayload { tool_name: None, tool_input: None }
+    } else {
+        serde_json::from_str(payload)?
+    };
 
     match event {
         HookEvent::SessionStart => handle_session_start(project_root, payload).await,
@@ -413,6 +417,18 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[tokio::test]
+    async fn session_start_handles_empty_payload() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let response = run(fixture.root(), HookEvent::SessionStart, "").await;
+        assert!(response.is_ok(), "empty payload must not error");
+        assert!(response.ok().unwrap_or_else(|| unreachable!()).is_some());
     }
 
     #[tokio::test]
