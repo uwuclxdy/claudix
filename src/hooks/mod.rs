@@ -247,7 +247,7 @@ fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchR
             chunk.file_path, chunk.line_range.start, chunk.line_range.end, chunk.language,
         ));
         if !chunk.content.is_empty() {
-            lines.push(chunk.content.clone());
+            lines.push(truncate_snippet(&chunk.content, 20));
         }
         lines.push(String::new());
     }
@@ -273,6 +273,16 @@ fn pre_tool_use_deny_response(query: &str, chunk_count: usize, file_count: usize
             ),
         }
     })
+}
+
+fn truncate_snippet(content: &str, max_lines: usize) -> String {
+    let mut lines = content.lines();
+    let taken: Vec<&str> = lines.by_ref().take(max_lines).collect();
+    if lines.next().is_some() {
+        format!("{}\n…", taken.join("\n"))
+    } else {
+        taken.join("\n")
+    }
 }
 
 fn extract_search_command(command: Option<&str>) -> Option<String> {
@@ -679,6 +689,44 @@ mod tests {
         assert_eq!(
             response.unwrap_or(Value::Null)["hookSpecificOutput"]["permissionDecision"],
             Value::String("deny".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_returns_search_results_in_context() {
+        let fixture = TestFixture::new("small_rust").unwrap();
+        write_config(fixture.root(), &stub_config());
+
+        Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config()))
+            .await
+            .unwrap()
+            .index_full()
+            .await
+            .unwrap();
+
+        let payload = json!({
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "add two numbers together" }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            response["hookSpecificOutput"]["permissionDecision"],
+            Value::String("deny".to_owned())
+        );
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("claudix search results"),
+            "hook must embed search results in context, got: {context}"
+        );
+        assert!(
+            context.contains("src/"),
+            "context must include file paths from search results"
         );
     }
 

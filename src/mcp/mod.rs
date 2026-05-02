@@ -280,18 +280,18 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "search_code",
-            "description": "Search indexed code semantically with optional language and path filters",
+            "description": "Semantic search over indexed source code. Use for conceptual queries ('where is auth handled', 'how does config load'), identifier lookups ('SessionStart', 'handle_post_tool_use'), and cross-file questions. Returns ranked results with file paths, line ranges, and code snippets. Prefer this over grep for anything that isn't a literal string match or regex.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Natural-language or identifier query" },
-                    "top_k": { "type": "integer", "minimum": 1, "description": "Maximum hits to return" },
+                    "query": { "type": "string", "description": "Natural-language description or identifier name. Multiple words work best." },
+                    "top_k": { "type": "integer", "minimum": 1, "description": "Maximum results to return (default: from config, usually 5-10)" },
                     "language_filter": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Optional list of language names"
+                        "description": "Restrict to specific languages, e.g. [\"rust\"], [\"python\", \"javascript\"]"
                     },
-                    "path_prefix": { "type": "string", "description": "Optional project-relative path prefix" }
+                    "path_prefix": { "type": "string", "description": "Restrict to files under this project-relative path prefix, e.g. \"src/hooks\"" }
                 },
                 "required": ["query"]
             }
