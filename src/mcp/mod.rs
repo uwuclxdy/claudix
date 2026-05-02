@@ -90,24 +90,16 @@ async fn handle_line(project_root: &Path, line: &str) -> Result<Option<Value>> {
         }
     };
 
+    // Notifications have no id and must receive no response.
+    if request.id.is_none() {
+        return Ok(None);
+    }
+
     if request.jsonrpc != JSONRPC_VERSION {
         return Ok(Some(error_response(
             request.id,
             -32600,
             "jsonrpc must be 2.0".to_owned(),
-            None,
-        )));
-    }
-
-    if request.method == "notifications/initialized" {
-        return Ok(None);
-    }
-
-    if request.id.is_none() {
-        return Ok(Some(error_response(
-            None,
-            -32600,
-            "requests must include an id".to_owned(),
             None,
         )));
     }
