@@ -1,8 +1,8 @@
 ![claudix banner](media/claudix.png)
 
-# claudix
+# Claude Index: claudix
 
-Local semantic search plugin for Claude Code. Indexes your repository, embeds chunks with machine learning, and exposes search through Claude's slash commands, MCP tools, and grep interception.
+Local semantic search plugin for Claude Code. Works like Copilot's Codebase Semantic Index but for CC: Indexes your repository, embeds chunks with machine learning, and exposes search through Claude's slash commands, MCP tools, and grep interception.
 
 ## What It Does
 
@@ -12,14 +12,14 @@ Core design goal: never break the session, always recover gracefully.
 
 ## Requirements
 
-- **macOS 11+ (Apple Silicon)**, **Linux x86_64** (glibc 2.28+ or musl), **Windows 10+ x86_64**
-- **Rust 1.83+** (if building from source; Intel Mac must build from source — no prebuilt)
+- **macOS 11+ (Apple Silicon)** or **Linux x86_64** (glibc 2.28+ or musl) or **Windows 10+ x86_64**
+- **Rust 1.83+**
 - **Optional**: LM Studio or Ollama for custom embedding backends (
   - bundled `bge-small-en-v1.5` requires `libonnxruntime` or `onnxruntime.dll`)
 
 ## Installation
 
-**Requires**: Rust 1.83+ (`rustup.rs`) and Claude Code.
+**Requires**: [Rust 1.83+](https://rustup.rs) and Claude Code.
 
 claudix ships the bundled `bge-small-en-v1.5` embedder and uses it as the fallback when no embedding provider is configured. Set `embedding.provider = "http"` if you prefer LM Studio, Ollama, or another OpenAI-compatible embedding server.
 
@@ -45,7 +45,7 @@ Then register the plugin:
 
 ```bash
 claude plugin marketplace add uwuclxdy/claudix
-claude plugin install claudix@uwuclxdy
+claude plugin install claudix@claudix
 ```
 
 Restart Claude Code. Run `/claudix:doctor` to verify.
