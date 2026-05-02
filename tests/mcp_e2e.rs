@@ -48,7 +48,6 @@ rrf = 0.15
 [hooks]
 intercept_grep = true
 auto_reembed_on_edit = true
-session_start_warmup = true
 
 [paths]
 index_dir = ".claudix/index"
