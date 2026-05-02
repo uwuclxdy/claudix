@@ -1,3 +1,5 @@
+![claudix banner](media/claudix.png)
+
 # claudix
 
 Local semantic search plugin for Claude Code. Indexes your repository, embeds chunks with machine learning, and exposes search through Claude's slash commands, MCP tools, and grep interception.
