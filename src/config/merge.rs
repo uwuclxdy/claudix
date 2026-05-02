@@ -75,8 +75,6 @@ pub struct PartialHooksConfig {
     #[serde(default)]
     pub auto_reembed_on_edit: Option<bool>,
     #[serde(default)]
-    pub session_start_warmup: Option<bool>,
-    #[serde(default)]
     pub auto_index_on_session_start: Option<bool>,
 }
 
@@ -151,7 +149,6 @@ impl PartialHooksConfig {
         Self {
             intercept_grep: other.intercept_grep.or(self.intercept_grep),
             auto_reembed_on_edit: other.auto_reembed_on_edit.or(self.auto_reembed_on_edit),
-            session_start_warmup: other.session_start_warmup.or(self.session_start_warmup),
             auto_index_on_session_start: other
                 .auto_index_on_session_start
                 .or(self.auto_index_on_session_start),

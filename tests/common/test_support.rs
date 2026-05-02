@@ -16,7 +16,6 @@ pub fn stub_config_with_model(model: impl Into<String>) -> Config {
     let mut config = Config::default();
     config.embedding.model = model.into();
     config.embedding.dimensions = 8;
-    config.hooks.session_start_warmup = false;
     config
 }
 

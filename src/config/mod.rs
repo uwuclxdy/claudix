@@ -54,7 +54,6 @@ pub struct HybridWeights {
 pub struct HooksConfig {
     pub intercept_grep: bool,
     pub auto_reembed_on_edit: bool,
-    pub session_start_warmup: bool,
     pub auto_index_on_session_start: bool,
 }
 
@@ -104,7 +103,6 @@ impl Default for Config {
             hooks: HooksConfig {
                 intercept_grep: true,
                 auto_reembed_on_edit: true,
-                session_start_warmup: true,
                 auto_index_on_session_start: true,
             },
             paths: PathsConfig {
@@ -309,10 +307,6 @@ impl Config {
                     .hooks
                     .auto_reembed_on_edit
                     .unwrap_or(defaults.hooks.auto_reembed_on_edit),
-                session_start_warmup: partial
-                    .hooks
-                    .session_start_warmup
-                    .unwrap_or(defaults.hooks.session_start_warmup),
                 auto_index_on_session_start: partial
                     .hooks
                     .auto_index_on_session_start
