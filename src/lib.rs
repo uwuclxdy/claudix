@@ -119,10 +119,15 @@ impl Claudix {
 
         let chunks = self.collect_file_chunks(&file).await?;
         let embedded_chunks = self.embed_chunks(chunks).await?;
-        let stats = self
-            .store
-            .replace_file_chunks(&embedded_chunks, self.config.as_ref())
-            .await?;
+        let stats = if embedded_chunks.is_empty() {
+            self.store
+                .delete_file_chunks(&relative_path, self.config.as_ref())
+                .await?
+        } else {
+            self.store
+                .replace_file_chunks(&embedded_chunks, self.config.as_ref())
+                .await?
+        };
 
         Ok(IndexStats {
             file_count: stats.file_count,
@@ -504,5 +509,31 @@ mod tests {
         assert!(rows.is_ok());
         let rows = rows.ok().unwrap_or_else(|| unreachable!());
         assert!(rows.iter().all(|row| row.file_path == "src/lib.rs"));
+    }
+
+    #[tokio::test]
+    async fn reindex_file_removes_stale_chunks_when_file_becomes_empty() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+
+        let claudix = test_claudix(fixture.root().to_path_buf(), config);
+        assert!(claudix.is_ok());
+        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(claudix.index_full().await.is_ok());
+        assert!(fs::write(fixture.root().join("src/math.rs"), b"").await.is_ok());
+
+        let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
+        assert!(stats.is_ok());
+
+        let rows = claudix.store.read_chunks().await;
+        assert!(rows.is_ok());
+        let rows = rows.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            rows.iter().all(|row| row.file_path != "src/math.rs"),
+            "stale chunks from emptied file must be removed"
+        );
     }
 }
