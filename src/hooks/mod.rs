@@ -43,6 +43,9 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     let Ok(store) = Store::new(project_root, config) else {
         return false;
     };
+    if store.full_index_running() {
+        return false;
+    }
     let needs_index = store
         .read_manifest()
         .ok()
