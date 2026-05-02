@@ -200,11 +200,7 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
         }
     }
 
-    Ok(Some(pre_tool_use_deny_response(
-        &query,
-        stats.chunk_count,
-        stats.file_count,
-    )))
+    Ok(None)
 }
 
 async fn consume_pending_restart() -> Option<String> {
@@ -262,19 +258,6 @@ fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchR
             "permissionDecision": "deny",
             "permissionDecisionReason": format!("claudix ran semantic search for '{query}' — results below."),
             "additionalContext": context,
-        }
-    })
-}
-
-fn pre_tool_use_deny_response(query: &str, chunk_count: usize, file_count: usize) -> Value {
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": "Use the claudix.search_code MCP tool for semantic queries; this query looks conceptual.",
-            "additionalContext": format!(
-                "Original query was '{query}'. The claudix search index has {chunk_count} chunks across {file_count} files."
-            ),
         }
     })
 }
@@ -560,7 +543,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_tool_use_denies_conceptual_bash_rg_when_index_ready() {
+    async fn pre_tool_use_passes_conceptual_bash_rg_when_search_returns_no_results() {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
@@ -577,6 +560,8 @@ mod tests {
                 .is_ok()
         );
 
+        // "where is the config loaded" is conceptual but the small_rust fixture has no config code;
+        // semantic search returns empty → must pass through, not block grep with no alternative.
         let payload = json!({
             "tool_name": "Bash",
             "tool_input": {
@@ -585,23 +570,9 @@ mod tests {
         });
         let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
         assert!(response.is_ok());
-        let response = response.ok().unwrap_or_else(|| unreachable!());
-        assert!(response.is_some());
-        let response = response.unwrap_or(Value::Null);
-        assert_eq!(
-            response["hookSpecificOutput"]["permissionDecision"],
-            Value::String("deny".to_owned())
-        );
-        let context = response["hookSpecificOutput"]["additionalContext"]
-            .as_str()
-            .unwrap_or_default();
         assert!(
-            context.contains("where is the config loaded"),
-            "deny message should reference the extracted pattern, not the full command"
-        );
-        assert!(
-            !context.contains("rg "),
-            "deny message must not expose the raw tool invocation"
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "must pass through when semantic search has no results to offer"
         );
     }
 
@@ -671,7 +642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_tool_use_denies_conceptual_bash_rg_regardless_of_path_arg() {
+    async fn pre_tool_use_passes_conceptual_bash_rg_with_path_arg_when_no_results() {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
@@ -688,7 +659,8 @@ mod tests {
                 .is_ok()
         );
 
-        // Even with src/ path argument, a conceptual quoted pattern must be denied
+        // Conceptual query with a path arg: semantic search still finds nothing for "config loaded"
+        // in the small_rust fixture → must pass through.
         let payload = json!({
             "tool_name": "Bash",
             "tool_input": {
@@ -697,14 +669,9 @@ mod tests {
         });
         let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
         assert!(response.is_ok());
-        let response = response.ok().unwrap_or_else(|| unreachable!());
         assert!(
-            response.is_some(),
-            "conceptual rg query must be denied even when a path arg is present"
-        );
-        assert_eq!(
-            response.unwrap_or(Value::Null)["hookSpecificOutput"]["permissionDecision"],
-            Value::String("deny".to_owned())
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "must pass through when semantic search has no results to offer"
         );
     }
 
