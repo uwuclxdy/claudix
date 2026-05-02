@@ -34,6 +34,13 @@ pub struct Dimension(pub u16);
 )]
 pub struct RelativePath(String);
 
+pub(crate) fn path_prefix_matches(path: &str, prefix: &str) -> bool {
+    let Some(rest) = path.strip_prefix(prefix) else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('/') || rest.starts_with('.')
+}
+
 impl RelativePath {
     pub fn new(s: impl Into<String>) -> Self {
         let raw = s.into();
@@ -50,7 +57,7 @@ impl RelativePath {
     }
 
     pub fn starts_with(&self, prefix: &RelativePath) -> bool {
-        self.0.starts_with(prefix.as_str())
+        path_prefix_matches(&self.0, prefix.as_str())
     }
 
     pub fn to_path_buf(&self) -> PathBuf {
@@ -242,5 +249,15 @@ mod tests {
         assert_eq!(ChunkKind::Function.to_string(), "function");
         assert_eq!(ChunkKind::Macro.to_string(), "macro");
         assert_eq!(ChunkKind::Other.to_string(), "other");
+    }
+
+    #[test]
+    fn relative_path_starts_with_respects_segment_boundary() {
+        let prefix = RelativePath::new("src/math");
+        assert!(RelativePath::new("src/math.rs").starts_with(&prefix));
+        assert!(RelativePath::new("src/math/util.rs").starts_with(&prefix));
+        assert!(RelativePath::new("src/math").starts_with(&prefix));
+        assert!(!RelativePath::new("src/mathematics.rs").starts_with(&prefix));
+        assert!(!RelativePath::new("src/mathx").starts_with(&prefix));
     }
 }

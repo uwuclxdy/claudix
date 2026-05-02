@@ -9,7 +9,8 @@ use crate::embedding::Provider;
 use crate::error::{ClaudixError, Result};
 use crate::store::{Store, StoredChunk};
 use crate::types::{
-    ByteRange, Chunk, ChunkId, ChunkKind, FileHash, Language, LineRange, RelativePath,
+    path_prefix_matches, ByteRange, Chunk, ChunkId, ChunkKind, FileHash, Language, LineRange,
+    RelativePath,
 };
 
 #[derive(Debug, Clone)]
@@ -197,7 +198,7 @@ fn apply_filters(rows: Vec<StoredChunk>, query: &SearchQuery) -> Vec<StoredChunk
             }
 
             if let Some(path_prefix) = path_prefix
-                && !row.file_path.starts_with(path_prefix)
+                && !path_prefix_matches(&row.file_path, path_prefix)
             {
                 return false;
             }
