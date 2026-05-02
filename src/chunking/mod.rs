@@ -525,23 +525,25 @@ fn is_rust_doc_comment(line: &str) -> bool {
 }
 
 fn line_start(content: &str, byte_index: usize) -> usize {
-    content[..byte_index]
-        .rfind('\n')
-        .map(|index| index + 1)
+    content.as_bytes()[..byte_index]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
         .unwrap_or(0)
 }
 
 fn line_end(content: &str, line_start: usize) -> usize {
-    content[line_start..]
-        .find('\n')
+    content.as_bytes()[line_start..]
+        .iter()
+        .position(|&b| b == b'\n')
         .map(|offset| line_start + offset)
         .unwrap_or(content.len())
 }
 
 fn line_number_for_byte(content: &str, byte_index: usize) -> u32 {
-    let line_count = content[..byte_index]
-        .bytes()
-        .filter(|byte| *byte == b'\n')
+    let line_count = content.as_bytes()[..byte_index]
+        .iter()
+        .filter(|&&b| b == b'\n')
         .count();
 
     u32::try_from(line_count + 1).unwrap_or(u32::MAX)
@@ -613,6 +615,20 @@ mod tests {
 
         let has_impl_chunk = chunks.iter().any(|chunk| chunk.kind == ChunkKind::Impl);
         assert!(has_impl_chunk);
+    }
+
+    #[test]
+    fn rust_chunker_handles_multibyte_chars_without_panic() {
+        // é is 0xC3 0xA9 — a 2-byte UTF-8 sequence. The node's exclusive end_byte
+        // sits after the last byte (0xA9), and end_byte - 1 = 0xA9 which is a
+        // continuation byte. line_number_for_byte must not slice the str there.
+        let source = "pub fn café() -> &'static str {\n    \"espresso\"\n}\n";
+        let chunker = MultiLanguageChunker::new();
+        let result = chunker.chunk(&RelativePath::new("src/lib.rs"), Language::Rust, hash_for(source), source);
+        assert!(result.is_ok(), "chunking with multi-byte ident must not panic: {result:?}");
+        let chunks = result.ok().unwrap_or_else(|| unreachable!());
+        assert!(!chunks.is_empty());
+        assert_eq!(chunks[0].name.as_deref(), Some("café"));
     }
 
     #[test]
