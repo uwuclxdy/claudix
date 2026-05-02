@@ -66,11 +66,20 @@ impl FileEnumerator {
             Err(error) => return Err(error.into()),
         };
 
-        if metadata.file_type().is_symlink() && !self.config.indexing.follow_symlinks {
-            return Ok(None);
-        }
-
-        if metadata.len() > self.max_file_size_bytes() {
+        if metadata.file_type().is_symlink() {
+            if !self.config.indexing.follow_symlinks {
+                return Ok(None);
+            }
+            // symlink_metadata reports the link size, not the target; re-stat the target.
+            let target_metadata = match fs::metadata(&absolute_path) {
+                Ok(m) => m,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if target_metadata.len() > self.max_file_size_bytes() {
+                return Ok(None);
+            }
+        } else if metadata.len() > self.max_file_size_bytes() {
             return Ok(None);
         }
 
