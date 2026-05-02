@@ -60,26 +60,35 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) {
 }
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
-    if let Ok(ref config) = config::load(project_root)
+    let config = config::load(project_root).ok();
+
+    if let Some(ref config) = config
         && config.hooks.auto_index_on_session_start
         && is_git_repo(project_root)
     {
         spawn_background_index(project_root, config);
     }
 
+    let indexed_file_count = config
+        .as_ref()
+        .and_then(|config| Store::new(project_root, config).ok())
+        .and_then(|store| store.read_manifest().ok().flatten())
+        .map(|manifest| manifest.file_count)
+        .unwrap_or(0);
+
     let mut response =
-        session_start_response("claudix semantic search status available".to_owned());
+        session_start_response("claudix semantic search available".to_owned());
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
-        None => session_start_message(cli::setup_state(project_root).await),
+        None => session_start_message(cli::setup_state(project_root).await, indexed_file_count),
     };
     response["systemMessage"] = Value::String(user_message);
     Ok(Some(response))
 }
 
-fn session_start_message(setup_state: cli::SetupState) -> String {
+fn session_start_message(setup_state: cli::SetupState, indexed_file_count: u64) -> String {
     match setup_state {
-        cli::SetupState::Ready => "claudix ready".to_owned(),
+        cli::SetupState::Ready => format!("claudix indexed {indexed_file_count} files"),
         cli::SetupState::Missing(parts) => format!(
             "claudix setup incomplete (missing {}); run the install script again",
             parts.join(", ")
@@ -351,8 +360,14 @@ mod tests {
 
     #[test]
     fn session_start_message_reports_ready_setup() {
-        let message = session_start_message(cli::SetupState::Ready);
-        assert_eq!(message, "claudix ready");
+        assert_eq!(
+            session_start_message(cli::SetupState::Ready, 0),
+            "claudix indexed 0 files"
+        );
+        assert_eq!(
+            session_start_message(cli::SetupState::Ready, 42),
+            "claudix indexed 42 files"
+        );
     }
 
     #[tokio::test]
