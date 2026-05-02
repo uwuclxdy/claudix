@@ -96,6 +96,10 @@ pub async fn run_index(project_root: impl AsRef<Path>) -> Result<IndexOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
     require_git_repo(&project_root)?;
     let config = config::load(&project_root)?;
+    let store = Store::new(&project_root, &config)?;
+    let _lock = store.acquire_index_lock().ok_or_else(|| {
+        crate::error::ClaudixError::Store("index already running".to_owned())
+    })?;
     let claudix = Claudix::new(project_root, Arc::new(config)).await?;
     let stats = claudix.index_full().await?;
 
@@ -118,6 +122,16 @@ pub async fn run_reindex_file(
 ) -> Result<IndexOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
     let config = config::load(&project_root)?;
+    let store = Store::new(&project_root, &config)?;
+
+    if store.full_index_running() {
+        let status = status_from_store(&store).await?;
+        return Ok(IndexOutput {
+            file_count: status.file_count,
+            chunk_count: status.chunk_count,
+        });
+    }
+
     let claudix = Claudix::new(project_root, Arc::new(config)).await?;
     let stats = claudix.reindex_file(path.as_ref()).await?;
 

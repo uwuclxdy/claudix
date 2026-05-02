@@ -1,11 +1,9 @@
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::Claudix;
 use crate::cli;
 use crate::config::{self, Config};
 use crate::error::Result;
@@ -109,9 +107,21 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
         return Ok(None);
     }
 
-    let claudix = Claudix::new(project_root.to_path_buf(), Arc::new(config)).await?;
-    let _ = claudix.reindex_file(Path::new(&file_path)).await?;
+    spawn_background_reindex_file(project_root, &file_path);
     Ok(None)
+}
+
+fn spawn_background_reindex_file(project_root: &Path, file_path: &str) {
+    let Ok(binary) = std::env::current_exe() else {
+        return;
+    };
+    let _ = std::process::Command::new(binary)
+        .args(["reindex-file", file_path])
+        .current_dir(project_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Result<Option<Value>> {
@@ -299,10 +309,13 @@ struct ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::sync::Arc;
+    use tempfile::tempdir;
+
+    use crate::Claudix;
     use crate::config::Config;
     use crate::store::Manifest;
-    use std::fs;
-    use tempfile::tempdir;
 
     mod fixture {
         include!(concat!(
@@ -355,7 +368,7 @@ mod tests {
         let model_context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
-        assert_eq!(model_context, "claudix semantic search status available");
+        assert_eq!(model_context, "claudix semantic search available");
     }
 
     #[test]
@@ -371,24 +384,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_tool_use_reindexes_changed_file() {
+    async fn post_tool_use_spawns_background_reindex_and_returns_none() {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
         write_config(fixture.root(), &stub_config());
-
-        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
-        assert!(claudix.is_ok());
-        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
-        assert!(claudix.index_full().await.is_ok());
-        assert!(
-            tokio::fs::write(
-                fixture.root().join("src/math.rs"),
-                "pub fn multiply(left: i32, right: i32) -> i32 {\n    left * right\n}\n",
-            )
-            .await
-            .is_ok()
-        );
 
         let payload = json!({
             "tool_name": "Write",
@@ -399,21 +399,26 @@ mod tests {
         let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
         assert!(response.is_ok());
         assert!(response.ok().unwrap_or_else(|| unreachable!()).is_none());
+    }
 
-        let store = Store::new(fixture.root(), &stub_config());
-        assert!(store.is_ok());
-        let rows = store
-            .ok()
-            .unwrap_or_else(|| unreachable!())
-            .read_chunks()
-            .await;
-        assert!(rows.is_ok());
-        let rows = rows.ok().unwrap_or_else(|| unreachable!());
-        assert!(
-            rows.iter()
-                .any(|row| row.name.as_deref() == Some("multiply"))
-        );
-        assert!(!rows.iter().any(|row| row.name.as_deref() == Some("add")));
+    #[tokio::test]
+    async fn post_tool_use_passes_through_when_auto_reembed_disabled() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let mut config = stub_config();
+        config.hooks.auto_reembed_on_edit = false;
+        write_config(fixture.root(), &config);
+
+        let payload = json!({
+            "tool_name": "Write",
+            "tool_input": {
+                "file_path": fixture.root().join("src/math.rs"),
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(response.ok().unwrap_or_else(|| unreachable!()).is_none());
     }
 
     #[tokio::test]

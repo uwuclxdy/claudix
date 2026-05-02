@@ -20,6 +20,8 @@ use crate::util::now_rfc3339;
 
 pub const SCHEMA_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.json";
+const LOCK_FILE_NAME: &str = "index.lock";
+const LOCK_STALE_SECS: u64 = 7_200;
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 const GITIGNORE_CONTENTS: &str = "*\n";
 const CHUNKS_TABLE_NAME: &str = "chunks";
@@ -59,6 +61,16 @@ impl Manifest {
             chunk_count: 0,
             file_count: 0,
         }
+    }
+}
+
+pub struct IndexLockGuard {
+    path: PathBuf,
+}
+
+impl Drop for IndexLockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -122,6 +134,32 @@ impl Store {
 
     pub fn project_root(&self) -> &Path {
         &self.project_root
+    }
+
+    pub fn acquire_index_lock(&self) -> Option<IndexLockGuard> {
+        if self.full_index_running() {
+            return None;
+        }
+        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
+        let _ = fs::remove_file(&lock_path);
+        match fs::File::create_new(&lock_path) {
+            Ok(_) => Some(IndexLockGuard { path: lock_path }),
+            Err(_) => None,
+        }
+    }
+
+    pub fn full_index_running(&self) -> bool {
+        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
+        let Ok(metadata) = fs::metadata(&lock_path) else {
+            return false;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return false;
+        };
+        let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
+            return false;
+        };
+        age.as_secs() < LOCK_STALE_SECS
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
