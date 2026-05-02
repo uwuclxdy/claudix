@@ -31,9 +31,9 @@ fn is_git_repo(path: &Path) -> bool {
     path.join(".git").exists()
 }
 
-fn spawn_background_index(project_root: &Path, config: &crate::config::Config) {
+fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -> bool {
     let Ok(store) = Store::new(project_root, config) else {
-        return;
+        return false;
     };
     let needs_index = store
         .read_manifest()
@@ -43,29 +43,32 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) {
         .map(|m| index_is_stale(m, config))
         .unwrap_or(true);
     if !needs_index {
-        return;
+        return false;
     }
     let Ok(binary) = std::env::current_exe() else {
-        return;
+        return false;
     };
-    let _ = std::process::Command::new(binary)
+    std::process::Command::new(binary)
         .arg("index")
         .current_dir(project_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .spawn();
+        .spawn()
+        .is_ok()
 }
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
     let config = config::load(project_root).ok();
 
-    if let Some(ref config) = config
+    let indexing = if let Some(ref config) = config
         && config.hooks.auto_index_on_session_start
         && is_git_repo(project_root)
     {
-        spawn_background_index(project_root, config);
-    }
+        spawn_background_index(project_root, config)
+    } else {
+        false
+    };
 
     let indexed_file_count = config
         .as_ref()
@@ -78,15 +81,21 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         session_start_response("claudix semantic search available".to_owned());
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
-        None => session_start_message(cli::setup_state(project_root).await, indexed_file_count),
+        None => session_start_message(cli::setup_state(project_root).await, indexed_file_count, indexing),
     };
     response["systemMessage"] = Value::String(user_message);
     Ok(Some(response))
 }
 
-fn session_start_message(setup_state: cli::SetupState, indexed_file_count: u64) -> String {
+fn session_start_message(setup_state: cli::SetupState, indexed_file_count: u64, indexing: bool) -> String {
     match setup_state {
-        cli::SetupState::Ready => format!("claudix indexed {indexed_file_count} files"),
+        cli::SetupState::Ready => {
+            if indexing {
+                format!("claudix indexed {indexed_file_count} files (indexing in background...)")
+            } else {
+                format!("claudix indexed {indexed_file_count} files")
+            }
+        }
         cli::SetupState::Missing(parts) => format!(
             "claudix setup incomplete (missing {}); run the install script again",
             parts.join(", ")
@@ -374,12 +383,16 @@ mod tests {
     #[test]
     fn session_start_message_reports_ready_setup() {
         assert_eq!(
-            session_start_message(cli::SetupState::Ready, 0),
+            session_start_message(cli::SetupState::Ready, 0, false),
             "claudix indexed 0 files"
         );
         assert_eq!(
-            session_start_message(cli::SetupState::Ready, 42),
+            session_start_message(cli::SetupState::Ready, 42, false),
             "claudix indexed 42 files"
+        );
+        assert_eq!(
+            session_start_message(cli::SetupState::Ready, 42, true),
+            "claudix indexed 42 files (indexing in background...)"
         );
     }
 
