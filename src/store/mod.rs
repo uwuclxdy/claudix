@@ -137,15 +137,22 @@ impl Store {
     }
 
     pub fn acquire_index_lock(&self) -> Option<IndexLockGuard> {
+        fs::create_dir_all(&self.paths.state_dir).ok()?;
+        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
+
+        // Atomic create — succeeds only when no lock file exists.
+        if let Ok(_file) = fs::File::create_new(&lock_path) {
+            return Some(IndexLockGuard { path: lock_path });
+        }
+
+        // Lock file exists — only remove it if it is stale.
         if self.full_index_running() {
             return None;
         }
-        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
         let _ = fs::remove_file(&lock_path);
-        match fs::File::create_new(&lock_path) {
-            Ok(_) => Some(IndexLockGuard { path: lock_path }),
-            Err(_) => None,
-        }
+        fs::File::create_new(&lock_path)
+            .ok()
+            .map(|_| IndexLockGuard { path: lock_path })
     }
 
     pub fn full_index_running(&self) -> bool {
