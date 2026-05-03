@@ -6,9 +6,7 @@ pub fn validate(config: &Config) -> Result<()> {
     validate_project_relative_path(&config.paths.index_dir, "paths.index_dir")?;
     validate_project_relative_path(&config.paths.log_dir, "paths.log_dir")?;
 
-    if allow_stub_embedding_model(config) {
-        return Ok(());
-    }
+    let allow_stub_embedding_model = allow_stub_embedding_model(config);
 
     if matches!(config.embedding.provider, EmbeddingProvider::Http)
         && config.embedding.endpoint.trim().is_empty()
@@ -20,6 +18,7 @@ pub fn validate(config: &Config) -> Result<()> {
     }
 
     if matches!(config.embedding.provider, EmbeddingProvider::Bundled)
+        && !allow_stub_embedding_model
         && config.embedding.model != crate::embedding::bundled::BUNDLED_MODEL_ID
     {
         return Err(ClaudixError::ConfigInvalid {
@@ -34,6 +33,7 @@ pub fn validate(config: &Config) -> Result<()> {
     }
 
     if matches!(config.embedding.provider, EmbeddingProvider::Bundled)
+        && !allow_stub_embedding_model
         && config.embedding.dimensions != crate::embedding::bundled::BUNDLED_DIMENSIONS.0
     {
         return Err(ClaudixError::ConfigInvalid {

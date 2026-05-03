@@ -475,6 +475,16 @@ index_dir = ".claudix/custom-index"
     }
 
     #[test]
+    fn stub_model_still_validates_numeric_fields() {
+        let mut config = Config::default();
+        config.embedding.model = "stub-model".to_owned();
+        config.search.top_k = 0;
+
+        let error = validate(&config);
+        assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
     fn reject_absolute_paths_outside_project() {
         let mut config = Config::default();
         config.paths.log_dir = PathBuf::from("/tmp/claudix-logs");
