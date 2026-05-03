@@ -74,6 +74,12 @@ pub fn validate(config: &Config) -> Result<()> {
     }
 
     let weights = &config.search.hybrid_weights;
+    if !weights.dense.is_finite() || !weights.bm25.is_finite() || !weights.rrf.is_finite() {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "search.hybrid_weights components must be finite numbers".into(),
+            recovery: RecoveryHint("Set all [search].hybrid_weights values to finite numbers"),
+        });
+    }
     if weights.dense < 0.0 || weights.bm25 < 0.0 || weights.rrf < 0.0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "search.hybrid_weights components must be >= 0".into(),
