@@ -278,6 +278,7 @@ fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchR
         }
         lines.push(String::new());
     }
+    lines.push("Tip: call search_code MCP tool directly next time to skip this interception round-trip.".to_owned());
     let context = lines.join("\n");
     json!({
         "hookSpecificOutput": {
@@ -852,6 +853,10 @@ mod tests {
         assert!(
             context.contains("src/"),
             "context must include file paths from search results"
+        );
+        assert!(
+            context.contains("search_code MCP tool"),
+            "context must include tip to use search_code directly, got: {context}"
         );
     }
 
