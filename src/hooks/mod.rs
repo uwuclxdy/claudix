@@ -312,9 +312,44 @@ fn extract_quoted_pattern(args: &str) -> Option<String> {
     };
 
     let after = &args[start + 1..];
-    let end = after.as_bytes().iter().position(|&b| b == quote)?;
-    let pattern = after[..end].trim();
+    let quote = char::from(quote);
+    let mut pattern = String::new();
+    let mut escaped = false;
+    let mut closed = false;
 
+    for character in after.chars() {
+        if escaped {
+            if character == quote {
+                pattern.push(character);
+            } else {
+                pattern.push('\\');
+                pattern.push(character);
+            }
+            escaped = false;
+            continue;
+        }
+
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if character == quote {
+            closed = true;
+            break;
+        }
+
+        pattern.push(character);
+    }
+
+    if escaped {
+        pattern.push('\\');
+    }
+    if !closed {
+        return None;
+    }
+
+    let pattern = pattern.trim();
     if pattern.is_empty() { None } else { Some(pattern.to_owned()) }
 }
 
@@ -421,6 +456,10 @@ mod tests {
         assert_eq!(
             extract_quoted_pattern(r#"-rn "pattern" src/"#),
             Some("pattern".to_owned())
+        );
+        assert_eq!(
+            extract_quoted_pattern(r#""error \"quoted\" message" src/"#),
+            Some(r#"error "quoted" message"#.to_owned())
         );
         // No quotes → None.
         assert_eq!(extract_quoted_pattern("add src/"), None);
