@@ -9,8 +9,8 @@ use crate::embedding::Provider;
 use crate::error::{ClaudixError, Result};
 use crate::store::{Store, StoredChunk};
 use crate::types::{
-    path_prefix_matches, ByteRange, Chunk, ChunkId, ChunkKind, FileHash, Language, LineRange,
-    RelativePath,
+    path_prefix_matches, ByteRange, Chunk, ChunkId, ChunkKind, Dimension, FileHash, Language,
+    LineRange, RelativePath,
 };
 
 #[derive(Debug, Clone)]
@@ -74,6 +74,7 @@ impl Searcher {
         }
 
         let query_vector = vectors.into_iter().next().unwrap_or_default();
+        validate_query_vector(&query_vector, self.embedder.dimensions())?;
         let config = self.config.clone();
 
         task::spawn_blocking(move || rank_rows(query, rows, query_vector, config))
@@ -178,6 +179,26 @@ fn effective_top_k(requested: usize, default_top_k: usize) -> usize {
     } else {
         requested
     }
+}
+
+fn validate_query_vector(vector: &[f32], dimensions: Dimension) -> Result<()> {
+    if vector.len() != usize::from(dimensions.0) {
+        return Err(ClaudixError::DimensionMismatch {
+            store_dim: dimensions.0,
+            model_dim: u16::try_from(vector.len()).unwrap_or(u16::MAX),
+            recovery: crate::error::RecoveryHint(
+                "Rebuild the index with the configured embedding dimensions or fix the endpoint model",
+            ),
+        });
+    }
+
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(ClaudixError::Embedding(
+            "provider returned non-finite query embedding values".to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn apply_filters(rows: Vec<StoredChunk>, query: &SearchQuery) -> Vec<StoredChunk> {
@@ -463,6 +484,8 @@ fn stored_chunk_kind(kind: &str) -> ChunkKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+
     use crate::embedding::{Provider, StubProvider};
     use crate::types::Dimension;
 
@@ -484,6 +507,34 @@ mod tests {
 
     use fixture::TestFixture;
     use test_support::{index_fixture, stub_config};
+
+    struct FixedProvider {
+        dimension: Dimension,
+        vectors: Vec<Vec<f32>>,
+    }
+
+    #[async_trait]
+    impl Provider for FixedProvider {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+
+        fn dimensions(&self) -> Dimension {
+            self.dimension
+        }
+
+        fn model_id(&self) -> &str {
+            "fixed-model"
+        }
+
+        async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(self.vectors.iter().take(batch.len()).cloned().collect())
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn tokenize_splits_snake_case() {
@@ -623,6 +674,29 @@ mod tests {
             _fixture: fixture,
             searcher: Searcher::new(store, embedder, config.search.clone()),
         })
+    }
+
+    #[tokio::test]
+    async fn search_rejects_non_finite_query_embedding() {
+        let harness = search_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        let embedder: Arc<dyn Provider> = Arc::new(FixedProvider {
+            dimension: Dimension(384),
+            vectors: vec![vec![f32::NAN; 384]],
+        });
+        let searcher = Searcher::new(harness.searcher.store, embedder, harness.searcher.config);
+
+        let error = searcher
+            .search_all(SearchQuery {
+                query: "add".to_owned(),
+                top_k: 10,
+                language_filter: None,
+                path_prefix: None,
+            })
+            .await;
+
+        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("non-finite query")));
     }
 
     #[tokio::test]
