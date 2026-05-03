@@ -66,6 +66,13 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    if config.indexing.max_file_size_kb == 0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "indexing.max_file_size_kb must be > 0".into(),
+            recovery: RecoveryHint("Set [indexing].max_file_size_kb to a positive integer"),
+        });
+    }
+
     if config.search.top_k == 0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "search.top_k must be > 0".into(),
