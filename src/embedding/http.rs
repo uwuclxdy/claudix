@@ -94,12 +94,19 @@ impl Provider for HttpProvider {
                 batch.len()
             )));
         }
-        let mut items: Vec<(usize, Vec<f32>)> = payload
-            .data
-            .into_iter()
-            .enumerate()
-            .map(|(pos, item)| (item.index.unwrap_or(pos), item.embedding))
-            .collect();
+        let mut seen = vec![false; batch.len()];
+        let mut items = Vec::with_capacity(payload.data.len());
+        for (position, item) in payload.data.into_iter().enumerate() {
+            let index = item.index.unwrap_or(position);
+            if index >= batch.len() || seen[index] {
+                return Err(ClaudixError::Embedding(format!(
+                    "provider returned invalid embedding index {index} for {} inputs",
+                    batch.len()
+                )));
+            }
+            seen[index] = true;
+            items.push((index, item.embedding));
+        }
         items.sort_unstable_by_key(|(idx, _)| *idx);
         let vectors: Vec<Vec<f32>> = items.into_iter().map(|(_, embedding)| embedding).collect();
 
@@ -234,6 +241,48 @@ mod tests {
         // Must reorder so that index 0 (alpha → [0.1,0.2]) comes first.
         assert_eq!(result, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
         server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn http_provider_reports_duplicate_embedding_index() {
+        let server = TestServer::spawn(response_with_json(
+            r#"{"data":[{"index":0,"embedding":[0.1,0.2]},{"index":0,"embedding":[0.3,0.4]}]}"#,
+        ))
+        .await;
+
+        let provider = HttpProvider::new(
+            server.endpoint(),
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+
+        let error = provider.embed(&["alpha", "beta"]).await;
+        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("invalid embedding index 0")));
+        let _ = server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn http_provider_reports_out_of_range_embedding_index() {
+        let server = TestServer::spawn(response_with_json(
+            r#"{"data":[{"index":0,"embedding":[0.1,0.2]},{"index":2,"embedding":[0.3,0.4]}]}"#,
+        ))
+        .await;
+
+        let provider = HttpProvider::new(
+            server.endpoint(),
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+
+        let error = provider.embed(&["alpha", "beta"]).await;
+        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("invalid embedding index 2")));
+        let _ = server.finish().await;
     }
 
     #[tokio::test]
