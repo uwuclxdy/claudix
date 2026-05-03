@@ -2,6 +2,8 @@ use crate::error::{ClaudixError, RecoveryHint, Result};
 
 use super::{Config, EmbeddingProvider, validate_project_relative_path};
 
+const FALLBACK_CHUNK_LINES: usize = 60;
+
 pub fn validate(config: &Config) -> Result<()> {
     validate_project_relative_path(&config.paths.index_dir, "paths.index_dir")?;
     validate_project_relative_path(&config.paths.log_dir, "paths.log_dir")?;
@@ -70,6 +72,15 @@ pub fn validate(config: &Config) -> Result<()> {
         return Err(ClaudixError::ConfigInvalid {
             message: "indexing.max_file_size_kb must be > 0".into(),
             recovery: RecoveryHint("Set [indexing].max_file_size_kb to a positive integer"),
+        });
+    }
+
+    if config.indexing.chunk_overlap_lines >= FALLBACK_CHUNK_LINES {
+        return Err(ClaudixError::ConfigInvalid {
+            message: format!(
+                "indexing.chunk_overlap_lines must be less than {FALLBACK_CHUNK_LINES}"
+            ),
+            recovery: RecoveryHint("Set [indexing].chunk_overlap_lines between 0 and 59"),
         });
     }
 

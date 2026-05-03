@@ -494,6 +494,23 @@ index_dir = ".claudix/custom-index"
     }
 
     #[test]
+    fn reject_chunk_overlap_at_or_above_chunk_size() {
+        let mut config = Config::default();
+        config.indexing.chunk_overlap_lines = 60;
+
+        let error = validate(&config);
+        assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
+    fn accept_chunk_overlap_below_chunk_size() {
+        let mut config = Config::default();
+        config.indexing.chunk_overlap_lines = 59;
+
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
     fn reject_absolute_paths_outside_project() {
         let mut config = Config::default();
         config.paths.log_dir = PathBuf::from("/tmp/claudix-logs");
