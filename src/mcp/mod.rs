@@ -200,8 +200,11 @@ async fn get_index_status(project_root: &Path) -> Result<Value> {
 }
 
 async fn reindex(project_root: &Path, arguments: Value) -> Result<Value> {
-    let _request: ReindexRequest =
+    let request: ReindexRequest =
         parse_tool_arguments(arguments, "reindex", "Pass force as an optional boolean")?;
+    if request.force {
+        cli::run_clear_index(project_root).await?;
+    }
     let output = cli::run_index(project_root).await?;
     to_value(output)
 }
@@ -458,5 +461,17 @@ mod tests {
         assert!(response.is_ok());
         let response = response.ok().flatten().unwrap_or(Value::Null);
         assert_eq!(response["error"]["code"], Value::Number((-32602).into()));
+    }
+
+    #[test]
+    fn reindex_request_defaults_force_to_false() {
+        let request: ReindexRequest = serde_json::from_str("{}").unwrap();
+        assert!(!request.force);
+    }
+
+    #[test]
+    fn reindex_request_parses_force_true() {
+        let request: ReindexRequest = serde_json::from_str(r#"{"force":true}"#).unwrap();
+        assert!(request.force);
     }
 }
