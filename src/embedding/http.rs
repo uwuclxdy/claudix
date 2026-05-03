@@ -24,7 +24,7 @@ impl HttpProvider {
         timeout: Duration,
         bearer_token: Option<&str>,
     ) -> Result<Self> {
-        let endpoint = normalize_endpoint(endpoint.into());
+        let endpoint = normalize_endpoint(endpoint.into())?;
         let client = build_client(timeout, bearer_token)?;
 
         Ok(Self {
@@ -156,8 +156,15 @@ fn build_client(timeout: Duration, bearer_token: Option<&str>) -> Result<reqwest
         .map_err(ClaudixError::from)
 }
 
-fn normalize_endpoint(endpoint: String) -> String {
-    endpoint.trim_end_matches('/').to_owned()
+fn normalize_endpoint(endpoint: String) -> Result<String> {
+    let endpoint = endpoint.trim().trim_end_matches('/').to_owned();
+    if endpoint.is_empty() {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "embedding endpoint cannot be empty".to_owned(),
+            recovery: RecoveryHint("Set [embedding].endpoint to the base URL for the HTTP provider"),
+        });
+    }
+    Ok(endpoint)
 }
 
 fn validate_dimensions(vectors: &[Vec<f32>], dimensions: Dimension) -> Result<()> {
@@ -189,6 +196,19 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn http_provider_rejects_blank_endpoint() {
+        let provider = HttpProvider::new(
+            "   ",
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
+        );
+
+        assert!(matches!(provider, Err(ClaudixError::ConfigInvalid { .. })));
+    }
 
     #[tokio::test]
     async fn http_provider_embeds_batch() {
