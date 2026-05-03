@@ -21,7 +21,7 @@ enum Command {
     Index,
     #[command(about = "Search indexed code semantically")]
     Search {
-        #[arg(trailing_var_arg = true, num_args = 1.., help = "Natural-language or identifier query (multi-word, no quoting needed)")]
+        #[arg(num_args = 1.., help = "Natural-language or identifier query (multi-word, no quoting needed)")]
         query: Vec<String>,
         #[arg(long, help = "Maximum results to return (default: from config)")]
         top_k: Option<usize>,
