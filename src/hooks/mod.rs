@@ -336,11 +336,16 @@ fn looks_like_regex(query: &str) -> bool {
 }
 
 fn looks_like_file_target(query: &str) -> bool {
+    const FILE_EXTENSIONS: &[&str] = &[
+        ".rs", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".c", ".h", ".cpp",
+        ".cc", ".cxx", ".hpp", ".hxx", ".cs", ".sql",
+    ];
+
     query.contains("--glob")
         || query.contains("--include")
         || query.contains("*.")
         || query.contains("src/")
-        || query.contains(".rs")
+        || FILE_EXTENSIONS.iter().any(|ext| query.contains(ext))
 }
 
 fn token_count(query: &str) -> usize {
@@ -382,6 +387,23 @@ struct ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn looks_like_file_target_covers_all_supported_extensions() {
+        for ext in &[
+            ".rs", ".py", ".js", ".mjs", ".ts", ".tsx", ".go", ".java", ".c", ".h", ".cpp",
+            ".hpp", ".cs", ".sql",
+        ] {
+            let query = format!("search routes{ext}");
+            assert!(
+                looks_like_file_target(&query),
+                "expected passthrough for query containing {ext}"
+            );
+        }
+        assert!(!looks_like_file_target("error handling retry logic"));
+        assert!(looks_like_file_target("find *.rs files"));
+        assert!(looks_like_file_target("search in src/"));
+    }
 
     #[test]
     fn extract_quoted_pattern_uses_first_quote_type_as_delimiter() {
