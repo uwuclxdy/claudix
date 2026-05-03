@@ -115,6 +115,13 @@ fn session_start_message(setup_state: cli::SetupState, indexed_file_count: u64, 
 }
 
 async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Result<Option<Value>> {
+    let Some(tool_name) = payload.tool_name.as_deref() else {
+        return Ok(None);
+    };
+    if !is_write_tool(tool_name) {
+        return Ok(None);
+    }
+
     let Some(tool_input) = payload.tool_input else {
         return Ok(None);
     };
@@ -129,6 +136,10 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
 
     spawn_background_reindex_file(project_root, &file_path);
     Ok(None)
+}
+
+fn is_write_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
 }
 
 fn spawn_background_reindex_file(project_root: &Path, file_path: &str) {
@@ -470,6 +481,27 @@ mod tests {
         let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
         assert!(response.is_ok());
         assert!(response.ok().unwrap_or_else(|| unreachable!()).is_none());
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_ignores_read_tool() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": fixture.root().join("src/math.rs"),
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "Read tool must not trigger reindex"
+        );
     }
 
     #[tokio::test]
