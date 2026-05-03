@@ -592,6 +592,7 @@ fn parse_path_prefix(path_prefix: Option<String>) -> Option<RelativePath> {
 }
 
 fn parse_language(value: &str) -> Result<Language> {
+    let value = value.trim();
     match value.to_ascii_lowercase().as_str() {
         "rust" => Ok(Language::Rust),
         "python" => Ok(Language::Python),
@@ -699,7 +700,7 @@ mod tests {
         let parsed = parse_language_filter(Some(vec!["rs".to_owned(), "ts".to_owned()]));
         assert!(parsed.is_err());
 
-        let parsed = parse_language_filter(Some(vec!["rust".to_owned(), "ts".to_owned()]));
+        let parsed = parse_language_filter(Some(vec![" rust ".to_owned(), "ts".to_owned()]));
         assert!(matches!(
             parsed,
             Ok(Some(ref languages)) if languages == &vec![Language::Rust, Language::TypeScript]
