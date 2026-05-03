@@ -21,8 +21,8 @@ enum Command {
     Index,
     #[command(about = "Search indexed code semantically")]
     Search {
-        #[arg(help = "Natural-language or identifier query")]
-        query: String,
+        #[arg(trailing_var_arg = true, num_args = 1.., help = "Natural-language or identifier query (multi-word, no quoting needed)")]
+        query: Vec<String>,
         #[arg(long, help = "Maximum results to return (default: from config)")]
         top_k: Option<usize>,
         #[arg(
@@ -80,7 +80,7 @@ async fn main() -> Result<()> {
         } => {
             let output = cli::run_search(
                 &project_root,
-                query,
+                query.join(" "),
                 top_k,
                 if language_filter.is_empty() {
                     None
