@@ -368,8 +368,7 @@ fn compare_scores_desc(
 }
 
 fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
-    let length = left.len().min(right.len());
-    if length == 0 {
+    if left.len() != right.len() || left.is_empty() {
         return 0.0;
     }
 
@@ -377,7 +376,7 @@ fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     let mut left_norm = 0.0;
     let mut right_norm = 0.0;
 
-    for index in 0..length {
+    for index in 0..left.len() {
         dot += left[index] * right[index];
         left_norm += left[index] * left[index];
         right_norm += right[index] * right[index];
@@ -543,6 +542,13 @@ mod tests {
             vec!["handle", "session", "start"]
         );
         assert_eq!(tokenize("fn full_index_running"), vec!["fn", "full", "index", "running"]);
+    }
+
+    #[test]
+    fn cosine_similarity_returns_zero_for_dimension_mismatch() {
+        assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0, 0.0, 0.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[], &[1.0]), 0.0);
     }
 
     #[test]
