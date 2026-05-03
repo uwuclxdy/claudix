@@ -194,9 +194,7 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
     if index_is_stale(&manifest, &config) {
         return Ok(None);
     }
-
-    let stats = store.chunk_stats().await?;
-    if stats.chunk_count == 0 {
+    if manifest.chunk_count == 0 {
         return Ok(None);
     }
 
