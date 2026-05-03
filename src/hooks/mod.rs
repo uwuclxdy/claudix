@@ -208,7 +208,7 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
     if let Ok(claudix) = Claudix::new(project_root.to_path_buf(), Arc::new(config.clone())).await {
         let search_query = SearchQuery {
             query: query.clone(),
-            top_k: 10,
+            top_k: config.search.top_k,
             language_filter: None,
             path_prefix: None,
         };
