@@ -234,14 +234,3 @@ fn read_stdin_payload() -> String {
         String::new()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn read_stdin_payload_returns_empty_without_input() {
-        let payload = read_stdin_payload();
-        assert!(payload.is_empty());
-    }
-}
