@@ -44,7 +44,8 @@ pub fn parse_rfc3339(timestamp: &str) -> Result<SystemTime> {
     let second = parse_number(&bytes[17..19], timestamp)?;
 
     if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || day < 1
+        || day > days_in_month(year, month)
         || hour > 23
         || minute > 59
         || second > 59
@@ -60,6 +61,20 @@ pub fn parse_rfc3339(timestamp: &str) -> Result<SystemTime> {
     let seconds = u64::try_from(seconds).map_err(|_| invalid_timestamp(timestamp))?;
 
     Ok(UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: i64) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 fn parse_number(bytes: &[u8], original: &str) -> Result<i64> {
@@ -131,5 +146,15 @@ mod tests {
     fn parse_rejects_invalid_shape() {
         let parsed = parse_rfc3339("2026-04-27 12:00:00");
         assert!(matches!(parsed, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
+    fn parse_rejects_invalid_month_days() {
+        for timestamp in ["2026-02-29T00:00:00Z", "2026-04-31T00:00:00Z"] {
+            let parsed = parse_rfc3339(timestamp);
+            assert!(matches!(parsed, Err(ClaudixError::ConfigInvalid { .. })));
+        }
+
+        assert!(parse_rfc3339("2028-02-29T00:00:00Z").is_ok());
     }
 }
