@@ -596,6 +596,10 @@ fn record_batch_from_rows(rows: &[StoredChunk], dimension: Dimension) -> Result<
         validate_vector(&row.vector, dimension)?;
     }
 
+    record_batch_from_rows_unchecked(rows, dimension)
+}
+
+fn record_batch_from_rows_unchecked(rows: &[StoredChunk], dimension: Dimension) -> Result<RecordBatch> {
     let names: Vec<Option<String>> = rows.iter().map(|row| row.name.clone()).collect();
     let hash_refs: Vec<&[u8; 16]> = rows.iter().map(|row| &row.file_hash).collect();
     let vectors = rows
@@ -669,7 +673,10 @@ fn batches_to_rows(batches: Vec<RecordBatch>) -> Result<Vec<StoredChunk>> {
     let mut rows = Vec::new();
 
     for batch in batches {
+        let dimension = vector_dimension(&batch)?;
         for row_index in 0..batch.num_rows() {
+            let vector = read_vector(&batch, row_index)?;
+            validate_vector(&vector, dimension)?;
             rows.push(StoredChunk {
                 chunk_id: read_u64(&batch, FIELD_CHUNK_ID, row_index)?,
                 file_path: read_string(&batch, FIELD_FILE_PATH, row_index)?,
@@ -682,7 +689,7 @@ fn batches_to_rows(batches: Vec<RecordBatch>) -> Result<Vec<StoredChunk>> {
                 byte_end: read_u32(&batch, FIELD_BYTE_END, row_index)?,
                 file_hash: read_file_hash(&batch, row_index)?,
                 content: read_string(&batch, FIELD_CONTENT, row_index)?,
-                vector: read_vector(&batch, row_index)?,
+                vector,
             });
         }
     }
@@ -752,6 +759,19 @@ fn read_file_hash(batch: &RecordBatch, row: usize) -> Result<[u8; 16]> {
 
     <[u8; 16]>::try_from(array.value(row))
         .map_err(|_| ClaudixError::Store("file_hash value was not 16 bytes".to_owned()))
+}
+
+fn vector_dimension(batch: &RecordBatch) -> Result<Dimension> {
+    let array = batch
+        .column_by_name(FIELD_VECTOR)
+        .ok_or_else(|| ClaudixError::Store(format!("missing column {FIELD_VECTOR}")))?;
+    let array = array
+        .as_any()
+        .downcast_ref::<FixedSizeListArray>()
+        .ok_or_else(|| ClaudixError::Store("vector column was not fixed-size list".to_owned()))?;
+    u16::try_from(array.value_length())
+        .map(Dimension)
+        .map_err(|_| ClaudixError::Store("vector dimension overflowed u16".to_owned()))
 }
 
 fn read_vector(batch: &RecordBatch, row: usize) -> Result<Vec<f32>> {
@@ -1083,6 +1103,30 @@ mod tests {
         )];
 
         let error = store.replace_chunks(&chunks, &config).await;
+        assert!(matches!(error, Err(ClaudixError::Store(message)) if message.contains("non-finite")));
+    }
+
+    #[test]
+    fn batches_to_rows_rejects_non_finite_vectors() {
+        let row = StoredChunk {
+            chunk_id: 1,
+            file_path: "src/lib.rs".to_owned(),
+            language: "rust".to_owned(),
+            kind: "function".to_owned(),
+            name: Some("alpha".to_owned()),
+            line_start: 1,
+            line_end: 3,
+            byte_start: 0,
+            byte_end: 32,
+            file_hash: [1; 16],
+            content: "pub fn alpha() {}".to_owned(),
+            vector: vec![f32::NAN, 1.0],
+        };
+        let batch = record_batch_from_rows_unchecked(&[row], Dimension(2));
+        assert!(batch.is_ok());
+        let batch = batch.ok().unwrap_or_else(|| unreachable!());
+
+        let error = batches_to_rows(vec![batch]);
         assert!(matches!(error, Err(ClaudixError::Store(message)) if message.contains("non-finite")));
     }
 
