@@ -502,6 +502,15 @@ index_dir = ".claudix/custom-index"
     }
 
     #[test]
+    fn reject_zero_embedding_timeout() {
+        let mut config = Config::default();
+        config.embedding.timeout_ms = 0;
+
+        let error = validate(&config);
+        assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
     fn reject_invalid_identifier_boost() {
         for identifier_boost in [0.0, -0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut config = Config::default();
