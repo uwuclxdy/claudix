@@ -319,25 +319,18 @@ fn deduplicate_by_file_path(results: Vec<SearchResult>) -> Vec<SearchResult> {
 
 fn sort_results(results: &mut [SearchResult]) {
     results.sort_by(|left, right| {
-        compare_scores_desc(
-            left.score,
-            right.score,
-            left.chunk.line_range.start as usize,
-            right.chunk.line_range.start as usize,
-        )
-        .then_with(|| {
-            left.chunk
-                .file_path
-                .as_str()
-                .cmp(right.chunk.file_path.as_str())
-        })
-        .then_with(|| {
-            left.chunk
-                .line_range
-                .start
-                .cmp(&right.chunk.line_range.start)
-        })
-        .then_with(|| left.chunk.line_range.end.cmp(&right.chunk.line_range.end))
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| {
+                left.chunk
+                    .file_path
+                    .as_str()
+                    .cmp(right.chunk.file_path.as_str())
+            })
+            .then_with(|| left.chunk.line_range.start.cmp(&right.chunk.line_range.start))
+            .then_with(|| left.chunk.line_range.end.cmp(&right.chunk.line_range.end))
     });
 }
 
