@@ -87,6 +87,7 @@ pub async fn run_search(
     let project_root = canonical_project_root(project_root.as_ref())?;
     let config = config::load(&project_root)?;
     let top_k = top_k.unwrap_or(config.search.top_k);
+    validate_search_top_k(top_k)?;
     let claudix = Claudix::new(project_root, Arc::new(config)).await?;
 
     run_search_with_claudix(&claudix, query, top_k, language_filter, path_prefix).await
@@ -256,6 +257,7 @@ async fn run_search_with_claudix(
     language_filter: Option<Vec<String>>,
     path_prefix: Option<String>,
 ) -> Result<SearchOutput> {
+    validate_search_top_k(top_k)?;
     let query = SearchQuery {
         query,
         top_k,
@@ -568,6 +570,17 @@ fn canonical_project_root(project_root: &Path) -> Result<PathBuf> {
     project_root.canonicalize().map_err(ClaudixError::from)
 }
 
+fn validate_search_top_k(top_k: usize) -> Result<()> {
+    if top_k == 0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "top_k must be > 0".into(),
+            recovery: RecoveryHint("Pass a positive top_k value"),
+        });
+    }
+
+    Ok(())
+}
+
 fn parse_language_filter(language_filter: Option<Vec<String>>) -> Result<Option<Vec<Language>>> {
     let Some(language_filter) = language_filter else {
         return Ok(None);
@@ -692,6 +705,13 @@ mod tests {
     #[test]
     fn parse_hook_event_rejects_unknown_values() {
         let result = parse_hook_event("Unknown");
+        assert!(matches!(result, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
+    fn validate_search_top_k_rejects_zero() {
+        let result = validate_search_top_k(0);
+
         assert!(matches!(result, Err(ClaudixError::ConfigInvalid { .. })));
     }
 
