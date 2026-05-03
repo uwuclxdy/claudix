@@ -84,6 +84,7 @@ pub async fn run_search(
     language_filter: Option<Vec<String>>,
     path_prefix: Option<String>,
 ) -> Result<SearchOutput> {
+    validate_search_query(&query)?;
     let project_root = canonical_project_root(project_root.as_ref())?;
     let config = config::load(&project_root)?;
     let top_k = top_k.unwrap_or(config.search.top_k);
@@ -570,6 +571,16 @@ fn canonical_project_root(project_root: &Path) -> Result<PathBuf> {
     project_root.canonicalize().map_err(ClaudixError::from)
 }
 
+fn validate_search_query(query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "search query cannot be empty".into(),
+            recovery: RecoveryHint("Pass a non-empty search query"),
+        });
+    }
+    Ok(())
+}
+
 fn validate_search_top_k(top_k: usize) -> Result<()> {
     if top_k == 0 {
         return Err(ClaudixError::ConfigInvalid {
@@ -712,6 +723,14 @@ mod tests {
     fn parse_hook_event_rejects_unknown_values() {
         let result = parse_hook_event("Unknown");
         assert!(matches!(result, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
+    fn validate_search_query_rejects_empty_and_whitespace() {
+        for query in ["", "   ", "\t", "\n"] {
+            let result = validate_search_query(query);
+            assert!(matches!(result, Err(ClaudixError::ConfigInvalid { .. })));
+        }
     }
 
     #[test]
