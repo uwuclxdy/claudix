@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -233,6 +233,60 @@ impl Store {
             .map(|row| row.file_hash);
         let stats = stats_from_rows(&rows);
         Ok((hash, stats))
+    }
+
+    pub async fn incremental_file_state(
+        &self,
+        current_files: &[(String, [u8; 16])],
+    ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
+        let stored_rows = self.read_chunks().await?;
+
+        let mut stored_hash_by_path: HashMap<&str, [u8; 16]> = HashMap::new();
+        for row in &stored_rows {
+            stored_hash_by_path.entry(&row.file_path).or_insert(row.file_hash);
+        }
+
+        let mut changed_paths: HashSet<String> = HashSet::new();
+        for (path, hash) in current_files {
+            match stored_hash_by_path.get(path.as_str()) {
+                Some(stored_hash) if stored_hash == hash => {}
+                _ => {
+                    changed_paths.insert(path.clone());
+                }
+            }
+        }
+
+        let current_path_set: HashSet<&str> =
+            current_files.iter().map(|(p, _)| p.as_str()).collect();
+
+        let unchanged_rows = stored_rows
+            .into_iter()
+            .filter(|row| {
+                current_path_set.contains(row.file_path.as_str())
+                    && !changed_paths.contains(&row.file_path)
+            })
+            .collect();
+
+        Ok((changed_paths, unchanged_rows))
+    }
+
+    pub async fn persist_incremental(
+        &self,
+        new_chunks: &[EmbeddedChunk],
+        unchanged_rows: Vec<StoredChunk>,
+        config: &Config,
+    ) -> Result<StoreStats> {
+        let dimension = Dimension(config.embedding.dimensions);
+        let new_rows = stored_chunks_from_embedded(new_chunks, dimension)?;
+
+        let mut merged_rows = unchanged_rows;
+        merged_rows.extend(new_rows);
+        sort_rows(&mut merged_rows);
+
+        let stats = stats_from_rows(&merged_rows);
+        self.persist_rows(merged_rows, dimension).await?;
+        self.sync_manifest(config, &stats)?;
+        Ok(stats)
     }
 
     pub async fn replace_chunks(
@@ -1220,6 +1274,57 @@ mod tests {
 
         let rows = store.read_chunks().await.unwrap();
         assert_eq!(rows.len(), 15, "read_chunks must return all rows, not just the LanceDB default of 10");
+    }
+
+    #[tokio::test]
+    async fn incremental_file_state_splits_changed_and_unchanged() {
+        let project_root = tempdir().unwrap();
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config).unwrap();
+
+        // Seed: two files, file_hash = chunk_id byte repeated
+        let initial = vec![
+            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
+            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
+        ];
+        store.replace_chunks(&initial, &config).await.unwrap();
+
+        // a.rs unchanged (same hash [1;16]), b.rs changed (new hash [9;16])
+        let current_files = vec![
+            ("src/a.rs".to_owned(), [1u8; 16]),
+            ("src/b.rs".to_owned(), [9u8; 16]),
+        ];
+
+        let (changed_paths, unchanged_rows) =
+            store.incremental_file_state(&current_files).await.unwrap();
+
+        assert!(!changed_paths.contains("src/a.rs"), "unchanged file must not be in changed_paths");
+        assert!(changed_paths.contains("src/b.rs"), "changed file must be in changed_paths");
+        assert_eq!(unchanged_rows.len(), 1);
+        assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
+    }
+
+    #[tokio::test]
+    async fn incremental_file_state_drops_deleted_files() {
+        let project_root = tempdir().unwrap();
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config).unwrap();
+
+        let initial = vec![
+            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
+            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
+        ];
+        store.replace_chunks(&initial, &config).await.unwrap();
+
+        // b.rs is not present in current_files (deleted)
+        let current_files = vec![("src/a.rs".to_owned(), [1u8; 16])];
+
+        let (changed_paths, unchanged_rows) =
+            store.incremental_file_state(&current_files).await.unwrap();
+
+        assert!(changed_paths.is_empty());
+        assert_eq!(unchanged_rows.len(), 1);
+        assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
     }
 
     #[tokio::test]

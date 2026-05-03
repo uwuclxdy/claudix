@@ -85,11 +85,25 @@ impl Claudix {
     pub async fn index_full(&self) -> Result<IndexStats> {
         let files = FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?
             .enumerate()?;
-        let chunks = self.collect_chunks(&files).await?;
+
+        let current_files: Vec<(String, [u8; 16])> = files
+            .iter()
+            .map(|f| (f.relative_path.as_str().to_owned(), f.file_hash.0))
+            .collect();
+
+        let (changed_paths, unchanged_rows) =
+            self.store.incremental_file_state(&current_files).await?;
+
+        let changed_files: Vec<_> = files
+            .into_iter()
+            .filter(|f| changed_paths.contains(f.relative_path.as_str()))
+            .collect();
+
+        let chunks = self.collect_chunks(&changed_files).await?;
         let embedded_chunks = self.embed_chunks(chunks).await?;
         let stats = self
             .store
-            .replace_chunks(&embedded_chunks, self.config.as_ref())
+            .persist_incremental(&embedded_chunks, unchanged_rows, self.config.as_ref())
             .await?;
 
         Ok(IndexStats {
@@ -480,6 +494,32 @@ mod tests {
         let stats = stats.ok().unwrap_or_else(|| unreachable!());
         // Chunk count unchanged — no re-embedding happened.
         assert_eq!(stats.chunk_count, 3);
+    }
+
+    #[tokio::test]
+    async fn index_full_preserves_unchanged_file_chunks_on_second_run() {
+        let fixture = TestFixture::new("small_rust").unwrap();
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config).unwrap();
+
+        claudix.index_full().await.unwrap();
+
+        // Modify only src/lib.rs; src/math.rs is untouched.
+        fs::write(
+            fixture.root().join("src/lib.rs"),
+            "pub mod math;\n\npub fn salute(name: &str) -> String { format!(\"hi {name}\") }\n",
+        )
+        .await
+        .unwrap();
+
+        claudix.index_full().await.unwrap();
+
+        let rows = claudix.store.read_chunks().await.unwrap();
+        let names: BTreeSet<_> = rows.iter().filter_map(|r| r.name.clone()).collect();
+
+        assert!(names.contains("salute"), "changed file must be re-embedded");
+        assert!(!names.contains("greet"), "stale chunk must be gone");
+        assert!(names.contains("add"), "unchanged file chunks must be preserved");
     }
 
     #[tokio::test]
