@@ -117,9 +117,10 @@ impl Claudix {
             });
         };
 
-        if let Ok(Some(stored_hash)) = self.store.stored_file_hash(&relative_path).await {
+        if let Ok((Some(stored_hash), stats)) =
+            self.store.stored_file_hash_and_stats(&relative_path).await
+        {
             if stored_hash == file.file_hash.0 {
-                let stats = self.store.chunk_stats().await?;
                 return Ok(IndexStats {
                     file_count: stats.file_count,
                     chunk_count: stats.chunk_count,

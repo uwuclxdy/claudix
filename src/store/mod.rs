@@ -222,13 +222,17 @@ impl Store {
         Ok(stats_from_rows(&rows))
     }
 
-    pub async fn stored_file_hash(&self, relative_path: &RelativePath) -> Result<Option<[u8; 16]>> {
+    pub async fn stored_file_hash_and_stats(
+        &self,
+        relative_path: &RelativePath,
+    ) -> Result<(Option<[u8; 16]>, StoreStats)> {
         let rows = self.read_chunks().await?;
         let hash = rows
-            .into_iter()
+            .iter()
             .find(|row| row.file_path == relative_path.as_str())
             .map(|row| row.file_hash);
-        Ok(hash)
+        let stats = stats_from_rows(&rows);
+        Ok((hash, stats))
     }
 
     pub async fn replace_chunks(
