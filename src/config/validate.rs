@@ -73,6 +73,13 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    if !config.search.identifier_boost.is_finite() || config.search.identifier_boost <= 0.0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "search.identifier_boost must be a finite positive number".into(),
+            recovery: RecoveryHint("Set [search].identifier_boost to a finite positive number"),
+        });
+    }
+
     let weights = &config.search.hybrid_weights;
     if !weights.dense.is_finite() || !weights.bm25.is_finite() || !weights.rrf.is_finite() {
         return Err(ClaudixError::ConfigInvalid {

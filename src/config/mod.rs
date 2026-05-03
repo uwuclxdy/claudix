@@ -502,6 +502,17 @@ index_dir = ".claudix/custom-index"
     }
 
     #[test]
+    fn reject_invalid_identifier_boost() {
+        for identifier_boost in [0.0, -0.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut config = Config::default();
+            config.search.identifier_boost = identifier_boost;
+
+            let error = validate(&config);
+            assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
+        }
+    }
+
+    #[test]
     fn reject_negative_hybrid_weights() {
         let mut config = Config::default();
         config.search.hybrid_weights = HybridWeights { dense: -0.1, bm25: 0.5, rrf: 0.5 };
