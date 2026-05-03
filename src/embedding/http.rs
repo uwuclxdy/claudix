@@ -87,6 +87,13 @@ impl Provider for HttpProvider {
         })?;
 
         let payload: EmbeddingResponse = response.json().await?;
+        if payload.data.len() != batch.len() {
+            return Err(ClaudixError::Embedding(format!(
+                "provider returned {} embeddings for {} inputs",
+                payload.data.len(),
+                batch.len()
+            )));
+        }
         let mut items: Vec<(usize, Vec<f32>)> = payload
             .data
             .into_iter()
@@ -222,6 +229,27 @@ mod tests {
         // Must reorder so that index 0 (alpha → [0.1,0.2]) comes first.
         assert_eq!(result, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
         server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn http_provider_reports_embedding_count_mismatch() {
+        let server = TestServer::spawn(response_with_json(
+            r#"{"data":[{"embedding":[0.1,0.2]}]}"#,
+        ))
+        .await;
+
+        let provider = HttpProvider::new(
+            server.endpoint(),
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+
+        let error = provider.embed(&["alpha", "beta"]).await;
+        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("1 embeddings for 2 inputs")));
+        let _ = server.finish().await;
     }
 
     #[tokio::test]
