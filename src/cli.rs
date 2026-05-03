@@ -260,7 +260,7 @@ async fn run_search_with_claudix(
         query,
         top_k,
         language_filter: parse_language_filter(language_filter)?,
-        path_prefix: path_prefix.map(RelativePath::new),
+        path_prefix: parse_path_prefix(path_prefix),
     };
     let results = claudix.search(query).await?;
 
@@ -584,6 +584,13 @@ fn parse_language_filter(language_filter: Option<Vec<String>>) -> Result<Option<
     Ok(Some(parsed))
 }
 
+fn parse_path_prefix(path_prefix: Option<String>) -> Option<RelativePath> {
+    path_prefix.and_then(|prefix| {
+        let trimmed = prefix.trim();
+        (!trimmed.is_empty()).then(|| RelativePath::new(trimmed.to_owned()))
+    })
+}
+
 fn parse_language(value: &str) -> Result<Language> {
     match value.to_ascii_lowercase().as_str() {
         "rust" => Ok(Language::Rust),
@@ -704,6 +711,16 @@ mod tests {
         let parsed = parse_language_filter(Some(Vec::new()));
 
         assert!(matches!(parsed, Ok(None)));
+    }
+
+    #[test]
+    fn parse_path_prefix_treats_blank_values_as_no_filter() {
+        assert!(parse_path_prefix(None).is_none());
+        assert!(parse_path_prefix(Some("   ".to_owned())).is_none());
+        assert_eq!(
+            parse_path_prefix(Some(" src/math ".to_owned())).as_ref().map(RelativePath::as_str),
+            Some("src/math")
+        );
     }
 
     #[tokio::test]
