@@ -100,7 +100,14 @@ pub async fn run_index(project_root: impl AsRef<Path>) -> Result<IndexOutput> {
     let _lock = store.acquire_index_lock().ok_or_else(|| {
         crate::error::ClaudixError::Store("index already running".to_owned())
     })?;
-    let claudix = Claudix::new(project_root, Arc::new(config)).await?;
+    let claudix = match Claudix::new(project_root.clone(), Arc::new(config.clone())).await {
+        Ok(claudix) => claudix,
+        Err(error) if requires_clean_reindex(&error) => {
+            store.clear_chunks(&config).await?;
+            Claudix::new(project_root, Arc::new(config)).await?
+        }
+        Err(error) => return Err(error),
+    };
     let stats = claudix.index_full().await?;
 
     Ok(IndexOutput {
@@ -174,6 +181,15 @@ pub async fn run_clear_index(project_root: impl AsRef<Path>) -> Result<ClearOutp
     store.clear_chunks(&config).await?;
 
     Ok(ClearOutput { cleared: true })
+}
+
+fn requires_clean_reindex(error: &ClaudixError) -> bool {
+    matches!(
+        error,
+        ClaudixError::SchemaMismatch { .. }
+            | ClaudixError::EmbeddingModelMismatch { .. }
+            | ClaudixError::DimensionMismatch { .. }
+    )
 }
 
 pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput> {
@@ -715,6 +731,28 @@ mod tests {
 
         assert_eq!(output.hits.len(), 1);
         assert_eq!(output.hits[0].file_path, "src/math.rs");
+    }
+
+    #[test]
+    fn clean_reindex_required_for_manifest_compatibility_errors() {
+        assert!(requires_clean_reindex(&ClaudixError::SchemaMismatch {
+            store: 0,
+            binary: 1,
+            recovery: RecoveryHint("reindex"),
+        }));
+        assert!(requires_clean_reindex(&ClaudixError::EmbeddingModelMismatch {
+            store_model: "old".to_owned(),
+            active_model: "new".to_owned(),
+            recovery: RecoveryHint("reindex"),
+        }));
+        assert!(requires_clean_reindex(&ClaudixError::DimensionMismatch {
+            store_dim: 384,
+            model_dim: 768,
+            recovery: RecoveryHint("reindex"),
+        }));
+        assert!(!requires_clean_reindex(&ClaudixError::Store(
+            "index already running".to_owned()
+        )));
     }
 
     #[tokio::test]
