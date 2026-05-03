@@ -567,6 +567,20 @@ index_dir = ".claudix/custom-index"
     }
 
     #[test]
+    fn reject_invalid_similarity_threshold() {
+        for threshold in [-0.1, 1.1, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut config = Config::default();
+            config.search.similarity_threshold = threshold;
+
+            let error = validate(&config);
+            assert!(
+                matches!(error, Err(ClaudixError::ConfigInvalid { .. })),
+                "expected rejection for similarity_threshold = {threshold}"
+            );
+        }
+    }
+
+    #[test]
     fn reject_negative_hybrid_weights() {
         let mut config = Config::default();
         config.search.hybrid_weights = HybridWeights { dense: -0.1, bm25: 0.5, rrf: 0.5 };
