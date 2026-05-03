@@ -66,12 +66,19 @@ impl FileEnumerator {
             Err(error) => return Err(error.into()),
         };
 
-        if metadata.file_type().is_symlink() {
+        let read_path = if metadata.file_type().is_symlink() {
             if !self.config.indexing.follow_symlinks {
                 return Ok(None);
             }
-            // symlink_metadata reports the link size, not the target; re-stat the target.
-            let target_metadata = match fs::metadata(&absolute_path) {
+            let target_path = match absolute_path.canonicalize() {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            if !target_path.starts_with(&self.project_root) {
+                return Ok(None);
+            }
+            let target_metadata = match fs::metadata(&target_path) {
                 Ok(m) => m,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.into()),
@@ -79,11 +86,15 @@ impl FileEnumerator {
             if target_metadata.len() > self.max_file_size_bytes() {
                 return Ok(None);
             }
-        } else if metadata.len() > self.max_file_size_bytes() {
-            return Ok(None);
-        }
+            target_path
+        } else {
+            if metadata.len() > self.max_file_size_bytes() {
+                return Ok(None);
+            }
+            absolute_path.clone()
+        };
 
-        let contents = match fs::read(&absolute_path) {
+        let contents = match fs::read(&read_path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
@@ -167,6 +178,8 @@ mod tests {
     use crate::types::RelativePath;
     use std::collections::BTreeSet;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs as unix_fs;
 
     mod fixture {
         include!(concat!(
@@ -280,6 +293,37 @@ mod tests {
         let escaped = RelativePath::new("../escape.rs");
         let error = enumerator.resolve_relative_path(&escaped);
         assert!(matches!(error, Err(ClaudixError::PathTraversal { .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_targets_outside_project_are_skipped() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let outside_dir = tempfile::tempdir();
+        assert!(outside_dir.is_ok());
+        let outside_dir = outside_dir.ok().unwrap_or_else(|| unreachable!());
+        let outside_file = outside_dir.path().join("outside.rs");
+        assert!(fs::write(&outside_file, "pub fn outside() {}\n").is_ok());
+        assert!(unix_fs::symlink(&outside_file, fixture.root().join("src/outside.rs")).is_ok());
+
+        let mut config = Config::default();
+        config.indexing.follow_symlinks = true;
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), config);
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let files = enumerator.enumerate();
+        assert!(files.is_ok());
+        let files = files.ok().unwrap_or_else(|| unreachable!());
+        let paths: BTreeSet<_> = files
+            .iter()
+            .map(|file| file.relative_path.as_str().to_owned())
+            .collect();
+
+        assert!(!paths.contains("src/outside.rs"));
     }
 
     #[test]
