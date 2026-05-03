@@ -166,6 +166,11 @@ fn validate_dimensions(vectors: &[Vec<f32>], dimensions: Dimension) -> Result<()
                 ),
             });
         }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(ClaudixError::Embedding(
+                "provider returned non-finite embedding values".to_owned(),
+            ));
+        }
     }
 
     Ok(())
@@ -250,6 +255,13 @@ mod tests {
         let error = provider.embed(&["alpha", "beta"]).await;
         assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("1 embeddings for 2 inputs")));
         let _ = server.finish().await;
+    }
+
+    #[test]
+    fn validate_dimensions_rejects_non_finite_embedding_values() {
+        let error = validate_dimensions(&[vec![0.1, f32::INFINITY]], Dimension(2));
+
+        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("non-finite embedding")));
     }
 
     #[tokio::test]
