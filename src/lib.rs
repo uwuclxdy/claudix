@@ -117,6 +117,16 @@ impl Claudix {
             });
         };
 
+        if let Ok(Some(stored_hash)) = self.store.stored_file_hash(&relative_path).await {
+            if stored_hash == file.file_hash.0 {
+                let stats = self.store.chunk_stats().await?;
+                return Ok(IndexStats {
+                    file_count: stats.file_count,
+                    chunk_count: stats.chunk_count,
+                });
+            }
+        }
+
         let chunks = self.collect_file_chunks(&file).await?;
         let embedded_chunks = self.embed_chunks(chunks).await?;
         let stats = if embedded_chunks.is_empty() {
@@ -448,6 +458,27 @@ mod tests {
         assert!(names.contains("greet"));
         assert!(names.contains("multiply"));
         assert!(!names.contains("add"));
+    }
+
+    #[tokio::test]
+    async fn reindex_file_skips_embedding_when_hash_unchanged() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+
+        let claudix = test_claudix(fixture.root().to_path_buf(), config);
+        assert!(claudix.is_ok());
+        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(claudix.index_full().await.is_ok());
+
+        // Reindex the same file without modifying it — hash matches stored hash, must skip.
+        let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
+        assert!(stats.is_ok());
+        let stats = stats.ok().unwrap_or_else(|| unreachable!());
+        // Chunk count unchanged — no re-embedding happened.
+        assert_eq!(stats.chunk_count, 3);
     }
 
     #[tokio::test]

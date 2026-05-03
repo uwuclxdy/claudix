@@ -222,6 +222,15 @@ impl Store {
         Ok(stats_from_rows(&rows))
     }
 
+    pub async fn stored_file_hash(&self, relative_path: &RelativePath) -> Result<Option<[u8; 16]>> {
+        let rows = self.read_chunks().await?;
+        let hash = rows
+            .into_iter()
+            .find(|row| row.file_path == relative_path.as_str())
+            .map(|row| row.file_hash);
+        Ok(hash)
+    }
+
     pub async fn replace_chunks(
         &self,
         chunks: &[EmbeddedChunk],
