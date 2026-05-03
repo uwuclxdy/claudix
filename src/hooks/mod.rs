@@ -81,15 +81,15 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         false
     };
 
-    let indexed_file_count = config
+    let manifest = config
         .as_ref()
         .and_then(|config| Store::new(project_root, config).ok())
-        .and_then(|store| store.read_manifest().ok().flatten())
-        .map(|manifest| manifest.file_count)
-        .unwrap_or(0);
+        .and_then(|store| store.read_manifest().ok().flatten());
 
-    let mut response =
-        session_start_response("claudix semantic search available".to_owned());
+    let indexed_file_count = manifest.as_ref().map(|m| m.file_count).unwrap_or(0);
+    let indexed_chunk_count = manifest.as_ref().map(|m| m.chunk_count).unwrap_or(0);
+
+    let mut response = session_start_response(indexed_file_count, indexed_chunk_count);
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
         None => session_start_message(cli::setup_state(project_root).await, indexed_file_count, indexing),
@@ -237,7 +237,15 @@ fn pending_restart_path() -> Option<std::path::PathBuf> {
     Some(base.join("pending-restart"))
 }
 
-fn session_start_response(additional_context: String) -> Value {
+fn session_start_response(file_count: u64, chunk_count: u64) -> Value {
+    let additional_context = if chunk_count == 0 {
+        "claudix semantic search available — index empty, run /claudix:index to build it".to_owned()
+    } else {
+        format!(
+            "claudix semantic search active — {file_count} files, {chunk_count} chunks indexed. \
+             Use search_code MCP tool for conceptual queries and identifier lookups instead of Grep."
+        )
+    };
     json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -535,7 +543,10 @@ mod tests {
         let model_context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
-        assert_eq!(model_context, "claudix semantic search available");
+        assert_eq!(
+            model_context,
+            "claudix semantic search available — index empty, run /claudix:index to build it"
+        );
     }
 
     #[test]
