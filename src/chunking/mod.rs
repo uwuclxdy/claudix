@@ -15,7 +15,7 @@ pub trait Chunker {
     ) -> Result<Vec<Chunk>>;
 }
 
-const DEFAULT_CHUNK_LINES: usize = 60;
+pub(crate) const DEFAULT_CHUNK_LINES: usize = 60;
 const DEFAULT_OVERLAP_LINES: usize = 5;
 
 #[derive(Debug)]

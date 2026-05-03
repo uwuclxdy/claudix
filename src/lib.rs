@@ -196,7 +196,8 @@ impl Claudix {
         let overlap_lines = self.config.indexing.chunk_overlap_lines;
 
         task::spawn_blocking(move || {
-            let chunker = MultiLanguageChunker::with_fallback_params(60, overlap_lines);
+            let chunker =
+                MultiLanguageChunker::with_fallback_params(chunking::DEFAULT_CHUNK_LINES, overlap_lines);
             if force_indexed && language == Language::Unknown {
                 chunker.chunk_as_text(&path, language, file_hash, &content)
             } else {

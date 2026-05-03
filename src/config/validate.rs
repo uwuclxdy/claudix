@@ -1,8 +1,7 @@
+use crate::chunking::DEFAULT_CHUNK_LINES;
 use crate::error::{ClaudixError, RecoveryHint, Result};
 
 use super::{Config, EmbeddingProvider, validate_project_relative_path};
-
-const FALLBACK_CHUNK_LINES: usize = 60;
 
 pub fn validate(config: &Config) -> Result<()> {
     validate_project_relative_path(&config.paths.index_dir, "paths.index_dir")?;
@@ -75,10 +74,10 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
-    if config.indexing.chunk_overlap_lines >= FALLBACK_CHUNK_LINES {
+    if config.indexing.chunk_overlap_lines >= DEFAULT_CHUNK_LINES {
         return Err(ClaudixError::ConfigInvalid {
             message: format!(
-                "indexing.chunk_overlap_lines must be less than {FALLBACK_CHUNK_LINES}"
+                "indexing.chunk_overlap_lines must be less than {DEFAULT_CHUNK_LINES}"
             ),
             recovery: RecoveryHint("Set [indexing].chunk_overlap_lines between 0 and 59"),
         });
