@@ -73,6 +73,24 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    let weights = &config.search.hybrid_weights;
+    if weights.dense < 0.0 || weights.bm25 < 0.0 || weights.rrf < 0.0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "search.hybrid_weights components must be >= 0".into(),
+            recovery: RecoveryHint(
+                "Set all [search].hybrid_weights values to non-negative numbers",
+            ),
+        });
+    }
+    if weights.dense == 0.0 && weights.bm25 == 0.0 && weights.rrf == 0.0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "search.hybrid_weights must not all be zero".into(),
+            recovery: RecoveryHint(
+                "Set at least one of [search].hybrid_weights.dense, .bm25, .rrf to a positive value",
+            ),
+        });
+    }
+
     Ok(())
 }
 
