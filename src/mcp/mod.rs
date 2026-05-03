@@ -220,6 +220,12 @@ async fn reindex_file(project_root: &Path, arguments: Value) -> Result<Value> {
         "reindex_file",
         "Pass path for a file inside $CLAUDE_PROJECT_DIR",
     )?;
+    if request.path.trim().is_empty() {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "path cannot be empty".to_owned(),
+            recovery: RecoveryHint("Pass a non-empty path to reindex_file"),
+        });
+    }
     let output = cli::run_reindex_file(project_root, Path::new(&request.path)).await?;
     to_value(output)
 }
@@ -435,6 +441,23 @@ mod tests {
         assert_eq!(
             result["structuredContent"]["recovery"],
             Value::String("Use a path inside $CLAUDE_PROJECT_DIR".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn reindex_file_rejects_empty_path() {
+        let response = handle_line(
+            Path::new("."),
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reindex_file","arguments":{"path":"   "}}}"#,
+        )
+        .await;
+
+        assert!(response.is_ok());
+        let response = response.ok().flatten().unwrap_or(Value::Null);
+        assert_eq!(response["result"]["isError"], Value::Bool(true));
+        assert_eq!(
+            response["result"]["structuredContent"]["recovery"],
+            Value::String("Pass a non-empty path to reindex_file".to_owned())
         );
     }
 
