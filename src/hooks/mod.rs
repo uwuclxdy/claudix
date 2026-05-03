@@ -270,8 +270,8 @@ fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchR
         let chunk = &result.chunk;
         let name_part = chunk.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
         lines.push(format!(
-            "{}:{}-{} [{}]{name_part} ({:.3})",
-            chunk.file_path, chunk.line_range.start, chunk.line_range.end, chunk.language, result.score,
+            "{}:{}-{} [{}] {}{name_part} ({:.3})",
+            chunk.file_path, chunk.line_range.start, chunk.line_range.end, chunk.language, chunk.kind, result.score,
         ));
         if !chunk.content.is_empty() {
             lines.push(truncate_snippet(&chunk.content, 20));
