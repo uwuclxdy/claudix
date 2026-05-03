@@ -59,14 +59,26 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     let Ok(binary) = std::env::current_exe() else {
         return false;
     };
-    std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    detach_background_process(&mut command);
+
+    command
         .arg("index")
         .current_dir(project_root)
+        .env("CLAUDE_PROJECT_DIR", project_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .is_ok()
+}
+
+fn detach_background_process(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
 }
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
