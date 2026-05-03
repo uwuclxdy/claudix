@@ -36,7 +36,7 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
 }
 
 fn is_git_repo(path: &Path) -> bool {
-    path.join(".git").exists()
+    cli::is_git_repo(path)
 }
 
 fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -> bool {
