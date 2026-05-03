@@ -426,8 +426,8 @@ mod tests {
     #[test]
     fn looks_like_file_target_covers_all_supported_extensions() {
         for ext in &[
-            ".rs", ".py", ".js", ".mjs", ".ts", ".tsx", ".go", ".java", ".c", ".h", ".cpp",
-            ".hpp", ".cs", ".sql",
+            ".rs", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".c", ".h",
+            ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".cs", ".sql",
         ] {
             let query = format!("search routes{ext}");
             assert!(
