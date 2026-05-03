@@ -511,6 +511,15 @@ index_dir = ".claudix/custom-index"
     }
 
     #[test]
+    fn reject_zero_reindex_after_hours() {
+        let mut config = Config::default();
+        config.indexing.reindex_after_hours = 0;
+
+        let error = validate(&config);
+        assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
     fn reject_absolute_paths_outside_project() {
         let mut config = Config::default();
         config.paths.log_dir = PathBuf::from("/tmp/claudix-logs");

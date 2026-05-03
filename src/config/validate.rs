@@ -84,6 +84,13 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    if config.indexing.reindex_after_hours == 0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "indexing.reindex_after_hours must be > 0".into(),
+            recovery: RecoveryHint("Set [indexing].reindex_after_hours to a positive integer"),
+        });
+    }
+
     if config.search.top_k == 0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "search.top_k must be > 0".into(),
