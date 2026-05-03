@@ -87,11 +87,14 @@ impl Provider for HttpProvider {
         })?;
 
         let payload: EmbeddingResponse = response.json().await?;
-        let vectors: Vec<Vec<f32>> = payload
+        let mut items: Vec<(usize, Vec<f32>)> = payload
             .data
             .into_iter()
-            .map(|item| item.embedding)
+            .enumerate()
+            .map(|(pos, item)| (item.index.unwrap_or(pos), item.embedding))
             .collect();
+        items.sort_unstable_by_key(|(idx, _)| *idx);
+        let vectors: Vec<Vec<f32>> = items.into_iter().map(|(_, embedding)| embedding).collect();
 
         validate_dimensions(&vectors, self.dimensions)?;
         Ok(vectors)
@@ -116,6 +119,8 @@ struct EmbeddingResponse {
 
 #[derive(Debug, Deserialize)]
 struct EmbeddingItem {
+    #[serde(default)]
+    index: Option<usize>,
     embedding: Vec<f32>,
 }
 
@@ -193,6 +198,30 @@ mod tests {
         assert!(request.contains("POST /v1/embeddings HTTP/1.1"));
         assert!(request.contains("\"model\":\"test-model\""));
         assert!(request.contains("\"input\":[\"alpha\",\"beta\"]"));
+    }
+
+    #[tokio::test]
+    async fn http_provider_reorders_out_of_order_response() {
+        // Response returns item at index 1 first, then index 0.
+        let server = TestServer::spawn(response_with_json(
+            r#"{"data":[{"index":1,"embedding":[0.3,0.4]},{"index":0,"embedding":[0.1,0.2]}]}"#,
+        ))
+        .await;
+
+        let provider = HttpProvider::new(
+            server.endpoint(),
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+
+        let result = provider.embed(&["alpha", "beta"]).await.unwrap();
+
+        // Must reorder so that index 0 (alpha → [0.1,0.2]) comes first.
+        assert_eq!(result, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+        server.finish().await;
     }
 
     #[tokio::test]
