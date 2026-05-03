@@ -782,11 +782,18 @@ fn read_vector(batch: &RecordBatch, row: usize) -> Result<Vec<f32>> {
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
         .ok_or_else(|| ClaudixError::Store("vector column was not fixed-size list".to_owned()))?;
+    if array.is_null(row) {
+        return Err(ClaudixError::Store("vector value was null".to_owned()));
+    }
+
     let values = array.value(row);
     let values = values
         .as_any()
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| ClaudixError::Store("vector values were not float32".to_owned()))?;
+    if values.null_count() > 0 {
+        return Err(ClaudixError::Store("vector values contained nulls".to_owned()));
+    }
 
     Ok((0..values.len()).map(|index| values.value(index)).collect())
 }
@@ -1128,6 +1135,56 @@ mod tests {
 
         let error = batches_to_rows(vec![batch]);
         assert!(matches!(error, Err(ClaudixError::Store(message)) if message.contains("non-finite")));
+    }
+
+    #[test]
+    fn batches_to_rows_rejects_null_vector_values() {
+        let batch = record_batch_with_vector(Some(vec![Some(1.0), None]));
+        assert!(batch.is_ok());
+        let batch = batch.ok().unwrap_or_else(|| unreachable!());
+
+        let error = batches_to_rows(vec![batch]);
+        assert!(matches!(error, Err(ClaudixError::Store(message)) if message.contains("null")));
+    }
+
+    #[test]
+    fn batches_to_rows_rejects_null_vectors() {
+        let batch = record_batch_with_vector(None);
+        assert!(batch.is_ok());
+        let batch = batch.ok().unwrap_or_else(|| unreachable!());
+
+        let error = batches_to_rows(vec![batch]);
+        assert!(matches!(error, Err(ClaudixError::Store(message)) if message.contains("null")));
+    }
+
+    fn record_batch_with_vector(vector: Option<Vec<Option<f32>>>) -> Result<RecordBatch> {
+        RecordBatch::try_new(
+            chunk_schema(Dimension(2)),
+            vec![
+                Arc::new(UInt64Array::from(vec![1])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["src/lib.rs"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["rust"])) as ArrayRef,
+                Arc::new(StringArray::from(vec!["function"])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some("alpha")])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![1])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![3])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![0])) as ArrayRef,
+                Arc::new(UInt32Array::from(vec![32])) as ArrayRef,
+                Arc::new(
+                    FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+                        vec![Some([1_u8; 16].as_slice())].into_iter(),
+                        16,
+                    )
+                    .map_err(|error| ClaudixError::Store(error.to_string()))?,
+                ) as ArrayRef,
+                Arc::new(StringArray::from(vec!["pub fn alpha() {}"] )) as ArrayRef,
+                Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
+                    vec![vector],
+                    2,
+                )) as ArrayRef,
+            ],
+        )
+        .map_err(|error| ClaudixError::Store(error.to_string()))
     }
 
     #[tokio::test]
