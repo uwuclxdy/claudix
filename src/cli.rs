@@ -267,11 +267,18 @@ async fn run_search_with_claudix(
 
 async fn status_from_store(store: &Store) -> Result<StatusOutput> {
     let manifest = store.read_manifest()?;
-    let stats = store.chunk_stats().await?;
+    let chunk_count = manifest
+        .as_ref()
+        .map(|m| m.chunk_count as usize)
+        .unwrap_or(0);
+    let file_count = manifest
+        .as_ref()
+        .map(|m| m.file_count as usize)
+        .unwrap_or(0);
 
     Ok(StatusOutput {
-        chunk_count: stats.chunk_count,
-        file_count: stats.file_count,
+        chunk_count,
+        file_count,
         model: manifest
             .as_ref()
             .map(|manifest| manifest.embedding_model.clone()),
