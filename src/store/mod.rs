@@ -443,7 +443,7 @@ impl Store {
 
 impl StoredChunk {
     fn from_embedded_chunk(chunk: &EmbeddedChunk, dimension: Dimension) -> Result<Self> {
-        validate_vector_length(&chunk.vector, dimension)?;
+        validate_vector(&chunk.vector, dimension)?;
 
         Ok(Self {
             chunk_id: chunk.chunk.id.0,
@@ -537,18 +537,24 @@ fn reject_path_escape(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_vector_length(vector: &[f32], dimension: Dimension) -> Result<()> {
-    if vector.len() == usize::from(dimension.0) {
-        return Ok(());
+fn validate_vector(vector: &[f32], dimension: Dimension) -> Result<()> {
+    if vector.len() != usize::from(dimension.0) {
+        return Err(ClaudixError::DimensionMismatch {
+            store_dim: dimension.0,
+            model_dim: u16::try_from(vector.len()).unwrap_or(u16::MAX),
+            recovery: RecoveryHint(
+                "Reindex the project after aligning embedding dimensions with the active model",
+            ),
+        });
     }
 
-    Err(ClaudixError::DimensionMismatch {
-        store_dim: dimension.0,
-        model_dim: u16::try_from(vector.len()).unwrap_or(u16::MAX),
-        recovery: RecoveryHint(
-            "Reindex the project after aligning embedding dimensions with the active model",
-        ),
-    })
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(ClaudixError::Store(
+            "embedding vector contains non-finite values".to_owned(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn stored_chunks_from_embedded(
@@ -587,7 +593,7 @@ fn chunk_schema(dimension: Dimension) -> SchemaRef {
 
 fn record_batch_from_rows(rows: &[StoredChunk], dimension: Dimension) -> Result<RecordBatch> {
     for row in rows {
-        validate_vector_length(&row.vector, dimension)?;
+        validate_vector(&row.vector, dimension)?;
     }
 
     let names: Vec<Option<String>> = rows.iter().map(|row| row.name.clone()).collect();
@@ -1055,6 +1061,29 @@ mod tests {
         assert_eq!(manifest.file_count, 1);
         assert!(manifest.last_full_index_at.is_some());
         assert_eq!(manifest.last_full_index_at, manifest.last_incremental_at);
+    }
+
+    #[tokio::test]
+    async fn replace_chunks_rejects_non_finite_vectors() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+
+        let store = Store::new(project_root.path(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let chunks = vec![sample_chunk(
+            1,
+            "src/lib.rs",
+            "alpha",
+            "pub fn alpha() {}",
+            &[f32::INFINITY; 384],
+        )];
+
+        let error = store.replace_chunks(&chunks, &config).await;
+        assert!(matches!(error, Err(ClaudixError::Store(message)) if message.contains("non-finite")));
     }
 
     #[tokio::test]
