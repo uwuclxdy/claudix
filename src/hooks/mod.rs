@@ -294,19 +294,28 @@ fn extract_search_command(command: Option<&str>) -> Option<String> {
 }
 
 fn extract_quoted_pattern(args: &str) -> Option<String> {
-    for &quote in b"\"'" {
-        let bytes = args.as_bytes();
-        if let Some(start) = bytes.iter().position(|&b| b == quote) {
-            let after = &args[start + 1..];
-            if let Some(end) = after.as_bytes().iter().position(|&b| b == quote) {
-                let pattern = after[..end].trim();
-                if !pattern.is_empty() {
-                    return Some(pattern.to_owned());
-                }
+    let bytes = args.as_bytes();
+    let dq_pos = bytes.iter().position(|&b| b == b'"');
+    let sq_pos = bytes.iter().position(|&b| b == b'\'');
+
+    let (start, quote) = match (dq_pos, sq_pos) {
+        (Some(d), Some(s)) => {
+            if d < s {
+                (d, b'"')
+            } else {
+                (s, b'\'')
             }
         }
-    }
-    None
+        (Some(d), None) => (d, b'"'),
+        (None, Some(s)) => (s, b'\''),
+        (None, None) => return None,
+    };
+
+    let after = &args[start + 1..];
+    let end = after.as_bytes().iter().position(|&b| b == quote)?;
+    let pattern = after[..end].trim();
+
+    if pattern.is_empty() { None } else { Some(pattern.to_owned()) }
 }
 
 fn should_passthrough(query: &str) -> bool {
@@ -373,6 +382,27 @@ struct ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_quoted_pattern_uses_first_quote_type_as_delimiter() {
+        // Single-quoted pattern containing double quotes — must extract the full inner string.
+        assert_eq!(
+            extract_quoted_pattern(r#"'say "hello"'"#),
+            Some(r#"say "hello""#.to_owned())
+        );
+        // Double-quoted pattern (common case).
+        assert_eq!(
+            extract_quoted_pattern(r#""error handling""#),
+            Some("error handling".to_owned())
+        );
+        // Double-quoted pattern with trailing flags.
+        assert_eq!(
+            extract_quoted_pattern(r#"-rn "pattern" src/"#),
+            Some("pattern".to_owned())
+        );
+        // No quotes → None.
+        assert_eq!(extract_quoted_pattern("add src/"), None);
+    }
     use std::fs;
     use std::sync::Arc;
     use tempfile::tempdir;
