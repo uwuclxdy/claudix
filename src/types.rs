@@ -39,7 +39,11 @@ pub(crate) fn path_prefix_matches(path: &str, prefix: &str) -> bool {
     let Some(rest) = path.strip_prefix(prefix) else {
         return false;
     };
-    rest.is_empty() || rest.starts_with('/') || rest.starts_with('.')
+    rest.is_empty()
+        || rest.starts_with('/')
+        || rest
+            .strip_prefix('.')
+            .is_some_and(|extension| !extension.contains(['/', '.']))
 }
 
 impl RelativePath {
@@ -217,6 +221,15 @@ mod tests {
         let prefix = RelativePath::new(r"src\nested");
 
         assert!(path.starts_with(&prefix));
+    }
+
+    #[test]
+    fn path_prefix_matches_exact_directory_and_extension_boundaries() {
+        assert!(path_prefix_matches("src/math", "src/math"));
+        assert!(path_prefix_matches("src/math/add.rs", "src/math"));
+        assert!(path_prefix_matches("src/math.rs", "src/math"));
+        assert!(!path_prefix_matches("src/math_extra.rs", "src/math"));
+        assert!(!path_prefix_matches("src/math.rs.bak", "src/math"));
     }
 
     #[test]
