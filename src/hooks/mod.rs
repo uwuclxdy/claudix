@@ -92,19 +92,26 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
     let mut response = session_start_response(indexed_file_count, indexed_chunk_count);
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
-        None => session_start_message(cli::setup_state(project_root).await, indexed_file_count, indexing),
+        None => session_start_message(cli::setup_state(project_root).await, indexed_file_count, indexed_chunk_count, indexing),
     };
     response["systemMessage"] = Value::String(user_message);
     Ok(Some(response))
 }
 
-fn session_start_message(setup_state: cli::SetupState, indexed_file_count: u64, indexing: bool) -> String {
+fn session_start_message(
+    setup_state: cli::SetupState,
+    indexed_file_count: u64,
+    indexed_chunk_count: u64,
+    indexing: bool,
+) -> String {
     match setup_state {
         cli::SetupState::Ready => {
             if indexing {
-                format!("claudix indexed {indexed_file_count} files (indexing in background...)")
+                format!(
+                    "claudix indexed {indexed_file_count} files, {indexed_chunk_count} chunks (indexing in background...)"
+                )
             } else {
-                format!("claudix indexed {indexed_file_count} files")
+                format!("claudix indexed {indexed_file_count} files, {indexed_chunk_count} chunks")
             }
         }
         cli::SetupState::Missing(parts) => format!(
@@ -552,16 +559,16 @@ mod tests {
     #[test]
     fn session_start_message_reports_ready_setup() {
         assert_eq!(
-            session_start_message(cli::SetupState::Ready, 0, false),
-            "claudix indexed 0 files"
+            session_start_message(cli::SetupState::Ready, 0, 0, false),
+            "claudix indexed 0 files, 0 chunks"
         );
         assert_eq!(
-            session_start_message(cli::SetupState::Ready, 42, false),
-            "claudix indexed 42 files"
+            session_start_message(cli::SetupState::Ready, 42, 683, false),
+            "claudix indexed 42 files, 683 chunks"
         );
         assert_eq!(
-            session_start_message(cli::SetupState::Ready, 42, true),
-            "claudix indexed 42 files (indexing in background...)"
+            session_start_message(cli::SetupState::Ready, 42, 683, true),
+            "claudix indexed 42 files, 683 chunks (indexing in background...)"
         );
     }
 
