@@ -193,7 +193,7 @@ pub(super) fn is_relative_path(path: &Path) -> bool {
         })
 }
 
-pub(super) fn validate_project_relative_path(path: &Path, field_name: &'static str) -> Result<()> {
+pub(crate) fn validate_project_relative_path(path: &Path, field_name: &'static str) -> Result<()> {
     if is_relative_path(path) {
         return Ok(());
     }

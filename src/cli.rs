@@ -5,7 +5,7 @@ use serde::Serialize;
 use tokio::fs;
 
 use crate::Claudix;
-use crate::config;
+use crate::config::{self, validate_project_relative_path};
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::hooks::HookEvent;
 use crate::search::SearchQuery;
@@ -262,7 +262,7 @@ async fn run_search_with_claudix(
         query,
         top_k,
         language_filter: parse_language_filter(language_filter)?,
-        path_prefix: parse_path_prefix(path_prefix),
+        path_prefix: parse_path_prefix(path_prefix)?,
     };
     let results = claudix.search(query).await?;
 
@@ -597,11 +597,17 @@ fn parse_language_filter(language_filter: Option<Vec<String>>) -> Result<Option<
     Ok(Some(parsed))
 }
 
-fn parse_path_prefix(path_prefix: Option<String>) -> Option<RelativePath> {
-    path_prefix.and_then(|prefix| {
-        let trimmed = prefix.trim();
-        (!trimmed.is_empty()).then(|| RelativePath::new(trimmed.to_owned()))
-    })
+fn parse_path_prefix(path_prefix: Option<String>) -> Result<Option<RelativePath>> {
+    let Some(prefix) = path_prefix else {
+        return Ok(None);
+    };
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    validate_project_relative_path(Path::new(trimmed), "search.path_prefix")?;
+    Ok(Some(RelativePath::new(trimmed.to_owned())))
 }
 
 fn parse_language(value: &str) -> Result<Language> {
@@ -736,12 +742,24 @@ mod tests {
 
     #[test]
     fn parse_path_prefix_treats_blank_values_as_no_filter() {
-        assert!(parse_path_prefix(None).is_none());
-        assert!(parse_path_prefix(Some("   ".to_owned())).is_none());
+        assert!(matches!(parse_path_prefix(None), Ok(None)));
+        assert!(matches!(parse_path_prefix(Some("   ".to_owned())), Ok(None)));
         assert_eq!(
-            parse_path_prefix(Some(" src/math ".to_owned())).as_ref().map(RelativePath::as_str),
+            parse_path_prefix(Some(" src/math ".to_owned()))
+                .ok()
+                .flatten()
+                .as_ref()
+                .map(RelativePath::as_str),
             Some("src/math")
         );
+    }
+
+    #[test]
+    fn parse_path_prefix_rejects_paths_outside_project() {
+        for path_prefix in ["../src", "/tmp/src"] {
+            let parsed = parse_path_prefix(Some(path_prefix.to_owned()));
+            assert!(matches!(parsed, Err(ClaudixError::ConfigInvalid { .. })));
+        }
     }
 
     #[tokio::test]
