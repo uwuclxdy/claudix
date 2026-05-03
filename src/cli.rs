@@ -572,6 +572,9 @@ fn parse_language_filter(language_filter: Option<Vec<String>>) -> Result<Option<
     let Some(language_filter) = language_filter else {
         return Ok(None);
     };
+    if language_filter.is_empty() {
+        return Ok(None);
+    }
 
     let mut parsed = Vec::with_capacity(language_filter.len());
     for language in language_filter {
@@ -694,6 +697,13 @@ mod tests {
             parsed,
             Ok(Some(ref languages)) if languages == &vec![Language::Rust, Language::TypeScript]
         ));
+    }
+
+    #[test]
+    fn parse_language_filter_treats_empty_list_as_no_filter() {
+        let parsed = parse_language_filter(Some(Vec::new()));
+
+        assert!(matches!(parsed, Ok(None)));
     }
 
     #[tokio::test]
