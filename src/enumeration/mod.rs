@@ -83,7 +83,7 @@ impl FileEnumerator {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => return Err(error.into()),
             };
-            if target_metadata.len() > self.max_file_size_bytes() {
+            if !target_metadata.is_file() || target_metadata.len() > self.max_file_size_bytes() {
                 return Ok(None);
             }
             target_path
@@ -324,6 +324,31 @@ mod tests {
             .collect();
 
         assert!(!paths.contains("src/outside.rs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_directories_are_skipped() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        assert!(unix_fs::symlink(fixture.root().join("src"), fixture.root().join("src/link.rs")).is_ok());
+
+        let mut config = Config::default();
+        config.indexing.follow_symlinks = true;
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), config);
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let files = enumerator.enumerate();
+        assert!(files.is_ok());
+        let files = files.ok().unwrap_or_else(|| unreachable!());
+        let paths: BTreeSet<_> = files
+            .iter()
+            .map(|file| file.relative_path.as_str().to_owned())
+            .collect();
+
+        assert!(!paths.contains("src/link.rs"));
     }
 
     #[test]
