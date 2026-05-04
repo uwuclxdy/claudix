@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -56,29 +57,68 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     if !needs_index {
         return false;
     }
+    spawn_detached_claudix(project_root, [OsStr::new("index")])
+}
+
+fn spawn_detached_claudix<const N: usize, S>(project_root: &Path, args: [S; N]) -> bool
+where
+    S: AsRef<OsStr>,
+{
     let Ok(binary) = std::env::current_exe() else {
         return false;
     };
-    let mut command = std::process::Command::new(binary);
-    detach_background_process(&mut command);
 
-    command
-        .arg("index")
+    spawn_detached_command(project_root, binary.as_os_str(), args)
+}
+
+#[cfg(unix)]
+fn spawn_detached_command<const N: usize, S>(
+    project_root: &Path,
+    binary: &OsStr,
+    args: [S; N],
+) -> bool
+where
+    S: AsRef<OsStr>,
+{
+    use std::os::unix::process::CommandExt;
+
+    std::process::Command::new("nohup")
+        .arg(binary)
+        .args(args.iter().map(AsRef::as_ref))
         .current_dir(project_root)
         .env("CLAUDE_PROJECT_DIR", project_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .process_group(0)
         .spawn()
         .is_ok()
 }
 
-fn detach_background_process(command: &mut std::process::Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+#[cfg(windows)]
+fn spawn_detached_command<const N: usize, S>(
+    project_root: &Path,
+    binary: &OsStr,
+    args: [S; N],
+) -> bool
+where
+    S: AsRef<OsStr>,
+{
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+    std::process::Command::new(binary)
+        .args(args.iter().map(AsRef::as_ref))
+        .current_dir(project_root)
+        .env("CLAUDE_PROJECT_DIR", project_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .is_ok()
 }
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
@@ -108,7 +148,12 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
     let mut response = session_start_response(indexed_file_count, indexed_chunk_count, index_stale);
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
-        None => session_start_message(cli::setup_state(project_root).await, indexed_file_count, indexed_chunk_count, indexing),
+        None => session_start_message(
+            cli::setup_state(project_root).await,
+            indexed_file_count,
+            indexed_chunk_count,
+            indexing,
+        ),
     };
     response["systemMessage"] = Value::String(user_message);
     Ok(Some(response))
@@ -166,19 +211,10 @@ fn is_write_tool(tool_name: &str) -> bool {
 }
 
 fn spawn_background_reindex_file(project_root: &Path, file_path: &str) {
-    let Ok(binary) = std::env::current_exe() else {
-        return;
-    };
-    let mut command = std::process::Command::new(binary);
-    detach_background_process(&mut command);
-    let _ = command
-        .args(["reindex-file", file_path])
-        .current_dir(project_root)
-        .env("CLAUDE_PROJECT_DIR", project_root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    let _ = spawn_detached_claudix(
+        project_root,
+        [OsStr::new("reindex-file"), OsStr::new(file_path)],
+    );
 }
 
 async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Result<Option<Value>> {
