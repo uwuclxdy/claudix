@@ -100,8 +100,12 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
 
     let indexed_file_count = manifest.as_ref().map(|m| m.file_count).unwrap_or(0);
     let indexed_chunk_count = manifest.as_ref().map(|m| m.chunk_count).unwrap_or(0);
+    let index_stale = match (&manifest, &config) {
+        (Some(m), Some(c)) => index_is_stale(m, c),
+        _ => indexed_chunk_count == 0,
+    };
 
-    let mut response = session_start_response(indexed_file_count, indexed_chunk_count);
+    let mut response = session_start_response(indexed_file_count, indexed_chunk_count, index_stale);
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
         None => session_start_message(cli::setup_state(project_root).await, indexed_file_count, indexed_chunk_count, indexing),
@@ -259,9 +263,14 @@ fn pending_restart_path() -> Option<std::path::PathBuf> {
     Some(base.join("pending-restart"))
 }
 
-fn session_start_response(file_count: u64, chunk_count: u64) -> Value {
+fn session_start_response(file_count: u64, chunk_count: u64, stale: bool) -> Value {
     let additional_context = if chunk_count == 0 {
         "claudix semantic search available — index empty, run /claudix:index to build it".to_owned()
+    } else if stale {
+        format!(
+            "claudix semantic search active — {file_count} files, {chunk_count} chunks indexed (index stale, reindexing in background). \
+             Use search_code MCP tool for conceptual queries and identifier lookups instead of Grep."
+        )
     } else {
         format!(
             "claudix semantic search active — {file_count} files, {chunk_count} chunks indexed. \
