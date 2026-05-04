@@ -439,7 +439,7 @@ fn token_count(query: &str) -> usize {
         .count()
 }
 
-fn index_is_stale(manifest: &Manifest, config: &Config) -> bool {
+pub(crate) fn index_is_stale(manifest: &Manifest, config: &Config) -> bool {
     let Some(last_full_index_at) = manifest.last_full_index_at.as_deref() else {
         return true;
     };

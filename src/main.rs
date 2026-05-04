@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
             if let Some(last_incremental_at) = output.last_incremental_at {
                 println!("last_incremental_at: {last_incremental_at}");
             }
+            println!("stale: {}", output.stale);
         }
         Command::ReindexFile { path } => {
             let output = cli::run_reindex_file(&project_root, path).await?;

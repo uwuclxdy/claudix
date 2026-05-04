@@ -48,6 +48,8 @@ pub struct StatusOutput {
     pub dimensions: Option<u16>,
     pub last_full_index_at: Option<String>,
     pub last_incremental_at: Option<String>,
+    /// True when the index is missing or older than `reindex_after_hours`.
+    pub stale: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -122,7 +124,7 @@ pub async fn run_status(project_root: impl AsRef<Path>) -> Result<StatusOutput> 
     let project_root = canonical_project_root(project_root.as_ref())?;
     let config = config::load(&project_root)?;
     let store = Store::new(&project_root, &config)?;
-    status_from_store(&store).await
+    status_from_store(&store, &config).await
 }
 
 pub async fn run_reindex_file(
@@ -134,7 +136,7 @@ pub async fn run_reindex_file(
     let store = Store::new(&project_root, &config)?;
 
     if store.full_index_running() {
-        let status = status_from_store(&store).await?;
+        let status = status_from_store(&store, &config).await?;
         return Ok(IndexOutput {
             file_count: status.file_count,
             chunk_count: status.chunk_count,
@@ -154,7 +156,7 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
     let project_root = canonical_project_root(project_root.as_ref())?;
     let config = config::load(&project_root)?;
     let store = Store::new(&project_root, &config)?;
-    let status = status_from_store(&store).await?;
+    let status = status_from_store(&store, &config).await?;
     let claudix = Claudix::new(project_root.clone(), Arc::new(config.clone())).await;
     let embedding_healthy = match claudix {
         Ok(claudix) => claudix.embedder_health_check().await.is_ok(),
@@ -284,7 +286,7 @@ async fn run_search_with_claudix(
     })
 }
 
-async fn status_from_store(store: &Store) -> Result<StatusOutput> {
+async fn status_from_store(store: &Store, config: &crate::config::Config) -> Result<StatusOutput> {
     let manifest = store.read_manifest()?;
     let chunk_count = manifest
         .as_ref()
@@ -294,6 +296,11 @@ async fn status_from_store(store: &Store) -> Result<StatusOutput> {
         .as_ref()
         .map(|m| m.file_count as usize)
         .unwrap_or(0);
+
+    let stale = manifest
+        .as_ref()
+        .map(|m| crate::hooks::index_is_stale(m, config))
+        .unwrap_or(true);
 
     Ok(StatusOutput {
         chunk_count,
@@ -308,6 +315,7 @@ async fn status_from_store(store: &Store) -> Result<StatusOutput> {
         last_incremental_at: manifest
             .as_ref()
             .and_then(|manifest| manifest.last_incremental_at.clone()),
+        stale,
     })
 }
 
@@ -866,7 +874,8 @@ mod tests {
         assert!(harness.is_ok());
         let harness = harness.ok().unwrap_or_else(|| unreachable!());
 
-        let status = status_from_store(&harness.store).await;
+        let config = stub_config();
+        let status = status_from_store(&harness.store, &config).await;
         assert!(status.is_ok());
         let status = status.ok().unwrap_or_else(|| unreachable!());
 
@@ -874,6 +883,7 @@ mod tests {
         assert_eq!(status.file_count, 2);
         assert_eq!(status.model.as_deref(), Some("stub-v1"));
         assert_eq!(status.dimensions, Some(8));
+        assert!(!status.stale, "freshly indexed should not be stale");
     }
 
     #[tokio::test]
