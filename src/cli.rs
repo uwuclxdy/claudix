@@ -481,7 +481,27 @@ async fn ensure_global_config(config_path: &Path) -> Result<bool> {
 }
 
 fn default_global_config() -> &'static str {
-    "# Global claudix configuration\n# Uncomment and edit values as needed.\n\n[embedding]\n# provider = \"bundled\"\n# model = \"bge-small-en-v1.5\"\n# dimensions = 384\n# endpoint = \"http://localhost:11434\"\n\n[indexing]\n# reindex_after_hours = 24\n\n[hooks]\n# auto_index_on_session_start = true\n"
+    "\
+# Global claudix configuration — uncomment and edit as needed.
+# Project-level overrides go in .claude/claudix.toml (project wins).
+
+[embedding]
+# provider = \"bundled\"           # bundled | http
+# model = \"bge-small-en-v1.5\"    # only used by bundled provider
+# dimensions = 384               # must match the model
+# endpoint = \"http://localhost:11434\"  # for http provider (LM Studio / Ollama)
+
+[indexing]
+# reindex_after_hours = 24       # auto-reindex threshold on session start
+
+[hooks]
+# auto_index_on_session_start = true  # trigger background reindex when stale
+# intercept_grep = true               # redirect conceptual Grep/rg to search_code
+# auto_reembed_on_edit = true         # re-embed edited files in background
+
+[search]
+# top_k = 10                     # default result count for search_code
+"
 }
 
 fn install_source_root(project_root: &Path) -> Result<PathBuf> {
@@ -1034,6 +1054,11 @@ mod tests {
         assert!(config.contains("[embedding]"));
         assert!(config.contains("provider = \"bundled\""));
         assert!(config.contains("reindex_after_hours = 24"));
+        assert!(config.contains("[hooks]"));
+        assert!(config.contains("intercept_grep = true"));
+        assert!(config.contains("auto_reembed_on_edit = true"));
+        assert!(config.contains("[search]"));
+        assert!(config.contains("top_k = 10"));
     }
 
     #[test]
