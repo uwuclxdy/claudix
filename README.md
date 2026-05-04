@@ -74,7 +74,7 @@ timeout_ms = 30000
 respect_gitignore = true
 follow_symlinks = false
 max_file_size_kb = 512              # skip files larger than this
-chunk_overlap_lines = 5              # lines overlapped between chunks
+chunk_overlap_lines = 5             # lines overlapped between chunks
 reindex_after_hours = 24            # background reindex interval
 
 [search]
