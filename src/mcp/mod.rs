@@ -290,7 +290,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_index_status",
-            "description": "Return current chunk counts, file counts, and manifest metadata for the active index",
+            "description": "Return current chunk counts, file counts, model, and stale flag for the active index. Check stale: true before running reindex.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
