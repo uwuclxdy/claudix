@@ -321,7 +321,8 @@ fn extract_search_command(command: Option<&str>) -> Option<String> {
         .strip_prefix("rg ")
         .or_else(|| command.strip_prefix("grep "))
         .or_else(|| command.strip_prefix("ag "))?;
-    extract_quoted_pattern(args.trim())
+    let args = args.trim();
+    extract_quoted_pattern(args).or_else(|| extract_unquoted_pattern(args))
 }
 
 fn extract_quoted_pattern(args: &str) -> Option<String> {
@@ -382,6 +383,23 @@ fn extract_quoted_pattern(args: &str) -> Option<String> {
 
     let pattern = pattern.trim();
     if pattern.is_empty() { None } else { Some(pattern.to_owned()) }
+}
+
+fn extract_unquoted_pattern(args: &str) -> Option<String> {
+    let tokens: Vec<&str> = args.split_whitespace().collect();
+    if tokens.iter().any(|t| t.starts_with('-')) {
+        return None;
+    }
+    let pattern_tokens: Vec<&str> = tokens
+        .iter()
+        .filter(|t| !t.contains('/') && !t.contains('\\'))
+        .copied()
+        .collect();
+    if pattern_tokens.len() == 1 && !pattern_tokens[0].is_empty() {
+        Some(pattern_tokens[0].to_owned())
+    } else {
+        None
+    }
 }
 
 fn should_passthrough(query: &str) -> bool {
@@ -469,6 +487,24 @@ mod tests {
         assert!(!looks_like_file_target("error handling retry logic"));
         assert!(looks_like_file_target("find *.rs files"));
         assert!(looks_like_file_target("search in src/"));
+    }
+
+    #[test]
+    fn extract_unquoted_pattern_returns_sole_non_path_token() {
+        assert_eq!(
+            extract_unquoted_pattern("handle_session_start"),
+            Some("handle_session_start".to_owned())
+        );
+        assert_eq!(
+            extract_unquoted_pattern("handle_session_start src/"),
+            Some("handle_session_start".to_owned())
+        );
+        // Multiple non-path tokens → ambiguous, return None.
+        assert_eq!(extract_unquoted_pattern("foo bar"), None);
+        // Any flag → bail out entirely (flag value might be misidentified as pattern).
+        assert_eq!(extract_unquoted_pattern("--type rust handle_session_start"), None);
+        // Path-only → None.
+        assert_eq!(extract_unquoted_pattern("src/lib.rs"), None);
     }
 
     #[test]
@@ -752,7 +788,7 @@ mod tests {
                 .is_ok()
         );
 
-        // Unquoted single-word pattern — passes through (token_count < 3 after extraction fails)
+        // Unquoted single-word pattern — extracted but token_count < 3 so passes through.
         let payload = json!({
             "tool_name": "Bash",
             "tool_input": {
@@ -764,6 +800,38 @@ mod tests {
         assert!(
             response.ok().unwrap_or_else(|| unreachable!()).is_none(),
             "unquoted single-word rg command should pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_intercepts_unquoted_identifier_in_bash_rg() {
+        let fixture = TestFixture::new("small_rust").unwrap();
+        write_config(fixture.root(), &stub_config());
+
+        Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config()))
+            .await
+            .unwrap()
+            .index_full()
+            .await
+            .unwrap();
+
+        // Unquoted identifier with enough tokens — should be intercepted just like a quoted query.
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg add_two_numbers"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string())
+            .await
+            .unwrap();
+        assert!(
+            response.is_some(),
+            "unquoted multi-token identifier should be intercepted"
+        );
+        assert_eq!(
+            response.unwrap()["hookSpecificOutput"]["permissionDecision"],
+            Value::String("deny".to_owned())
         );
     }
 
