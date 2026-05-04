@@ -675,7 +675,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::embedding::{Provider, StubProvider};
-    use crate::store::Store;
+    use crate::store::{Manifest, Store};
     use crate::types::Dimension;
     use tempfile::tempdir;
 
@@ -866,6 +866,42 @@ mod tests {
         assert!(!requires_clean_reindex(&ClaudixError::Store(
             "index already running".to_owned()
         )));
+    }
+
+    #[tokio::test]
+    async fn run_index_clears_model_mismatch_and_reindexes() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+        let claude_dir = fixture.root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        let config_text = toml::to_string(&config);
+        assert!(config_text.is_ok());
+        assert!(std::fs::write(
+            claude_dir.join("claudix.toml"),
+            config_text.ok().unwrap_or_default(),
+        )
+        .is_ok());
+
+        let store = Store::new(fixture.root(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+        let old_manifest = Manifest::new("old-model", config.embedding.dimensions);
+        assert!(store.write_manifest(&old_manifest).is_ok());
+
+        let output = run_index(fixture.root()).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+        assert!(output.chunk_count > 0);
+
+        let manifest = store.read_manifest();
+        assert!(manifest.is_ok());
+        let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
+        let manifest = manifest.unwrap_or_else(|| unreachable!());
+        assert_eq!(manifest.embedding_model, config.embedding.model);
+        assert_eq!(manifest.dimensions, config.embedding.dimensions);
+        assert_eq!(manifest.chunk_count as usize, output.chunk_count);
     }
 
     #[tokio::test]

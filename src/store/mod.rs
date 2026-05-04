@@ -353,12 +353,7 @@ impl Store {
             connection.drop_table(CHUNKS_TABLE_NAME).await?;
         }
 
-        let mut manifest = self
-            .read_manifest()?
-            .unwrap_or_else(|| Manifest::new(&config.embedding.model, config.embedding.dimensions));
-        manifest.chunk_count = 0;
-        manifest.file_count = 0;
-        manifest.last_full_index_at = None;
+        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
         manifest.last_incremental_at = Some(now_rfc3339());
         self.write_manifest(&manifest)
     }
@@ -1358,6 +1353,37 @@ mod tests {
         let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
         assert!(manifest.is_some());
         let manifest = manifest.unwrap_or_else(|| unreachable!());
+        assert_eq!(manifest.chunk_count, 0);
+        assert_eq!(manifest.file_count, 0);
+        assert_eq!(manifest.embedding_model, config.embedding.model);
+        assert_eq!(manifest.dimensions, config.embedding.dimensions);
+    }
+
+    #[tokio::test]
+    async fn clear_chunks_resets_manifest_model_and_dimensions() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+        let mut config = Config::default();
+        config.embedding.model = "active-model".to_owned();
+        config.embedding.dimensions = 768;
+
+        let store = Store::new(project_root.path(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let old_manifest = Manifest::new("old-model", 384);
+        assert!(store.write_manifest(&old_manifest).is_ok());
+
+        let cleared = store.clear_chunks(&config).await;
+        assert!(cleared.is_ok());
+
+        let manifest = store.read_manifest();
+        assert!(manifest.is_ok());
+        let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
+        let manifest = manifest.unwrap_or_else(|| unreachable!());
+        assert_eq!(manifest.embedding_model, "active-model");
+        assert_eq!(manifest.dimensions, 768);
         assert_eq!(manifest.chunk_count, 0);
         assert_eq!(manifest.file_count, 0);
     }
