@@ -413,9 +413,15 @@ fn should_passthrough(query: &str) -> bool {
 fn looks_like_regex(query: &str) -> bool {
     query.contains('^')
         || query.contains('$')
-        || query.contains("\\")
+        || query.contains('\\')
         || query.contains('[')
         || query.contains(']')
+        || query.contains('(')
+        || query.contains(')')
+        || query.contains('+')
+        || query.contains('?')
+        || query.contains('{')
+        || query.contains('}')
         || query.contains(".*")
 }
 
@@ -472,6 +478,15 @@ struct ToolInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn looks_like_regex_detects_metacharacters() {
+        for pattern in ["^pub fn", "fn\\s+\\w+", "[a-z]+", "fn(x)", "x+", "x?", "{3}", "x$", ".*"] {
+            assert!(looks_like_regex(pattern), "expected regex detection for: {pattern}");
+        }
+        assert!(!looks_like_regex("error handling"));
+        assert!(!looks_like_regex("handle_session_start"));
+    }
 
     #[test]
     fn looks_like_file_target_covers_all_supported_extensions() {
