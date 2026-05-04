@@ -144,7 +144,7 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
     let Some(tool_input) = payload.tool_input else {
         return Ok(None);
     };
-    let Some(file_path) = tool_input.file_path else {
+    let Some(file_path) = tool_input.file_path.or(tool_input.notebook_path) else {
         return Ok(None);
     };
 
@@ -462,6 +462,7 @@ struct HookPayload {
 #[derive(Debug, Deserialize)]
 struct ToolInput {
     file_path: Option<String>,
+    notebook_path: Option<String>,
     pattern: Option<String>,
     command: Option<String>,
     path: Option<String>,
@@ -660,6 +661,25 @@ mod tests {
         assert!(
             response.ok().unwrap_or_else(|| unreachable!()).is_none(),
             "Read tool must not trigger reindex"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_triggers_reindex_for_notebook_edit() {
+        let fixture = TestFixture::new("small_rust").unwrap();
+        write_config(fixture.root(), &stub_config());
+
+        let payload = json!({
+            "tool_name": "NotebookEdit",
+            "tool_input": {
+                "notebook_path": fixture.root().join("analysis.ipynb"),
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "NotebookEdit must trigger reindex and return None"
         );
     }
 
