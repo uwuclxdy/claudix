@@ -299,7 +299,7 @@ fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchR
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": format!("claudix ran semantic search for '{query}' — results below."),
+            "permissionDecisionReason": format!("claudix found {} semantic matches for '{query}' — see additionalContext.", results.len()),
             "additionalContext": context,
         }
     })

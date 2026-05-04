@@ -298,11 +298,11 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "reindex",
-            "description": "Rebuild the project index using the active embedding provider",
+            "description": "Rebuild the project index using the active embedding provider. Use when the index is stale or after major codebase changes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "force": { "type": "boolean", "description": "Accepted for compatibility; currently informational only" }
+                    "force": { "type": "boolean", "description": "When true, wipes the existing index before rebuilding (required after embedding model change)" }
                 }
             }
         }),
