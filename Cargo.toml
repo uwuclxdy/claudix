@@ -29,74 +29,74 @@ test-stub = []
 
 [dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
-futures = "0.3"
+tokio = { version = "1.52.2", features = ["full"] }
+futures = "0.3.32"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "1.1.2"
 
 # Error handling
-thiserror = "2"
-anyhow = "1"
+thiserror = "2.0.18"
+anyhow = "1.0.102"
 
 # Logging / tracing
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # HTTP client (rustls only, no openssl)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13.3", features = ["json", "rustls"] }
 
 # LanceDB for storage and FTS
-lancedb = "0.14"
-arrow = { version = "53", features = ["prettyprint"] }
-arrow-array = "53"
-arrow-schema = "53"
+lancedb = "0.27.2"
+arrow = { version = "58.2.0", features = ["prettyprint"] }
+arrow-array = "58.2.0"
+arrow-schema = "58.2.0"
 
 # Tree-sitter for chunking
-tree-sitter = "0.25"
-tree-sitter-rust = "0.23"
-tree-sitter-python = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-typescript = "0.23"
-tree-sitter-go = "0.23"
-tree-sitter-java = "0.23"
-tree-sitter-c = "0.23"
-tree-sitter-cpp = "0.23"
+tree-sitter = "0.26.8"
+tree-sitter-rust = "0.24.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-javascript = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-go = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.2"
+tree-sitter-cpp = "0.23.4"
 
 # Git enumeration (pure Rust, no C dep)
-gix = { version = "0.70", default-features = false, features = ["index"] }
+gix = { version = "0.83.0", default-features = false, features = ["index"] }
 
 # File walking with gitignore support
-ignore = "0.4"
+ignore = "0.4.25"
 
 # Path helpers
-dirs = "6"
+dirs = "6.0.0"
 
 # Hashing
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-sha2 = "0.10"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+sha2 = "0.11.0"
 
 # ONNX inference for bundled embedder
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
-tokenizers = { version = "0.21", default-features = false, features = ["http", "fancy-regex"] }
-ndarray = "0.17"
+tokenizers = { version = "0.23.1", default-features = false, features = ["http", "fancy-regex"] }
+ndarray = "0.17.2"
 
 # Tempfile for tests
-tempfile = "3"
+tempfile = "3.27.0"
 
 # MCP server (hand-rolled JSON-RPC fallback if rmcp API is unstable)
 # We start with hand-rolled JSON-RPC since rmcp is very new
-async-trait = "0.1"
+async-trait = "0.1.89"
 
 [dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
-tokio-test = "0.4"
+assert_cmd = "2.2.1"
+predicates = "3.1.4"
+tokio-test = "0.4.5"
 
 [profile.release]
 strip = true
