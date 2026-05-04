@@ -332,7 +332,13 @@ mod tests {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        assert!(unix_fs::symlink(fixture.root().join("src"), fixture.root().join("src/link.rs")).is_ok());
+        assert!(
+            unix_fs::symlink(
+                fixture.root().join("src"),
+                fixture.root().join("src/link.rs")
+            )
+            .is_ok()
+        );
 
         let mut config = Config::default();
         config.indexing.follow_symlinks = true;

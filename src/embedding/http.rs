@@ -161,7 +161,9 @@ fn normalize_endpoint(endpoint: String) -> Result<String> {
     if endpoint.is_empty() {
         return Err(ClaudixError::ConfigInvalid {
             message: "embedding endpoint cannot be empty".to_owned(),
-            recovery: RecoveryHint("Set [embedding].endpoint to the base URL for the HTTP provider"),
+            recovery: RecoveryHint(
+                "Set [embedding].endpoint to the base URL for the HTTP provider",
+            ),
         });
     }
     Ok(endpoint)
@@ -253,10 +255,13 @@ mod tests {
             Dimension(2),
             Duration::from_secs(5),
             None,
-        )
-        .unwrap();
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
 
-        let result = provider.embed(&["alpha", "beta"]).await.unwrap();
+        let result = provider.embed(&["alpha", "beta"]).await;
+        assert!(result.is_ok());
+        let result = result.ok().unwrap_or_else(|| unreachable!());
 
         // Must reorder so that index 0 (alpha → [0.1,0.2]) comes first.
         assert_eq!(result, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
@@ -276,11 +281,14 @@ mod tests {
             Dimension(2),
             Duration::from_secs(5),
             None,
-        )
-        .unwrap();
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
 
         let error = provider.embed(&["alpha", "beta"]).await;
-        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("invalid embedding index 0")));
+        assert!(
+            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("invalid embedding index 0"))
+        );
         let _ = server.finish().await;
     }
 
@@ -297,20 +305,21 @@ mod tests {
             Dimension(2),
             Duration::from_secs(5),
             None,
-        )
-        .unwrap();
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
 
         let error = provider.embed(&["alpha", "beta"]).await;
-        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("invalid embedding index 2")));
+        assert!(
+            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("invalid embedding index 2"))
+        );
         let _ = server.finish().await;
     }
 
     #[tokio::test]
     async fn http_provider_reports_embedding_count_mismatch() {
-        let server = TestServer::spawn(response_with_json(
-            r#"{"data":[{"embedding":[0.1,0.2]}]}"#,
-        ))
-        .await;
+        let server =
+            TestServer::spawn(response_with_json(r#"{"data":[{"embedding":[0.1,0.2]}]}"#)).await;
 
         let provider = HttpProvider::new(
             server.endpoint(),
@@ -318,11 +327,14 @@ mod tests {
             Dimension(2),
             Duration::from_secs(5),
             None,
-        )
-        .unwrap();
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
 
         let error = provider.embed(&["alpha", "beta"]).await;
-        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("1 embeddings for 2 inputs")));
+        assert!(
+            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("1 embeddings for 2 inputs"))
+        );
         let _ = server.finish().await;
     }
 
@@ -330,7 +342,9 @@ mod tests {
     fn validate_dimensions_rejects_non_finite_embedding_values() {
         let error = validate_dimensions(&[vec![0.1, f32::INFINITY]], Dimension(2));
 
-        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("non-finite embedding")));
+        assert!(
+            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("non-finite embedding"))
+        );
     }
 
     #[tokio::test]

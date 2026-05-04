@@ -9,8 +9,8 @@ use crate::embedding::Provider;
 use crate::error::{ClaudixError, Result};
 use crate::store::{Store, StoredChunk};
 use crate::types::{
-    path_prefix_matches, ByteRange, Chunk, ChunkId, ChunkKind, Dimension, FileHash, Language,
-    LineRange, RelativePath,
+    ByteRange, Chunk, ChunkId, ChunkKind, Dimension, FileHash, Language, LineRange, RelativePath,
+    path_prefix_matches,
 };
 
 #[derive(Debug, Clone)]
@@ -350,7 +350,12 @@ fn sort_results(results: &mut [SearchResult]) {
                     .as_str()
                     .cmp(right.chunk.file_path.as_str())
             })
-            .then_with(|| left.chunk.line_range.start.cmp(&right.chunk.line_range.start))
+            .then_with(|| {
+                left.chunk
+                    .line_range
+                    .start
+                    .cmp(&right.chunk.line_range.start)
+            })
             .then_with(|| left.chunk.line_range.end.cmp(&right.chunk.line_range.end))
     });
 }
@@ -541,7 +546,10 @@ mod tests {
             tokenize("handle_session_start"),
             vec!["handle", "session", "start"]
         );
-        assert_eq!(tokenize("fn full_index_running"), vec!["fn", "full", "index", "running"]);
+        assert_eq!(
+            tokenize("fn full_index_running"),
+            vec!["fn", "full", "index", "running"]
+        );
     }
 
     #[test]
@@ -558,7 +566,10 @@ mod tests {
             DocumentStats::from_content("pub fn with_fallback_params(max: usize) -> Self"),
         ];
         let scores = bm25_scores(&docs, &tokenize("session start hook"));
-        assert!(scores[0] > 0.0, "handle_session_start should match 'session start'");
+        assert!(
+            scores[0] > 0.0,
+            "handle_session_start should match 'session start'"
+        );
         assert_eq!(scores[1], 0.0, "with_fallback_params should not match");
     }
 
@@ -569,7 +580,11 @@ mod tests {
 
         let config = SearchConfig {
             top_k: 10,
-            hybrid_weights: HybridWeights { dense: 0.55, bm25: 0.30, rrf: 0.15 },
+            hybrid_weights: HybridWeights {
+                dense: 0.55,
+                bm25: 0.30,
+                rrf: 0.15,
+            },
             identifier_boost: 1.4,
             similarity_threshold: 0.30,
         };
@@ -580,8 +595,10 @@ mod tests {
             language: "rust".into(),
             kind: "function".into(),
             name: Some(name.into()),
-            line_start: 1, line_end: 5,
-            byte_start: 0, byte_end: 100,
+            line_start: 1,
+            line_end: 5,
+            byte_start: 0,
+            byte_end: 100,
             file_hash: [0u8; 16],
             content: content.into(),
             vector: vec,
@@ -591,8 +608,16 @@ mod tests {
         // handle_session_start has lower cosine (0.3 of max), but strong BM25
         // The BM25 + identifier_boost should push handle_session_start above new()
         let rows = vec![
-            make_row("new", "pub fn new(max: usize) -> Self { Self { max } }", vec![0.9, 0.1, 0.0, 0.0]),
-            make_row("handle_session_start", "async fn handle_session_start(root: &Path) -> Result<Option<Value>> { let config = load(root); }", vec![0.3, 0.8, 0.0, 0.0]),
+            make_row(
+                "new",
+                "pub fn new(max: usize) -> Self { Self { max } }",
+                vec![0.9, 0.1, 0.0, 0.0],
+            ),
+            make_row(
+                "handle_session_start",
+                "async fn handle_session_start(root: &Path) -> Result<Option<Value>> { let config = load(root); }",
+                vec![0.3, 0.8, 0.0, 0.0],
+            ),
         ];
         let query_vector = vec![1.0, 0.0, 0.0, 0.0];
         let query = SearchQuery {
@@ -602,7 +627,7 @@ mod tests {
             path_prefix: None,
         };
 
-        let results = rank_rows(query, rows, query_vector, config).unwrap();
+        let results = rank_rows(query, rows, query_vector, config).expect("rank_rows must succeed");
         assert_eq!(results.len(), 2, "both chunks should pass the filter");
         assert_eq!(
             results[0].chunk.name.as_deref(),
@@ -618,7 +643,11 @@ mod tests {
 
         let config = SearchConfig {
             top_k: 10,
-            hybrid_weights: HybridWeights { dense: 0.55, bm25: 0.30, rrf: 0.15 },
+            hybrid_weights: HybridWeights {
+                dense: 0.55,
+                bm25: 0.30,
+                rrf: 0.15,
+            },
             identifier_boost: 1.4,
             similarity_threshold: 0.30,
         };
@@ -631,8 +660,10 @@ mod tests {
                 language: "rust".into(),
                 kind: "function".into(),
                 name: Some(name.into()),
-                line_start: 1, line_end: 5,
-                byte_start: 0, byte_end: 100,
+                line_start: 1,
+                line_end: 5,
+                byte_start: 0,
+                byte_end: 100,
                 file_hash: [0u8; 16],
                 content: content.into(),
                 vector: v,
@@ -640,9 +671,21 @@ mod tests {
         };
 
         let rows = vec![
-            make_row("new", "pub fn new(max: usize) -> Self { Self { max } }", 0.8),
-            make_row("handle_session_start", "async fn handle_session_start(root: &Path) { let config = load(root); }", 0.2),
-            make_row("full_index_running", "pub fn full_index_running(&self) -> bool { let lock = self.lock_path(); }", 0.1),
+            make_row(
+                "new",
+                "pub fn new(max: usize) -> Self { Self { max } }",
+                0.8,
+            ),
+            make_row(
+                "handle_session_start",
+                "async fn handle_session_start(root: &Path) { let config = load(root); }",
+                0.2,
+            ),
+            make_row(
+                "full_index_running",
+                "pub fn full_index_running(&self) -> bool { let lock = self.lock_path(); }",
+                0.1,
+            ),
         ];
 
         let query_vector = vec![1.0, 0.0, 0.0, 0.0];
@@ -653,11 +696,18 @@ mod tests {
             path_prefix: None,
         };
 
-        let results = rank_rows(query, rows, query_vector, config).unwrap();
-        assert!(results.len() >= 2, "BM25 should match handle_session_start and others: got {} results", results.len());
+        let results = rank_rows(query, rows, query_vector, config).expect("rank_rows must succeed");
+        assert!(
+            results.len() >= 2,
+            "BM25 should match handle_session_start and others: got {} results",
+            results.len()
+        );
         // handle_session_start should rank above new() because BM25 matches override low dense
         let top_name = results[0].chunk.name.as_deref().unwrap_or("");
-        assert_ne!(top_name, "new", "trivial new() should not rank first when BM25 matches exist");
+        assert_ne!(
+            top_name, "new",
+            "trivial new() should not rank first when BM25 matches exist"
+        );
     }
 
     struct SearchHarness {
@@ -702,7 +752,9 @@ mod tests {
             })
             .await;
 
-        assert!(matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("non-finite query")));
+        assert!(
+            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("non-finite query"))
+        );
     }
 
     #[tokio::test]

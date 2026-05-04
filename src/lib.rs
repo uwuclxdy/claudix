@@ -133,13 +133,12 @@ impl Claudix {
 
         if let Ok((Some(stored_hash), stats)) =
             self.store.stored_file_hash_and_stats(&relative_path).await
+            && stored_hash == file.file_hash.0
         {
-            if stored_hash == file.file_hash.0 {
-                return Ok(IndexStats {
-                    file_count: stats.file_count,
-                    chunk_count: stats.chunk_count,
-                });
-            }
+            return Ok(IndexStats {
+                file_count: stats.file_count,
+                chunk_count: stats.chunk_count,
+            });
         }
 
         let chunks = self.collect_file_chunks(&file).await?;
@@ -196,8 +195,10 @@ impl Claudix {
         let overlap_lines = self.config.indexing.chunk_overlap_lines;
 
         task::spawn_blocking(move || {
-            let chunker =
-                MultiLanguageChunker::with_fallback_params(chunking::DEFAULT_CHUNK_LINES, overlap_lines);
+            let chunker = MultiLanguageChunker::with_fallback_params(
+                chunking::DEFAULT_CHUNK_LINES,
+                overlap_lines,
+            );
             if force_indexed && language == Language::Unknown {
                 chunker.chunk_as_text(&path, language, file_hash, &content)
             } else {
@@ -272,20 +273,20 @@ async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
         return Ok(Arc::new(StubProvider::with_model_id(
             config.embedding.model.clone(),
             dimensions,
-        )));
+        )) as Arc<dyn Provider>);
     }
 
     match config.embedding.provider {
         EmbeddingProvider::Bundled => Ok(Arc::new(
             BundledProvider::new(config.embedding.model.clone(), dimensions).await?,
-        )),
+        ) as Arc<dyn Provider>),
         EmbeddingProvider::Http => Ok(Arc::new(HttpProvider::new(
             config.embedding.endpoint.clone(),
             config.embedding.model.clone(),
             dimensions,
             Duration::from_millis(config.embedding.timeout_ms),
             None,
-        )?)),
+        )?) as Arc<dyn Provider>),
     }
 }
 
@@ -499,11 +500,11 @@ mod tests {
 
     #[tokio::test]
     async fn index_full_preserves_unchanged_file_chunks_on_second_run() {
-        let fixture = TestFixture::new("small_rust").unwrap();
+        let fixture = TestFixture::new("small_rust").expect("test fixture");
         let config = stub_config();
-        let claudix = test_claudix(fixture.root().to_path_buf(), config).unwrap();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config).expect("test claudix");
 
-        claudix.index_full().await.unwrap();
+        claudix.index_full().await.expect("initial index");
 
         // Modify only src/lib.rs; src/math.rs is untouched.
         fs::write(
@@ -511,16 +512,19 @@ mod tests {
             "pub mod math;\n\npub fn salute(name: &str) -> String { format!(\"hi {name}\") }\n",
         )
         .await
-        .unwrap();
+        .expect("write modification");
 
-        claudix.index_full().await.unwrap();
+        claudix.index_full().await.expect("second index");
 
-        let rows = claudix.store.read_chunks().await.unwrap();
+        let rows = claudix.store.read_chunks().await.expect("read chunks");
         let names: BTreeSet<_> = rows.iter().filter_map(|r| r.name.clone()).collect();
 
         assert!(names.contains("salute"), "changed file must be re-embedded");
         assert!(!names.contains("greet"), "stale chunk must be gone");
-        assert!(names.contains("add"), "unchanged file chunks must be preserved");
+        assert!(
+            names.contains("add"),
+            "unchanged file chunks must be preserved"
+        );
     }
 
     #[tokio::test]
@@ -596,7 +600,11 @@ mod tests {
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
         assert!(claudix.index_full().await.is_ok());
-        assert!(fs::write(fixture.root().join("src/math.rs"), b"").await.is_ok());
+        assert!(
+            fs::write(fixture.root().join("src/math.rs"), b"")
+                .await
+                .is_ok()
+        );
 
         let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
         assert!(stats.is_ok());

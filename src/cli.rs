@@ -101,9 +101,9 @@ pub async fn run_index(project_root: impl AsRef<Path>) -> Result<IndexOutput> {
     require_git_repo(&project_root)?;
     let config = config::load(&project_root)?;
     let store = Store::new(&project_root, &config)?;
-    let _lock = store.acquire_index_lock().ok_or_else(|| {
-        crate::error::ClaudixError::Store("index already running".to_owned())
-    })?;
+    let _lock = store
+        .acquire_index_lock()
+        .ok_or_else(|| crate::error::ClaudixError::Store("index already running".to_owned()))?;
     let claudix = match Claudix::new(project_root.clone(), Arc::new(config.clone())).await {
         Ok(claudix) => claudix,
         Err(error) if requires_clean_reindex(&error) => {
@@ -790,7 +790,10 @@ mod tests {
     #[test]
     fn parse_path_prefix_treats_blank_values_as_no_filter() {
         assert!(matches!(parse_path_prefix(None), Ok(None)));
-        assert!(matches!(parse_path_prefix(Some("   ".to_owned())), Ok(None)));
+        assert!(matches!(
+            parse_path_prefix(Some("   ".to_owned())),
+            Ok(None)
+        ));
         assert_eq!(
             parse_path_prefix(Some(" src/math ".to_owned()))
                 .ok()
@@ -853,11 +856,13 @@ mod tests {
             binary: 1,
             recovery: RecoveryHint("reindex"),
         }));
-        assert!(requires_clean_reindex(&ClaudixError::EmbeddingModelMismatch {
-            store_model: "old".to_owned(),
-            active_model: "new".to_owned(),
-            recovery: RecoveryHint("reindex"),
-        }));
+        assert!(requires_clean_reindex(
+            &ClaudixError::EmbeddingModelMismatch {
+                store_model: "old".to_owned(),
+                active_model: "new".to_owned(),
+                recovery: RecoveryHint("reindex"),
+            }
+        ));
         assert!(requires_clean_reindex(&ClaudixError::DimensionMismatch {
             store_dim: 384,
             model_dim: 768,
@@ -878,11 +883,13 @@ mod tests {
         assert!(std::fs::create_dir_all(&claude_dir).is_ok());
         let config_text = toml::to_string(&config);
         assert!(config_text.is_ok());
-        assert!(std::fs::write(
-            claude_dir.join("claudix.toml"),
-            config_text.ok().unwrap_or_default(),
-        )
-        .is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                config_text.ok().unwrap_or_default(),
+            )
+            .is_ok()
+        );
 
         let store = Store::new(fixture.root(), &config);
         assert!(store.is_ok());

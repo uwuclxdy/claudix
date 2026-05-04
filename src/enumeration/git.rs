@@ -14,7 +14,7 @@ pub fn discover_repository(project_root: &Path) -> Result<Repository> {
 
 pub fn list_candidate_paths(repo: &Repository) -> Result<Vec<RelativePath>> {
     let workdir = repo
-        .work_dir()
+        .workdir()
         .ok_or_else(|| ClaudixError::Git("bare repositories are not supported".into()))?;
     let mut paths = BTreeSet::new();
 

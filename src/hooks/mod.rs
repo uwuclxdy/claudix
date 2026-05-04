@@ -24,7 +24,10 @@ pub enum HookEvent {
 
 pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result<Option<Value>> {
     let payload: HookPayload = if payload.trim().is_empty() {
-        HookPayload { tool_name: None, tool_input: None }
+        HookPayload {
+            tool_name: None,
+            tool_input: None,
+        }
     } else {
         serde_json::from_str(payload)?
     };
@@ -328,17 +331,29 @@ fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchR
     ];
     for result in &results {
         let chunk = &result.chunk;
-        let name_part = chunk.name.as_deref().map(|n| format!(" {n}")).unwrap_or_default();
+        let name_part = chunk
+            .name
+            .as_deref()
+            .map(|n| format!(" {n}"))
+            .unwrap_or_default();
         lines.push(format!(
             "{}:{}-{} [{}] {}{name_part} ({:.3})",
-            chunk.file_path, chunk.line_range.start, chunk.line_range.end, chunk.language, chunk.kind, result.score,
+            chunk.file_path,
+            chunk.line_range.start,
+            chunk.line_range.end,
+            chunk.language,
+            chunk.kind,
+            result.score,
         ));
         if !chunk.content.is_empty() {
             lines.push(truncate_snippet(&chunk.content, 20));
         }
         lines.push(String::new());
     }
-    lines.push("Tip: call search_code MCP tool directly next time to skip this interception round-trip.".to_owned());
+    lines.push(
+        "Tip: call search_code MCP tool directly next time to skip this interception round-trip."
+            .to_owned(),
+    );
     let context = lines.join("\n");
     json!({
         "hookSpecificOutput": {
@@ -427,7 +442,11 @@ fn extract_quoted_pattern(args: &str) -> Option<String> {
     }
 
     let pattern = pattern.trim();
-    if pattern.is_empty() { None } else { Some(pattern.to_owned()) }
+    if pattern.is_empty() {
+        None
+    } else {
+        Some(pattern.to_owned())
+    }
 }
 
 fn extract_unquoted_pattern(args: &str) -> Option<String> {
@@ -526,8 +545,21 @@ mod tests {
 
     #[test]
     fn looks_like_regex_detects_metacharacters() {
-        for pattern in ["^pub fn", "fn\\s+\\w+", "[a-z]+", "fn(x)", "x+", "x?", "{3}", "x$", ".*"] {
-            assert!(looks_like_regex(pattern), "expected regex detection for: {pattern}");
+        for pattern in [
+            "^pub fn",
+            "fn\\s+\\w+",
+            "[a-z]+",
+            "fn(x)",
+            "x+",
+            "x?",
+            "{3}",
+            "x$",
+            ".*",
+        ] {
+            assert!(
+                looks_like_regex(pattern),
+                "expected regex detection for: {pattern}"
+            );
         }
         assert!(!looks_like_regex("error handling"));
         assert!(!looks_like_regex("handle_session_start"));
@@ -536,8 +568,8 @@ mod tests {
     #[test]
     fn looks_like_file_target_covers_all_supported_extensions() {
         for ext in &[
-            ".rs", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".c", ".h",
-            ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".cs", ".sql",
+            ".rs", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".c", ".h", ".cpp",
+            ".cc", ".cxx", ".hpp", ".hxx", ".cs", ".sql",
         ] {
             let query = format!("search routes{ext}");
             assert!(
@@ -563,7 +595,10 @@ mod tests {
         // Multiple non-path tokens → ambiguous, return None.
         assert_eq!(extract_unquoted_pattern("foo bar"), None);
         // Any flag → bail out entirely (flag value might be misidentified as pattern).
-        assert_eq!(extract_unquoted_pattern("--type rust handle_session_start"), None);
+        assert_eq!(
+            extract_unquoted_pattern("--type rust handle_session_start"),
+            None
+        );
         // Path-only → None.
         assert_eq!(extract_unquoted_pattern("src/lib.rs"), None);
     }
@@ -885,15 +920,21 @@ mod tests {
 
     #[tokio::test]
     async fn pre_tool_use_intercepts_unquoted_identifier_in_bash_rg() {
-        let fixture = TestFixture::new("small_rust").unwrap();
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
         write_config(fixture.root(), &stub_config());
 
-        Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config()))
-            .await
-            .unwrap()
-            .index_full()
-            .await
-            .unwrap();
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full()
+                .await
+                .is_ok()
+        );
 
         // Unquoted identifier with enough tokens — should be intercepted just like a quoted query.
         let payload = json!({
@@ -902,15 +943,16 @@ mod tests {
                 "command": "rg add_two_numbers"
             }
         });
-        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string())
-            .await
-            .unwrap();
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        let response = response.ok().unwrap_or_else(|| unreachable!());
         assert!(
             response.is_some(),
             "unquoted multi-token identifier should be intercepted"
         );
+        let response = response.unwrap_or(Value::Null);
         assert_eq!(
-            response.unwrap()["hookSpecificOutput"]["permissionDecision"],
+            response["hookSpecificOutput"]["permissionDecision"],
             Value::String("deny".to_owned())
         );
     }
@@ -983,24 +1025,31 @@ mod tests {
 
     #[tokio::test]
     async fn pre_tool_use_returns_search_results_in_context() {
-        let fixture = TestFixture::new("small_rust").unwrap();
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
         write_config(fixture.root(), &stub_config());
 
-        Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config()))
-            .await
-            .unwrap()
-            .index_full()
-            .await
-            .unwrap();
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full()
+                .await
+                .is_ok()
+        );
 
         let payload = json!({
             "tool_name": "Grep",
             "tool_input": { "pattern": "add two numbers together" }
         });
-        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string())
-            .await
-            .unwrap()
-            .unwrap();
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        let response = response.ok().unwrap_or_else(|| unreachable!());
+        assert!(response.is_some());
+        let response = response.unwrap_or(Value::Null);
 
         assert_eq!(
             response["hookSpecificOutput"]["permissionDecision"],

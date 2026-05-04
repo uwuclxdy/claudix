@@ -540,7 +540,11 @@ index_dir = ".claudix/custom-index"
     #[test]
     fn reject_all_zero_hybrid_weights() {
         let mut config = Config::default();
-        config.search.hybrid_weights = HybridWeights { dense: 0.0, bm25: 0.0, rrf: 0.0 };
+        config.search.hybrid_weights = HybridWeights {
+            dense: 0.0,
+            bm25: 0.0,
+            rrf: 0.0,
+        };
 
         let error = validate(&config);
         assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
@@ -583,7 +587,11 @@ index_dir = ".claudix/custom-index"
     #[test]
     fn reject_negative_hybrid_weights() {
         let mut config = Config::default();
-        config.search.hybrid_weights = HybridWeights { dense: -0.1, bm25: 0.5, rrf: 0.5 };
+        config.search.hybrid_weights = HybridWeights {
+            dense: -0.1,
+            bm25: 0.5,
+            rrf: 0.5,
+        };
 
         let error = validate(&config);
         assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
@@ -593,7 +601,11 @@ index_dir = ".claudix/custom-index"
     fn reject_non_finite_hybrid_weights() {
         for dense in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let mut config = Config::default();
-            config.search.hybrid_weights = HybridWeights { dense, bm25: 0.5, rrf: 0.5 };
+            config.search.hybrid_weights = HybridWeights {
+                dense,
+                bm25: 0.5,
+                rrf: 0.5,
+            };
 
             let error = validate(&config);
             assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
@@ -603,7 +615,11 @@ index_dir = ".claudix/custom-index"
     #[test]
     fn accept_partial_nonzero_hybrid_weights() {
         let mut config = Config::default();
-        config.search.hybrid_weights = HybridWeights { dense: 1.0, bm25: 0.0, rrf: 0.0 };
+        config.search.hybrid_weights = HybridWeights {
+            dense: 1.0,
+            bm25: 0.0,
+            rrf: 0.0,
+        };
 
         assert!(validate(&config).is_ok());
     }

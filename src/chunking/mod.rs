@@ -624,8 +624,16 @@ mod tests {
         // continuation byte. line_number_for_byte must not slice the str there.
         let source = "pub fn café() -> &'static str {\n    \"espresso\"\n}\n";
         let chunker = MultiLanguageChunker::new();
-        let result = chunker.chunk(&RelativePath::new("src/lib.rs"), Language::Rust, hash_for(source), source);
-        assert!(result.is_ok(), "chunking with multi-byte ident must not panic: {result:?}");
+        let result = chunker.chunk(
+            &RelativePath::new("src/lib.rs"),
+            Language::Rust,
+            hash_for(source),
+            source,
+        );
+        assert!(
+            result.is_ok(),
+            "chunking with multi-byte ident must not panic: {result:?}"
+        );
         let chunks = result.ok().unwrap_or_else(|| unreachable!());
         assert!(!chunks.is_empty());
         assert_eq!(chunks[0].name.as_deref(), Some("café"));

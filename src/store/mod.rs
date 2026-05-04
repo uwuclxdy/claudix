@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::types::Float32Type;
 use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, RecordBatch,
-    RecordBatchIterator, StringArray, UInt32Array, UInt64Array,
+    RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array, UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use futures::TryStreamExt;
@@ -243,7 +243,9 @@ impl Store {
 
         let mut stored_hash_by_path: HashMap<&str, [u8; 16]> = HashMap::new();
         for row in &stored_rows {
-            stored_hash_by_path.entry(&row.file_path).or_insert(row.file_hash);
+            stored_hash_by_path
+                .entry(&row.file_path)
+                .or_insert(row.file_hash);
         }
 
         let mut changed_paths: HashSet<String> = HashSet::new();
@@ -350,7 +352,7 @@ impl Store {
 
         let connection = self.open_connection().await?;
         if self.chunks_table_exists(&connection).await? {
-            connection.drop_table(CHUNKS_TABLE_NAME).await?;
+            connection.drop_table(CHUNKS_TABLE_NAME, &[]).await?;
         }
 
         let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
@@ -363,7 +365,7 @@ impl Store {
         let connection = self.open_connection().await?;
 
         if self.chunks_table_exists(&connection).await? {
-            connection.drop_table(CHUNKS_TABLE_NAME).await?;
+            connection.drop_table(CHUNKS_TABLE_NAME, &[]).await?;
         }
 
         let table = connection
@@ -376,7 +378,7 @@ impl Store {
         }
 
         let batch = record_batch_from_rows(&rows, dimension)?;
-        let reader = Box::new(RecordBatchIterator::new(
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
             vec![Ok(batch)],
             chunk_schema(dimension),
         ));
@@ -594,7 +596,10 @@ fn record_batch_from_rows(rows: &[StoredChunk], dimension: Dimension) -> Result<
     record_batch_from_rows_unchecked(rows, dimension)
 }
 
-fn record_batch_from_rows_unchecked(rows: &[StoredChunk], dimension: Dimension) -> Result<RecordBatch> {
+fn record_batch_from_rows_unchecked(
+    rows: &[StoredChunk],
+    dimension: Dimension,
+) -> Result<RecordBatch> {
     let names: Vec<Option<String>> = rows.iter().map(|row| row.name.clone()).collect();
     let hash_refs: Vec<&[u8; 16]> = rows.iter().map(|row| &row.file_hash).collect();
     let vectors = rows
@@ -787,7 +792,9 @@ fn read_vector(batch: &RecordBatch, row: usize) -> Result<Vec<f32>> {
         .downcast_ref::<Float32Array>()
         .ok_or_else(|| ClaudixError::Store("vector values were not float32".to_owned()))?;
     if values.null_count() > 0 {
-        return Err(ClaudixError::Store("vector values contained nulls".to_owned()));
+        return Err(ClaudixError::Store(
+            "vector values contained nulls".to_owned(),
+        ));
     }
 
     Ok((0..values.len()).map(|index| values.value(index)).collect())
@@ -1105,7 +1112,9 @@ mod tests {
         )];
 
         let error = store.replace_chunks(&chunks, &config).await;
-        assert!(matches!(error, Err(ClaudixError::Store(message)) if message.contains("non-finite")));
+        assert!(
+            matches!(error, Err(ClaudixError::Store(message)) if message.contains("non-finite"))
+        );
     }
 
     #[test]
@@ -1129,7 +1138,9 @@ mod tests {
         let batch = batch.ok().unwrap_or_else(|| unreachable!());
 
         let error = batches_to_rows(vec![batch]);
-        assert!(matches!(error, Err(ClaudixError::Store(message)) if message.contains("non-finite")));
+        assert!(
+            matches!(error, Err(ClaudixError::Store(message)) if message.contains("non-finite"))
+        );
     }
 
     #[test]
@@ -1172,11 +1183,10 @@ mod tests {
                     )
                     .map_err(|error| ClaudixError::Store(error.to_string()))?,
                 ) as ArrayRef,
-                Arc::new(StringArray::from(vec!["pub fn alpha() {}"] )) as ArrayRef,
-                Arc::new(FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                    vec![vector],
-                    2,
-                )) as ArrayRef,
+                Arc::new(StringArray::from(vec!["pub fn alpha() {}"])) as ArrayRef,
+                Arc::new(
+                    FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(vec![vector], 2),
+                ) as ArrayRef,
             ],
         )
         .map_err(|error| ClaudixError::Store(error.to_string()))
@@ -1418,32 +1428,50 @@ mod tests {
     async fn read_chunks_returns_more_than_default_lancedb_limit() {
         // Regression test: LanceDB Query::new() sets limit=Some(10) by default.
         // read_all_rows must override it or >10 chunks are silently truncated.
-        let project_root = tempdir().unwrap();
+        let project_root = tempdir().expect("tempdir");
         let config = Config::default();
-        let store = Store::new(project_root.path(), &config).unwrap();
+        let store = Store::new(project_root.path(), &config).expect("store init");
 
         let chunks: Vec<_> = (1u64..=15)
-            .map(|i| sample_chunk(i, &format!("src/f{i}.rs"), &format!("fn{i}"), "fn body", &[i as f32 / 15.0; 384]))
+            .map(|i| {
+                sample_chunk(
+                    i,
+                    &format!("src/f{i}.rs"),
+                    &format!("fn{i}"),
+                    "fn body",
+                    &[i as f32 / 15.0; 384],
+                )
+            })
             .collect();
 
-        store.replace_chunks(&chunks, &config).await.unwrap();
+        store
+            .replace_chunks(&chunks, &config)
+            .await
+            .expect("replace chunks");
 
-        let rows = store.read_chunks().await.unwrap();
-        assert_eq!(rows.len(), 15, "read_chunks must return all rows, not just the LanceDB default of 10");
+        let rows = store.read_chunks().await.expect("read chunks");
+        assert_eq!(
+            rows.len(),
+            15,
+            "read_chunks must return all rows, not just the LanceDB default of 10"
+        );
     }
 
     #[tokio::test]
     async fn incremental_file_state_splits_changed_and_unchanged() {
-        let project_root = tempdir().unwrap();
+        let project_root = tempdir().expect("tempdir");
         let config = Config::default();
-        let store = Store::new(project_root.path(), &config).unwrap();
+        let store = Store::new(project_root.path(), &config).expect("store init");
 
         // Seed: two files, file_hash = chunk_id byte repeated
         let initial = vec![
             sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
             sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
         ];
-        store.replace_chunks(&initial, &config).await.unwrap();
+        store
+            .replace_chunks(&initial, &config)
+            .await
+            .expect("replace chunks");
 
         // a.rs unchanged (same hash [1;16]), b.rs changed (new hash [9;16])
         let current_files = vec![
@@ -1451,32 +1479,45 @@ mod tests {
             ("src/b.rs".to_owned(), [9u8; 16]),
         ];
 
-        let (changed_paths, unchanged_rows) =
-            store.incremental_file_state(&current_files).await.unwrap();
+        let (changed_paths, unchanged_rows) = store
+            .incremental_file_state(&current_files)
+            .await
+            .expect("incremental state");
 
-        assert!(!changed_paths.contains("src/a.rs"), "unchanged file must not be in changed_paths");
-        assert!(changed_paths.contains("src/b.rs"), "changed file must be in changed_paths");
+        assert!(
+            !changed_paths.contains("src/a.rs"),
+            "unchanged file must not be in changed_paths"
+        );
+        assert!(
+            changed_paths.contains("src/b.rs"),
+            "changed file must be in changed_paths"
+        );
         assert_eq!(unchanged_rows.len(), 1);
         assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
     }
 
     #[tokio::test]
     async fn incremental_file_state_drops_deleted_files() {
-        let project_root = tempdir().unwrap();
+        let project_root = tempdir().expect("tempdir");
         let config = Config::default();
-        let store = Store::new(project_root.path(), &config).unwrap();
+        let store = Store::new(project_root.path(), &config).expect("store init");
 
         let initial = vec![
             sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
             sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
         ];
-        store.replace_chunks(&initial, &config).await.unwrap();
+        store
+            .replace_chunks(&initial, &config)
+            .await
+            .expect("replace chunks");
 
         // b.rs is not present in current_files (deleted)
         let current_files = vec![("src/a.rs".to_owned(), [1u8; 16])];
 
-        let (changed_paths, unchanged_rows) =
-            store.incremental_file_state(&current_files).await.unwrap();
+        let (changed_paths, unchanged_rows) = store
+            .incremental_file_state(&current_files)
+            .await
+            .expect("incremental state");
 
         assert!(changed_paths.is_empty());
         assert_eq!(unchanged_rows.len(), 1);
@@ -1494,13 +1535,24 @@ mod tests {
         assert!(store.is_ok());
         let store = store.ok().unwrap_or_else(|| unreachable!());
 
-        let chunks = vec![sample_chunk(1, "src/lib.rs", "foo", "pub fn foo() {}", &[1.0; 384])];
+        let chunks = vec![sample_chunk(
+            1,
+            "src/lib.rs",
+            "foo",
+            "pub fn foo() {}",
+            &[1.0; 384],
+        )];
         assert!(store.replace_chunks(&chunks, &config).await.is_ok());
 
         let manifest = store.read_manifest();
         assert!(manifest.is_ok());
         let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
-        assert!(manifest.unwrap_or_else(|| unreachable!()).last_full_index_at.is_some());
+        assert!(
+            manifest
+                .unwrap_or_else(|| unreachable!())
+                .last_full_index_at
+                .is_some()
+        );
 
         assert!(store.clear_chunks(&config).await.is_ok());
 
@@ -1508,7 +1560,10 @@ mod tests {
         assert!(manifest.is_ok());
         let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
         let manifest = manifest.unwrap_or_else(|| unreachable!());
-        assert!(manifest.last_full_index_at.is_none(), "clear must reset last_full_index_at so auto-reindex triggers on next session");
+        assert!(
+            manifest.last_full_index_at.is_none(),
+            "clear must reset last_full_index_at so auto-reindex triggers on next session"
+        );
         assert_eq!(manifest.chunk_count, 0);
         assert_eq!(manifest.file_count, 0);
     }
