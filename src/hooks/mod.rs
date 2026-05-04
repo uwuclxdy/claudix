@@ -165,9 +165,12 @@ fn spawn_background_reindex_file(project_root: &Path, file_path: &str) {
     let Ok(binary) = std::env::current_exe() else {
         return;
     };
-    let _ = std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    detach_background_process(&mut command);
+    let _ = command
         .args(["reindex-file", file_path])
         .current_dir(project_root)
+        .env("CLAUDE_PROJECT_DIR", project_root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
