@@ -129,7 +129,13 @@ fn rust_chunk_kind(node: Node<'_>) -> Option<ChunkKind> {
         "enum_item" => Some(ChunkKind::Enum),
         "trait_item" => Some(ChunkKind::Trait),
         "impl_item" => Some(ChunkKind::Impl),
-        "mod_item" => Some(ChunkKind::Module),
+        "mod_item" => {
+            // `mod foo;` has no body — only index inline `mod foo { ... }` blocks.
+            let has_body = node
+                .named_children(&mut node.walk())
+                .any(|child| child.kind() == "declaration_list");
+            if has_body { Some(ChunkKind::Module) } else { None }
+        }
         "macro_definition" => Some(ChunkKind::Macro),
         _ => None,
     }
@@ -568,6 +574,31 @@ mod tests {
     // -----------------------------------------------------------------------
     // Rust
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn rust_chunker_skips_mod_pointer_declarations() {
+        // `mod error;` is a pointer declaration with no body — indexing it
+        // produces useless 1-token chunks that outscore the real content.
+        let source = "mod error;\nmod tests;\n\npub mod inline {\n    pub fn helper() {}\n}\n";
+        let chunker = MultiLanguageChunker::new();
+
+        let chunks = chunker
+            .chunk(
+                &RelativePath::new("src/main.rs"),
+                Language::Rust,
+                hash_for(source),
+                source,
+            )
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+
+        let mod_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.kind == ChunkKind::Module)
+            .collect();
+        assert_eq!(mod_chunks.len(), 1, "only the inline mod block should be indexed");
+        assert_eq!(mod_chunks[0].name.as_deref(), Some("inline"));
+    }
 
     #[test]
     fn rust_chunker_extracts_named_top_level_items() {
