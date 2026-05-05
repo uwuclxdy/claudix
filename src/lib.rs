@@ -405,7 +405,7 @@ mod tests {
         assert!(
             fs::write(
                 fixture.root().join("src/lib.rs"),
-                "pub mod math;\n\npub fn salute(name: &str) -> String {\n    format!(\"hi {name}\")\n}\n",
+                "pub mod math;\n\npub fn salute(name: &str) -> String {\n    format!(\"hi {name}\")\n}\n\npub fn wave(name: &str) -> String {\n    format!(\"bye {name}\")\n}\n",
             )
             .await
             .is_ok()

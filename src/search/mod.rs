@@ -157,6 +157,9 @@ fn rank_rows(
             } else {
                 combined_score
             };
+            // Clamp to [0, 1]: identifier_boost can push combined_score above 1.0
+            // making scores non-comparable and non-intuitive for users.
+            let boosted_score = boosted_score.clamp(0.0, 1.0);
 
             if boosted_score <= 0.0 {
                 return None;
