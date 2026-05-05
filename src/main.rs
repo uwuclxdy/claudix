@@ -4,12 +4,13 @@ use std::panic;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use claudix::{cli, hooks, mcp};
+use claudix::{ClaudixError, cli, hooks, mcp};
 use serde_json::to_string;
 
 #[derive(Debug, Parser)]
 #[command(name = "claudix")]
 #[command(about = "Local semantic search for Claude Code")]
+#[command(version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -18,7 +19,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(about = "Index or re-index the current repository")]
-    Index,
+    Index {
+        #[arg(long, help = "Clear the index before re-indexing")]
+        force: bool,
+    },
     #[command(about = "Search indexed code semantically")]
     Search {
         #[arg(num_args = 1.., help = "Natural-language or identifier query (multi-word, no quoting needed)")]
@@ -56,16 +60,34 @@ enum Command {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
     panic::set_hook(Box::new(|panic_info| {
         eprintln!("claudix panic: {panic_info}");
     }));
 
+    if let Err(err) = run().await {
+        if let Some(hint) = err
+            .downcast_ref::<ClaudixError>()
+            .and_then(ClaudixError::recovery_hint)
+        {
+            eprintln!("error: {err}");
+            eprintln!("hint: {hint}");
+        } else {
+            eprintln!("error: {err}");
+        }
+        std::process::exit(1);
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
     let project_root = active_project_root()?;
 
     match cli.command {
-        Command::Index => {
+        Command::Index { force } => {
+            if force {
+                cli::run_clear_index(&project_root).await?;
+            }
             let output = cli::run_index(&project_root).await?;
             println!(
                 "indexed {} files into {} chunks",
@@ -160,11 +182,19 @@ async fn main() -> Result<()> {
             );
             println!("embedding_provider: {}", output.embedding_provider);
             println!("embedding_healthy: {}", output.embedding_healthy);
+            if output.embedding_model_mismatch {
+                println!("embedding_model_mismatch: true");
+            }
 
-            if !output.embedding_healthy {
+            if output.embedding_model_mismatch {
                 eprintln!(
-                    "\nembedding not ready — run `claudix install` to download the bundled model,\n\
-                     or set [embedding] provider = \"http\" in ~/.claude/claudix.toml to use LM Studio/Ollama."
+                    "\nembedding model mismatch — the index was built with a different model.\n\
+                     Fix: run `claudix clear && claudix index` to rebuild with the active model."
+                );
+            } else if !output.embedding_healthy {
+                eprintln!(
+                    "\nembedding server not reachable — start LM Studio / Ollama,\n\
+                     or run `claudix install` to switch to the bundled model."
                 );
             }
             if !output.index_present {

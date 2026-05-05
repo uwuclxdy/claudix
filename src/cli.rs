@@ -62,6 +62,9 @@ pub struct DoctorOutput {
     pub dimensions: Option<u16>,
     pub embedding_provider: String,
     pub embedding_healthy: bool,
+    /// True when the stored index model differs from the active config model.
+    /// Distinct from `embedding_healthy = false` caused by the server being unreachable.
+    pub embedding_model_mismatch: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -157,10 +160,12 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
     let config = config::load(&project_root)?;
     let store = Store::new(&project_root, &config)?;
     let status = status_from_store(&store, &config).await?;
+
     let claudix = Claudix::new(project_root.clone(), Arc::new(config.clone())).await;
-    let embedding_healthy = match claudix {
-        Ok(claudix) => claudix.embedder_health_check().await.is_ok(),
-        Err(_) => false,
+    let (embedding_healthy, embedding_model_mismatch) = match claudix {
+        Ok(claudix) => (claudix.embedder_health_check().await.is_ok(), false),
+        Err(ClaudixError::EmbeddingModelMismatch { .. }) => (false, true),
+        Err(_) => (false, false),
     };
 
     Ok(DoctorOutput {
@@ -175,6 +180,7 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
             config::EmbeddingProvider::Http => "http".to_owned(),
         },
         embedding_healthy,
+        embedding_model_mismatch,
     })
 }
 

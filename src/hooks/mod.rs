@@ -147,8 +147,17 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         (Some(m), Some(c)) => index_is_stale(m, c),
         _ => indexed_chunk_count == 0,
     };
+    let model_mismatch = match (&manifest, &config) {
+        (Some(m), Some(c)) => m.embedding_model != c.embedding.model,
+        _ => false,
+    };
 
-    let mut response = session_start_response(indexed_file_count, indexed_chunk_count, index_stale);
+    let mut response = session_start_response(
+        indexed_file_count,
+        indexed_chunk_count,
+        index_stale,
+        model_mismatch,
+    );
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
         None => session_start_message(
@@ -302,8 +311,15 @@ fn pending_restart_path() -> Option<std::path::PathBuf> {
     Some(base.join("pending-restart"))
 }
 
-fn session_start_response(file_count: u64, chunk_count: u64, stale: bool) -> Value {
-    let additional_context = if chunk_count == 0 {
+fn session_start_response(
+    file_count: u64,
+    chunk_count: u64,
+    stale: bool,
+    model_mismatch: bool,
+) -> Value {
+    let additional_context = if model_mismatch {
+        "claudix: embedding model mismatch — run `claudix clear && claudix index` to rebuild with the active model".to_owned()
+    } else if chunk_count == 0 {
         "claudix semantic search available — index empty, run /claudix:index to build it".to_owned()
     } else if stale {
         format!(
