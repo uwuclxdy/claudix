@@ -56,6 +56,8 @@ pub struct PartialSearchConfig {
     pub identifier_boost: Option<f32>,
     #[serde(default)]
     pub similarity_threshold: Option<f32>,
+    #[serde(default)]
+    pub min_score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -130,6 +132,7 @@ impl PartialSearchConfig {
             hybrid_weights: self.hybrid_weights.merge(other.hybrid_weights),
             identifier_boost: other.identifier_boost.or(self.identifier_boost),
             similarity_threshold: other.similarity_threshold.or(self.similarity_threshold),
+            min_score: other.min_score.or(self.min_score),
         }
     }
 }

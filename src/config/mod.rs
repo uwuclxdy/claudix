@@ -41,6 +41,7 @@ pub struct SearchConfig {
     pub hybrid_weights: HybridWeights,
     pub identifier_boost: f32,
     pub similarity_threshold: f32,
+    pub min_score: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +100,7 @@ impl Default for Config {
                 },
                 identifier_boost: 1.4,
                 similarity_threshold: 0.30,
+                min_score: 0.05,
             },
             hooks: HooksConfig {
                 intercept_grep: true,
@@ -297,6 +299,10 @@ impl Config {
                     .search
                     .similarity_threshold
                     .unwrap_or(defaults.search.similarity_threshold),
+                min_score: partial
+                    .search
+                    .min_score
+                    .unwrap_or(defaults.search.min_score),
             },
             hooks: HooksConfig {
                 intercept_grep: partial
@@ -342,6 +348,7 @@ endpoint = "http://localhost:1234"
 [search]
 top_k = 15
 hybrid_weights = { dense = 0.6, bm25 = 0.25, rrf = 0.15 }
+min_score = 0.45
 "#;
 
         let parsed: std::result::Result<PartialConfig, toml::de::Error> = toml::from_str(text);
@@ -378,6 +385,10 @@ hybrid_weights = { dense = 0.6, bm25 = 0.25, rrf = 0.15 }
                 .as_ref()
                 .and_then(|cfg| cfg.search.hybrid_weights.rrf),
             Some(0.15)
+        );
+        assert_eq!(
+            parsed.as_ref().and_then(|cfg| cfg.search.min_score),
+            Some(0.45)
         );
     }
 

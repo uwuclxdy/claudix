@@ -157,11 +157,9 @@ fn rank_rows(
             } else {
                 combined_score
             };
-            // Clamp to [0, 1]: identifier_boost can push combined_score above 1.0
-            // making scores non-comparable and non-intuitive for users.
             let boosted_score = boosted_score.clamp(0.0, 1.0);
 
-            if boosted_score <= 0.0 {
+            if boosted_score < config.min_score {
                 return None;
             }
 
@@ -590,6 +588,7 @@ mod tests {
             },
             identifier_boost: 1.4,
             similarity_threshold: 0.30,
+            min_score: 0.0,
         };
 
         let make_row = |name: &str, content: &str, vec: Vec<f32>| StoredChunk {
@@ -640,6 +639,53 @@ mod tests {
     }
 
     #[test]
+    fn rank_rows_filters_results_below_min_score() {
+        use crate::config::{HybridWeights, SearchConfig};
+        use crate::store::StoredChunk;
+
+        let config = SearchConfig {
+            top_k: 10,
+            hybrid_weights: HybridWeights {
+                dense: 0.55,
+                bm25: 0.30,
+                rrf: 0.15,
+            },
+            identifier_boost: 1.0,
+            similarity_threshold: 0.0,
+            min_score: 0.50,
+        };
+        let row = |name: &str, vector: Vec<f32>| StoredChunk {
+            chunk_id: 0,
+            file_path: format!("src/{name}.rs"),
+            language: "rust".into(),
+            kind: "function".into(),
+            name: Some(name.into()),
+            line_start: 1,
+            line_end: 5,
+            byte_start: 0,
+            byte_end: 100,
+            file_hash: [0u8; 16],
+            content: format!("pub fn {name}() {{}}"),
+            vector,
+        };
+        let rows = vec![
+            row("strong_match", vec![1.0, 0.0, 0.0, 0.0]),
+            row("weak_candidate", vec![0.0, 1.0, 0.0, 0.0]),
+        ];
+        let query = SearchQuery {
+            query: "strong".into(),
+            top_k: 10,
+            language_filter: None,
+            path_prefix: None,
+        };
+
+        let results = rank_rows(query, rows, vec![1.0, 0.0, 0.0, 0.0], config)
+            .expect("rank_rows must succeed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].chunk.name.as_deref(), Some("strong_match"));
+    }
+
+    #[test]
     fn rank_rows_returns_multiple_results_for_code_query() {
         use crate::config::{HybridWeights, SearchConfig};
         use crate::store::StoredChunk;
@@ -653,6 +699,7 @@ mod tests {
             },
             identifier_boost: 1.4,
             similarity_threshold: 0.30,
+            min_score: 0.0,
         };
 
         let make_row = |name: &str, content: &str, sim: f32| {

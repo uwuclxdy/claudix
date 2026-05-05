@@ -104,6 +104,13 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    if !(0.0..=1.0).contains(&config.search.min_score) {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "search.min_score must be between 0 and 1".into(),
+            recovery: RecoveryHint("Set [search].min_score to a value in [0, 1]"),
+        });
+    }
+
     if !config.search.identifier_boost.is_finite() || config.search.identifier_boost <= 0.0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "search.identifier_boost must be a finite positive number".into(),
