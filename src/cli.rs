@@ -12,7 +12,7 @@ use crate::search::SearchQuery;
 use crate::store::Store;
 use crate::types::{Language, RelativePath};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchHit {
     pub file_path: String,
     pub language: String,
@@ -20,11 +20,11 @@ pub struct SearchHit {
     pub name: Option<String>,
     pub line_start: u32,
     pub line_end: u32,
-    pub score: String,
+    pub score: f32,
     pub snippet: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchOutput {
     pub hits: Vec<SearchHit>,
 }
@@ -285,7 +285,7 @@ async fn run_search_with_claudix(
                 name: result.chunk.name,
                 line_start: result.chunk.line_range.start,
                 line_end: result.chunk.line_range.end,
-                score: format!("{:.3}", result.score),
+                score: result.score,
                 snippet: result.chunk.content,
             })
             .collect(),
