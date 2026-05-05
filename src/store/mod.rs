@@ -1,7 +1,11 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
 
 use arrow_array::types::Float32Type;
 use arrow_array::{
@@ -22,6 +26,8 @@ pub const SCHEMA_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const LOCK_FILE_NAME: &str = "index.lock";
 const LOCK_STALE_SECS: u64 = 7_200;
+const LOCK_TERMINATION_GRACE_MS: u64 = 2_000;
+const LOCK_TERMINATION_POLL_MS: u64 = 100;
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 const GITIGNORE_CONTENTS: &str = "*\n";
 const CHUNKS_TABLE_NAME: &str = "chunks";
@@ -140,23 +146,28 @@ impl Store {
         fs::create_dir_all(&self.paths.state_dir).ok()?;
         let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
 
-        // Atomic create — succeeds only when no lock file exists.
-        if let Ok(_file) = fs::File::create_new(&lock_path) {
+        if let Ok(mut file) = fs::File::create_new(&lock_path) {
+            writeln!(file, "{}", std::process::id()).ok()?;
             return Some(IndexLockGuard { path: lock_path });
         }
 
-        // Lock file exists — only remove it if it is stale.
         if self.full_index_running() {
             return None;
         }
         let _ = fs::remove_file(&lock_path);
-        fs::File::create_new(&lock_path)
-            .ok()
-            .map(|_| IndexLockGuard { path: lock_path })
+        if let Ok(mut file) = fs::File::create_new(&lock_path) {
+            writeln!(file, "{}", std::process::id()).ok()?;
+            return Some(IndexLockGuard { path: lock_path });
+        }
+        None
     }
 
     pub fn full_index_running(&self) -> bool {
         let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
+        if let Some(pid) = read_lock_pid(&lock_path) {
+            return process_running(pid);
+        }
+
         let Ok(metadata) = fs::metadata(&lock_path) else {
             return false;
         };
@@ -167,6 +178,25 @@ impl Store {
             return false;
         };
         age.as_secs() < LOCK_STALE_SECS
+    }
+
+    pub fn stop_index_lock_holder(&self) {
+        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
+        let Some(pid) = read_lock_pid(&lock_path) else {
+            let _ = fs::remove_file(lock_path);
+            return;
+        };
+
+        if pid == std::process::id() {
+            return;
+        }
+
+        terminate_process(pid);
+        wait_for_process_exit(pid, Duration::from_millis(LOCK_TERMINATION_GRACE_MS));
+        if process_running(pid) {
+            kill_process(pid);
+        }
+        let _ = fs::remove_file(lock_path);
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
@@ -348,6 +378,7 @@ impl Store {
     }
 
     pub async fn clear_chunks(&self, config: &Config) -> Result<()> {
+        self.stop_index_lock_holder();
         self.ensure_layout()?;
 
         let connection = self.open_connection().await?;
@@ -435,6 +466,70 @@ impl Store {
         }
         self.write_manifest(&manifest)
     }
+}
+
+fn read_lock_pid(lock_path: &Path) -> Option<u32> {
+    fs::read_to_string(lock_path).ok()?.trim().parse().ok()
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if !process_running(pid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(LOCK_TERMINATION_POLL_MS));
+    }
+}
+
+#[cfg(unix)]
+fn process_running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(unix)]
+fn kill_process(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(windows)]
+fn process_running(pid: u32) -> bool {
+    Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+        })
+}
+
+#[cfg(windows)]
+fn terminate_process(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string()])
+        .status();
+}
+
+#[cfg(windows)]
+fn kill_process(pid: u32) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F"])
+        .status();
 }
 
 impl StoredChunk {
@@ -1366,6 +1461,44 @@ mod tests {
         assert_eq!(manifest.file_count, 0);
         assert_eq!(manifest.embedding_model, config.embedding.model);
         assert_eq!(manifest.dimensions, config.embedding.dimensions);
+    }
+
+    #[tokio::test]
+    async fn clear_chunks_removes_stale_index_lock() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+
+        let store = Store::new(project_root.path(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+        assert!(store.ensure_layout().is_ok());
+
+        let lock_path = store.paths.state_dir.join(LOCK_FILE_NAME);
+        assert!(fs::write(&lock_path, "999999999\n").is_ok());
+
+        let cleared = store.clear_chunks(&config).await;
+        assert!(cleared.is_ok());
+        assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn acquire_index_lock_writes_current_pid() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+
+        let store = Store::new(project_root.path(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let lock = store.acquire_index_lock();
+        assert!(lock.is_some());
+
+        let lock_path = store.paths.state_dir.join(LOCK_FILE_NAME);
+        assert_eq!(read_lock_pid(&lock_path), Some(std::process::id()));
     }
 
     #[tokio::test]
