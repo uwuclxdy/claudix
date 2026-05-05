@@ -318,18 +318,20 @@ fn session_start_response(
     model_mismatch: bool,
 ) -> Value {
     let additional_context = if model_mismatch {
-        "claudix: embedding model mismatch — run `claudix clear && claudix index` to rebuild with the active model".to_owned()
+        "claudix semantic search unavailable — embedding model mismatch. Run `claudix clear && claudix index` to rebuild with the active model.".to_owned()
     } else if chunk_count == 0 {
-        "claudix semantic search available — index empty, run /claudix:index to build it".to_owned()
+        "claudix semantic search installed but index empty. Run /claudix:index before code exploration; until indexed, use Grep or Read.".to_owned()
     } else if stale {
         format!(
-            "claudix semantic search active — {file_count} files, {chunk_count} chunks indexed (index stale, reindexing in background). \
-             Use search_code MCP tool for conceptual queries and identifier lookups instead of Grep."
+            "claudix semantic search active — {file_count} files, {chunk_count} chunks indexed (index stale; reindexing in background). \
+             Prefer search_code for conceptual questions, identifier lookups, and cross-file code discovery. \
+             Use Grep for exact literals, regexes, or path-constrained scans."
         )
     } else {
         format!(
             "claudix semantic search active — {file_count} files, {chunk_count} chunks indexed. \
-             Use search_code MCP tool for conceptual queries and identifier lookups instead of Grep."
+             Prefer search_code for conceptual questions, identifier lookups, and cross-file code discovery. \
+             Use Grep for exact literals, regexes, or path-constrained scans."
         )
     };
     json!({
@@ -716,7 +718,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             model_context,
-            "claudix semantic search available — index empty, run /claudix:index to build it"
+            "claudix semantic search installed but index empty. Run /claudix:index before code exploration; until indexed, use Grep or Read."
         );
     }
 
@@ -734,6 +736,20 @@ mod tests {
             session_start_message(cli::SetupState::Ready, 42, 683, true),
             "claudix indexed 42 files, 683 chunks (indexing in background...)"
         );
+    }
+
+    #[test]
+    fn session_start_context_guides_tool_choice() {
+        let response = session_start_response(42, 683, false, false);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(context.contains("Prefer search_code"));
+        assert!(context.contains("conceptual questions"));
+        assert!(context.contains("identifier lookups"));
+        assert!(context.contains("cross-file code discovery"));
+        assert!(context.contains("Use Grep for exact literals"));
     }
 
     #[tokio::test]
