@@ -355,8 +355,7 @@ impl Store {
             connection.drop_table(CHUNKS_TABLE_NAME, &[]).await?;
         }
 
-        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
-        manifest.last_incremental_at = Some(now_rfc3339());
+        let manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
         self.write_manifest(&manifest)
     }
 
@@ -1563,6 +1562,10 @@ mod tests {
         assert!(
             manifest.last_full_index_at.is_none(),
             "clear must reset last_full_index_at so auto-reindex triggers on next session"
+        );
+        assert!(
+            manifest.last_incremental_at.is_none(),
+            "clear must reset last_incremental_at to avoid skipping files on next incremental run"
         );
         assert_eq!(manifest.chunk_count, 0);
         assert_eq!(manifest.file_count, 0);
