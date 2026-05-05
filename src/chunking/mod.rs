@@ -134,7 +134,11 @@ fn rust_chunk_kind(node: Node<'_>) -> Option<ChunkKind> {
             let has_body = node
                 .named_children(&mut node.walk())
                 .any(|child| child.kind() == "declaration_list");
-            if has_body { Some(ChunkKind::Module) } else { None }
+            if has_body {
+                Some(ChunkKind::Module)
+            } else {
+                None
+            }
         }
         "macro_definition" => Some(ChunkKind::Macro),
         _ => None,
@@ -596,7 +600,11 @@ mod tests {
             .iter()
             .filter(|c| c.kind == ChunkKind::Module)
             .collect();
-        assert_eq!(mod_chunks.len(), 1, "only the inline mod block should be indexed");
+        assert_eq!(
+            mod_chunks.len(),
+            1,
+            "only the inline mod block should be indexed"
+        );
         assert_eq!(mod_chunks[0].name.as_deref(), Some("inline"));
     }
 
@@ -625,7 +633,7 @@ mod tests {
 
     #[test]
     fn rust_chunker_marks_impl_functions_as_methods() {
-        let source = "pub struct Counter;\n\nimpl Counter {\n    pub fn new() -> Self {\n        Self\n    }\n}\n";
+        let source = "pub struct Counter;\n\nimpl Counter {\n    pub fn new() -> Self {\n        Self\n    }\n\n    pub fn increment(&mut self) {}\n}\n\nimpl Default for Counter {\n    fn default() -> Self {\n        Self::new()\n    }\n}\n";
         let chunker = MultiLanguageChunker::new();
 
         let chunks = chunker.chunk(
@@ -637,15 +645,21 @@ mod tests {
         assert!(chunks.is_ok());
         let chunks = chunks.ok().unwrap_or_else(|| unreachable!());
 
-        let method = chunks
+        let method_names = chunks
             .iter()
-            .find(|chunk| chunk.name.as_deref() == Some("new"));
-        assert!(method.is_some());
-        let method = method.unwrap_or_else(|| unreachable!());
-        assert_eq!(method.kind, ChunkKind::Method);
+            .filter(|chunk| chunk.kind == ChunkKind::Method)
+            .map(|chunk| chunk.name.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            method_names,
+            vec![Some("new"), Some("increment"), Some("default")]
+        );
 
-        let has_impl_chunk = chunks.iter().any(|chunk| chunk.kind == ChunkKind::Impl);
-        assert!(has_impl_chunk);
+        let impl_chunks = chunks
+            .iter()
+            .filter(|chunk| chunk.kind == ChunkKind::Impl)
+            .count();
+        assert_eq!(impl_chunks, 2);
     }
 
     #[test]
