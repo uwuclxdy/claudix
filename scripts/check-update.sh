@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs in the background from session-start.sh.
-# Checks GitHub releases once per day; installs via cargo --git if a newer
+# Checks GitHub releases once per day; installs via cargo if a newer
 # version exists; writes a pending-restart flag for the next SessionStart.
 set -uo pipefail
 
@@ -20,9 +20,7 @@ if [[ -f "$CHECK_CACHE" ]]; then
   (( age < 86400 )) && exit 0
 fi
 
-installed_ver="$(cargo install --list 2>/dev/null \
-  | grep -E '^claudix v' | head -1 \
-  | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo '')"
+installed_ver="$("$CARGO_BIN" -V 2>/dev/null | awk '{print $2}' || echo '')"
 [[ -n "$installed_ver" ]] || exit 0
 
 latest_ver="$(curl --fail --silent --max-time 10 \
@@ -35,8 +33,8 @@ latest_ver="$(curl --fail --silent --max-time 10 \
 mkdir -p "$CLAUDIX_DATA"
 touch "$CHECK_CACHE"
 
-[[ "$latest_ver" != "$installed_ver" ]] || exit 0
-
-if cargo install --git 'https://github.com/uwuclxdy/claudix' --tag "v${latest_ver}" --quiet 2>/dev/null; then
-  printf '%s\n' "$latest_ver" > "$PENDING_RESTART"
+if [[ "$latest_ver" != "$installed_ver" ]]; then
+  if cargo install "claudix@${latest_ver}" --quiet 2>/dev/null; then
+    printf '%s\n' "$latest_ver" > "$PENDING_RESTART"
+  fi
 fi
