@@ -66,6 +66,7 @@ pub struct PathsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    pub watch: bool,
     pub embedding: EmbeddingConfig,
     pub indexing: IndexingConfig,
     pub search: SearchConfig,
@@ -76,6 +77,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            watch: false,
             embedding: EmbeddingConfig {
                 provider: EmbeddingProvider::Bundled,
                 endpoint: String::new(),
@@ -227,6 +229,7 @@ impl Config {
         let defaults = Self::default();
 
         Self {
+            watch: partial.watch.unwrap_or(defaults.watch),
             embedding: EmbeddingConfig {
                 provider: partial
                     .embedding
@@ -341,6 +344,8 @@ mod tests {
     #[test]
     fn nested_toml_parses_into_partial_config() {
         let text = r#"
+watch = true
+
 [embedding]
 provider = "http"
 endpoint = "http://localhost:1234"
@@ -355,6 +360,7 @@ min_score = 0.45
         assert!(parsed.is_ok());
 
         let parsed = parsed.ok();
+        assert_eq!(parsed.as_ref().and_then(|cfg| cfg.watch), Some(true));
         assert_eq!(
             parsed
                 .as_ref()
@@ -395,6 +401,7 @@ min_score = 0.45
     #[test]
     fn merge_project_over_global() {
         let global = PartialConfig {
+            watch: Some(false),
             search: merge::PartialSearchConfig {
                 top_k: Some(5),
                 ..Default::default()
@@ -402,6 +409,7 @@ min_score = 0.45
             ..Default::default()
         };
         let project = PartialConfig {
+            watch: Some(true),
             search: merge::PartialSearchConfig {
                 top_k: Some(20),
                 ..Default::default()
@@ -410,6 +418,7 @@ min_score = 0.45
         };
 
         let merged = global.merge(project);
+        assert_eq!(merged.watch, Some(true));
         assert_eq!(merged.search.top_k, Some(20));
     }
 

@@ -146,6 +146,10 @@ impl Store {
         self.paths.state_dir.join("indexing-pending")
     }
 
+    pub fn state_dir_path(&self) -> &Path {
+        &self.paths.state_dir
+    }
+
     pub fn acquire_index_lock(&self) -> Option<IndexLockGuard> {
         fs::create_dir_all(&self.paths.state_dir).ok()?;
         let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);

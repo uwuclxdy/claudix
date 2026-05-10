@@ -3,6 +3,9 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+const WATCH_MARKER_FILE_NAME: &str = "watch.pid";
+const WATCH_MARKER_STALE_SECS: u64 = 43_200;
+
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -81,6 +84,42 @@ where
     spawn_detached_command(project_root, binary.as_os_str(), args)
 }
 
+fn spawn_background_watch(project_root: &Path, config: &Config) -> bool {
+    if !config.watch {
+        return false;
+    }
+    let Ok(store) = Store::new(project_root, config) else {
+        return false;
+    };
+    if store.ensure_layout().is_err() {
+        return false;
+    }
+    let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
+    if watch_marker_is_fresh(&marker_path) {
+        return false;
+    }
+
+    let spawned = spawn_detached_claudix(project_root, [OsStr::new("watch")]);
+    if spawned {
+        let _ = fs::write(marker_path, std::process::id().to_string());
+    }
+    spawned
+}
+
+fn watch_marker_is_fresh(marker_path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(marker_path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified) else {
+        return true;
+    };
+
+    age < Duration::from_secs(WATCH_MARKER_STALE_SECS)
+}
+
 #[cfg(unix)]
 fn spawn_detached_command<const N: usize, S>(
     project_root: &Path,
@@ -142,6 +181,11 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
     } else {
         false
     };
+    if let Some(ref config) = config
+        && is_git_repo(project_root)
+    {
+        let _ = spawn_background_watch(project_root, config);
+    }
 
     let manifest = config
         .as_ref()

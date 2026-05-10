@@ -1,8 +1,12 @@
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use tokio::fs;
+use tokio::sync::mpsc;
 
 use crate::Claudix;
 use crate::config::{self, validate_project_relative_path};
@@ -131,6 +135,47 @@ pub async fn run_status(project_root: impl AsRef<Path>) -> Result<StatusOutput> 
     status_from_store(&store, &config).await
 }
 
+pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
+    let project_root = canonical_project_root(project_root.as_ref())?;
+    let config = config::load(&project_root)?;
+    if !config.watch {
+        return Ok(());
+    }
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let mut watcher = RecommendedWatcher::new(
+        move |event| {
+            let _ = event_tx.send(event);
+        },
+        notify::Config::default(),
+    )
+    .map_err(|error| ClaudixError::Store(format!("file watcher failed: {error}")))?;
+    watcher
+        .watch(&project_root, RecursiveMode::Recursive)
+        .map_err(|error| ClaudixError::Store(format!("file watcher failed: {error}")))?;
+
+    let claudix = Claudix::new(project_root.clone(), Arc::new(config)).await?;
+    let mut pending = VecDeque::new();
+    loop {
+        tokio::select! {
+            event = event_rx.recv() => {
+                let Some(event) = event else {
+                    return Ok(());
+                };
+                queue_reindex_paths(&project_root, event, &mut pending);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)), if !pending.is_empty() => {
+                let paths = drain_unique_paths(&mut pending);
+                for path in paths {
+                    if let Err(error) = claudix.reindex_file(&path).await {
+                        tracing::warn!("claudix watch failed to reindex {}: {error}", path.display());
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub async fn run_reindex_file(
     project_root: impl AsRef<Path>,
     path: impl AsRef<Path>,
@@ -201,6 +246,45 @@ fn requires_clean_reindex(error: &ClaudixError) -> bool {
             | ClaudixError::EmbeddingModelMismatch { .. }
             | ClaudixError::DimensionMismatch { .. }
     )
+}
+
+fn queue_reindex_paths(
+    project_root: &Path,
+    event: notify::Result<notify::Event>,
+    pending: &mut VecDeque<PathBuf>,
+) {
+    let Ok(event) = event else {
+        return;
+    };
+    if !is_reindex_event(&event.kind) {
+        return;
+    }
+
+    pending.extend(event.paths.into_iter().filter_map(|path| {
+        let relative = path.strip_prefix(project_root).ok()?;
+        if relative.components().next().is_none() || relative.starts_with(Path::new(".claudix")) {
+            return None;
+        }
+        Some(relative.to_path_buf())
+    }));
+}
+
+fn is_reindex_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    )
+}
+
+fn drain_unique_paths(pending: &mut VecDeque<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    while let Some(path) = pending.pop_front() {
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput> {
@@ -500,6 +584,7 @@ fn default_global_config() -> &'static str {
     "\
 # Global claudix configuration — uncomment and edit as needed.
 # Project-level overrides go in .claude/claudix.toml (project wins).
+# watch = false                  # opt-in file watcher for saved files
 
 [embedding]
 # provider = \"bundled\"           # bundled | http
@@ -855,6 +940,40 @@ mod tests {
 
         assert_eq!(output.hits.len(), 1);
         assert_eq!(output.hits[0].file_path, "src/math.rs");
+    }
+
+    #[test]
+    fn queue_reindex_paths_ignores_internal_state_paths() {
+        let root = Path::new("/tmp/project");
+        let event = notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![root.join("src/lib.rs"), root.join(".claudix/manifest.json")],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        let mut pending = VecDeque::new();
+
+        queue_reindex_paths(root, Ok(event), &mut pending);
+
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec![PathBuf::from("src/lib.rs")]
+        );
+    }
+
+    #[test]
+    fn drain_unique_paths_deduplicates_in_order() {
+        let mut pending = VecDeque::from(vec![
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("src/lib.rs"),
+            PathBuf::from("src/main.rs"),
+        ]);
+
+        assert_eq!(
+            drain_unique_paths(&mut pending),
+            vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/main.rs")]
+        );
     }
 
     #[test]

@@ -44,6 +44,8 @@ enum Command {
         #[arg(help = "Path to the file, relative or absolute inside the project")]
         path: String,
     },
+    #[command(about = "Watch saved files and re-embed changed files when watch = true")]
+    Watch,
     #[command(about = "Drop the entire index dataset")]
     Clear,
     #[command(about = "Handle a Claude Code hook event (SessionStart | PostToolUse | PreToolUse)")]
@@ -162,6 +164,9 @@ async fn run() -> Result<()> {
                 "indexed {} files into {} chunks",
                 output.file_count, output.chunk_count
             );
+        }
+        Command::Watch => {
+            cli::run_watch(&project_root).await?;
         }
         Command::Clear => {
             let output = cli::run_clear_index(&project_root).await?;

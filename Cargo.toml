@@ -74,6 +74,7 @@ gix-hash = { version = "0.25.0", features = ["sha1"] }
 
 # File walking with gitignore support
 ignore = "0.4.25"
+notify = "8.2.0"
 
 # Path helpers
 dirs = "6.0.0"

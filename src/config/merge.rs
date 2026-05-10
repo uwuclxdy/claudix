@@ -5,6 +5,8 @@ use super::EmbeddingProvider;
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct PartialConfig {
     #[serde(default)]
+    pub watch: Option<bool>,
+    #[serde(default)]
     pub embedding: PartialEmbeddingConfig,
     #[serde(default)]
     pub indexing: PartialIndexingConfig,
@@ -91,6 +93,7 @@ pub struct PartialPathsConfig {
 impl PartialConfig {
     pub fn merge(self, other: Self) -> Self {
         Self {
+            watch: other.watch.or(self.watch),
             embedding: self.embedding.merge(other.embedding),
             indexing: self.indexing.merge(other.indexing),
             search: self.search.merge(other.search),
