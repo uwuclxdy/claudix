@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -50,17 +51,23 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     if store.full_index_running() {
         return false;
     }
-    let needs_index = store
-        .read_manifest()
-        .ok()
-        .flatten()
+    let manifest = store.read_manifest().ok().flatten();
+    let needs_index = manifest
         .as_ref()
         .map(|m| index_is_stale(m, config))
         .unwrap_or(true);
     if !needs_index {
         return false;
     }
-    spawn_detached_claudix(project_root, [OsStr::new("index")])
+    let spawned = spawn_detached_claudix(project_root, [OsStr::new("index")]);
+    if spawned {
+        let prior_ts = manifest
+            .as_ref()
+            .and_then(|m| m.last_full_index_at.as_deref())
+            .unwrap_or("none");
+        let _ = fs::write(store.pending_index_marker_path(), prior_ts);
+    }
+    spawned
 }
 
 fn spawn_detached_claudix<const N: usize, S>(project_root: &Path, args: [S; N]) -> bool
@@ -157,36 +164,19 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         indexed_chunk_count,
         index_stale,
         model_mismatch,
+        indexing,
     );
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
-        None => session_start_message(
-            cli::setup_state(project_root).await,
-            indexed_file_count,
-            indexed_chunk_count,
-            indexing,
-        ),
+        None => session_start_message(cli::setup_state(project_root).await),
     };
     response["systemMessage"] = Value::String(user_message);
     Ok(Some(response))
 }
 
-fn session_start_message(
-    setup_state: cli::SetupState,
-    indexed_file_count: u64,
-    indexed_chunk_count: u64,
-    indexing: bool,
-) -> String {
+fn session_start_message(setup_state: cli::SetupState) -> String {
     match setup_state {
-        cli::SetupState::Ready => {
-            if indexing {
-                format!(
-                    "claudix indexed {indexed_file_count} files, {indexed_chunk_count} chunks (indexing in background...)"
-                )
-            } else {
-                format!("claudix indexed {indexed_file_count} files, {indexed_chunk_count} chunks")
-            }
-        }
+        cli::SetupState::Ready => String::new(),
         cli::SetupState::Missing(parts) => format!(
             "claudix setup incomplete (missing {}); run the install script again",
             parts.join(", ")
@@ -198,7 +188,23 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
     let Some(tool_name) = payload.tool_name.as_deref() else {
         return Ok(None);
     };
+
+    let config = config::load(project_root).ok();
+
+    if let Some(ref cfg) = config {
+        if let Some(notification) = check_index_ready(project_root, cfg) {
+            return Ok(Some(notification));
+        }
+    }
+
     if !is_write_tool(tool_name) {
+        return Ok(None);
+    }
+
+    let Some(ref cfg) = config else {
+        return Ok(None);
+    };
+    if !cfg.hooks.auto_reembed_on_edit {
         return Ok(None);
     }
 
@@ -209,13 +215,51 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
         return Ok(None);
     };
 
-    let config = config::load(project_root)?;
-    if !config.hooks.auto_reembed_on_edit {
-        return Ok(None);
-    }
-
     spawn_background_reindex_file(project_root, &file_path);
     Ok(None)
+}
+
+fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
+    let store = Store::new(project_root, config).ok()?;
+    let marker_path = store.pending_index_marker_path();
+    let prior_ts = fs::read_to_string(&marker_path).ok()?;
+    let prior_ts = prior_ts.trim();
+
+    // Give the spawned process a few seconds to acquire its lock before declaring it done.
+    let marker_age = fs::metadata(&marker_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| SystemTime::now().duration_since(t).ok());
+    if marker_age.map_or(true, |age| age < Duration::from_secs(3)) {
+        return None;
+    }
+
+    if store.full_index_running() {
+        return None;
+    }
+
+    let _ = fs::remove_file(&marker_path);
+    let manifest = store.read_manifest().ok()??;
+    let current_ts = manifest.last_full_index_at.as_deref().unwrap_or("none");
+
+    let additional_context = if current_ts != prior_ts {
+        format!(
+            "claudix indexing complete — {} files, {} chunks. Semantic search is now ready: \
+             use search_code for conceptual queries, identifier lookups, and cross-file discovery.",
+            manifest.file_count, manifest.chunk_count
+        )
+    } else {
+        "claudix background indexing ended without updating the index — it may have failed. \
+         Run /claudix:doctor to diagnose."
+            .to_owned()
+    };
+
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PostToolUse",
+            "additionalContext": additional_context,
+        }
+    }))
 }
 
 fn is_write_tool(tool_name: &str) -> bool {
@@ -316,22 +360,29 @@ fn session_start_response(
     chunk_count: u64,
     stale: bool,
     model_mismatch: bool,
+    indexing_spawned: bool,
 ) -> Value {
     let additional_context = if model_mismatch {
-        "claudix semantic search unavailable — embedding model mismatch. Run `claudix clear && claudix index` to rebuild with the active model.".to_owned()
+        "claudix semantic search unavailable — embedding model mismatch. Run `claudix clear && claudix index` to rebuild.".to_owned()
     } else if chunk_count == 0 {
-        "claudix semantic search installed but index empty. Run /claudix:index before code exploration; until indexed, use Grep or Read.".to_owned()
+        "claudix is installed but the index is empty. Run /claudix:index to build it; until then use Grep or Read for code discovery.".to_owned()
+    } else if indexing_spawned {
+        format!(
+            "claudix semantic search ready — {file_count} files, {chunk_count} chunks (reindexing in background; you'll be notified when complete). \
+             Use search_code for fast semantic search: conceptual queries, identifier lookups, cross-file discovery. \
+             Use Grep for exact literals, regexes, or path-filtered scans."
+        )
     } else if stale {
         format!(
-            "claudix semantic search active — {file_count} files, {chunk_count} chunks indexed (index stale; reindexing in background). \
-             Prefer search_code for conceptual questions, identifier lookups, and cross-file code discovery. \
-             Use Grep for exact literals, regexes, or path-constrained scans."
+            "claudix semantic search ready — {file_count} files, {chunk_count} chunks (index stale). \
+             Use search_code for fast semantic search: conceptual queries, identifier lookups, cross-file discovery. \
+             Use Grep for exact literals, regexes, or path-filtered scans."
         )
     } else {
         format!(
-            "claudix semantic search active — {file_count} files, {chunk_count} chunks indexed. \
-             Prefer search_code for conceptual questions, identifier lookups, and cross-file code discovery. \
-             Use Grep for exact literals, regexes, or path-constrained scans."
+            "claudix semantic search ready — {file_count} files, {chunk_count} chunks. \
+             Use search_code for fast semantic search: conceptual queries, identifier lookups, cross-file discovery. \
+             Use Grep for exact literals, regexes, or path-filtered scans."
         )
     };
     json!({
@@ -718,37 +769,31 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             model_context,
-            "claudix semantic search installed but index empty. Run /claudix:index before code exploration; until indexed, use Grep or Read."
+            "claudix is installed but the index is empty. Run /claudix:index to build it; until then use Grep or Read for code discovery."
         );
     }
 
     #[test]
     fn session_start_message_reports_ready_setup() {
+        assert_eq!(session_start_message(cli::SetupState::Ready), "");
         assert_eq!(
-            session_start_message(cli::SetupState::Ready, 0, 0, false),
-            "claudix indexed 0 files, 0 chunks"
-        );
-        assert_eq!(
-            session_start_message(cli::SetupState::Ready, 42, 683, false),
-            "claudix indexed 42 files, 683 chunks"
-        );
-        assert_eq!(
-            session_start_message(cli::SetupState::Ready, 42, 683, true),
-            "claudix indexed 42 files, 683 chunks (indexing in background...)"
+            session_start_message(cli::SetupState::Missing(vec!["bin"])),
+            "claudix setup incomplete (missing bin); run the install script again"
         );
     }
 
     #[test]
     fn session_start_context_guides_tool_choice() {
-        let response = session_start_response(42, 683, false, false);
+        let response = session_start_response(42, 683, false, false, false);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
 
-        assert!(context.contains("Prefer search_code"));
-        assert!(context.contains("conceptual questions"));
+        assert!(context.contains("Use search_code"));
+        assert!(context.contains("fast semantic search"));
+        assert!(context.contains("conceptual queries"));
         assert!(context.contains("identifier lookups"));
-        assert!(context.contains("cross-file code discovery"));
+        assert!(context.contains("cross-file discovery"));
         assert!(context.contains("Use Grep for exact literals"));
     }
 
