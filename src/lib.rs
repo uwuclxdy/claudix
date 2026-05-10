@@ -25,7 +25,8 @@ use chunking::{Chunker, MultiLanguageChunker};
 use config::{Config, EmbeddingProvider};
 #[cfg(any(test, feature = "test-stub"))]
 use embedding::StubProvider;
-use embedding::{BundledProvider, HttpProvider, Provider};
+use embedding::bundled::{BUNDLED_DIMENSIONS, BUNDLED_MODEL_ID};
+use embedding::{BundledProvider, FallbackProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator};
 use error::RecoveryHint;
 use search::{SearchQuery, SearchResult, Searcher};
@@ -281,13 +282,23 @@ async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
         EmbeddingProvider::Bundled => Ok(Arc::new(
             BundledProvider::new(config.embedding.model.clone(), dimensions).await?,
         ) as Arc<dyn Provider>),
-        EmbeddingProvider::Http => Ok(Arc::new(HttpProvider::new(
-            config.embedding.endpoint.clone(),
-            config.embedding.model.clone(),
-            dimensions,
-            Duration::from_millis(config.embedding.timeout_ms),
-            None,
-        )?) as Arc<dyn Provider>),
+        EmbeddingProvider::Http => {
+            let primary = Arc::new(HttpProvider::new(
+                config.embedding.endpoint.clone(),
+                config.embedding.model.clone(),
+                dimensions,
+                Duration::from_millis(config.embedding.timeout_ms),
+                None,
+            )?) as Arc<dyn Provider>;
+            if config.embedding.model == BUNDLED_MODEL_ID && dimensions == BUNDLED_DIMENSIONS {
+                let fallback = Arc::new(
+                    BundledProvider::new(config.embedding.model.clone(), dimensions).await?,
+                ) as Arc<dyn Provider>;
+                Ok(Arc::new(FallbackProvider::new(primary, fallback)) as Arc<dyn Provider>)
+            } else {
+                Ok(primary)
+            }
+        }
     }
 }
 
