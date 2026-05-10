@@ -6,16 +6,9 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-REPO="${CLAUDIX_INSTALL_REPO:-https://github.com/uwuclxdy/claudix}"
+REPO="${CLAUDIX_INSTALL_REPO:-}"
 
-case "$REPO" in
-  ./*|../*|/*)
-    cargo install --path "$REPO"
-    ;;
-  *)
-    cargo install --git "$REPO"
-    ;;
-esac
+cargo install claudix
 
 if command -v claude >/dev/null 2>&1; then
   claude plugin uninstall claudix@claudix || true

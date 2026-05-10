@@ -13,12 +13,7 @@ if "%CLAUDIX_INSTALL_REPO%"=="" (
     set REPO=%CLAUDIX_INSTALL_REPO%
 )
 
-if exist "%REPO%\Cargo.toml" (
-    cargo install --path "%REPO%"
-) else (
-    cargo install --git %REPO%
-)
-if errorlevel 1 exit /b 1
+cargo install claudix
 
 where claude >nul 2>&1
 if errorlevel 1 (

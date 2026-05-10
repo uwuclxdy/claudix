@@ -38,7 +38,7 @@ irm https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.bat | iex
 ### Manual
 
 ```bash
-cargo install --git https://github.com/uwuclxdy/claudix
+cargo install claudix
 ```
 
 Then register the plugin:
