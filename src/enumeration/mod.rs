@@ -131,7 +131,7 @@ fn language_for_path(path: &Path) -> Language {
     Language::from_extension(extension)
 }
 
-fn hash_bytes(bytes: &[u8]) -> FileHash {
+pub(crate) fn hash_bytes(bytes: &[u8]) -> FileHash {
     let digest = xxhash_rust::xxh3::xxh3_128(bytes);
     FileHash(digest.to_be_bytes())
 }

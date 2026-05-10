@@ -191,10 +191,10 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
 
     let config = config::load(project_root).ok();
 
-    if let Some(ref cfg) = config {
-        if let Some(notification) = check_index_ready(project_root, cfg) {
-            return Ok(Some(notification));
-        }
+    if let Some(ref cfg) = config
+        && let Some(notification) = check_index_ready(project_root, cfg)
+    {
+        return Ok(Some(notification));
     }
 
     if !is_write_tool(tool_name) {
@@ -230,7 +230,7 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
         .ok()
         .and_then(|m| m.modified().ok())
         .and_then(|t| SystemTime::now().duration_since(t).ok());
-    if marker_age.map_or(true, |age| age < Duration::from_secs(3)) {
+    if marker_age.is_none_or(|age| age < Duration::from_secs(3)) {
         return None;
     }
 
@@ -405,14 +405,20 @@ fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchR
             .as_deref()
             .map(|n| format!(" {n}"))
             .unwrap_or_default();
+        let stale_warning = if result.stale {
+            " [STALE - file modified since index]"
+        } else {
+            ""
+        };
         lines.push(format!(
-            "{}:{}-{} [{}] {}{name_part} ({:.3})",
+            "{}:{}-{} [{}] {}{name_part} ({:.3}){}",
             chunk.file_path,
             chunk.line_range.start,
             chunk.line_range.end,
             chunk.language,
             chunk.kind,
             result.score,
+            stale_warning,
         ));
         if !chunk.content.is_empty() {
             lines.push(truncate_snippet(&chunk.content, 20));
@@ -1117,6 +1123,13 @@ mod tests {
                 .await
                 .is_ok()
         );
+        assert!(
+            std::fs::write(
+                fixture.root().join("src/math.rs"),
+                "pub fn subtract(left: i32, right: i32) -> i32 { left - right }\n",
+            )
+            .is_ok()
+        );
 
         let payload = json!({
             "tool_name": "Grep",
@@ -1142,6 +1155,10 @@ mod tests {
         assert!(
             context.contains("src/"),
             "context must include file paths from search results"
+        );
+        assert!(
+            context.contains("[STALE - file modified since index]"),
+            "context must warn about stale hits, got: {context}"
         );
         assert!(
             context.contains("search_code MCP tool"),

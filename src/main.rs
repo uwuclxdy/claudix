@@ -114,25 +114,28 @@ async fn run() -> Result<()> {
             .await?;
 
             for hit in output.hits {
+                let stale_warning = stale_warning(hit.stale);
                 match hit.name {
                     Some(name) => println!(
-                        "{}:{}-{} [{}] {} {} {}",
+                        "{}:{}-{} [{}] {} {} {}{}",
                         hit.file_path,
                         hit.line_start,
                         hit.line_end,
                         hit.language,
                         hit.kind,
                         name,
-                        hit.score
+                        hit.score,
+                        stale_warning
                     ),
                     None => println!(
-                        "{}:{}-{} [{}] {} {}",
+                        "{}:{}-{} [{}] {} {}{}",
                         hit.file_path,
                         hit.line_start,
                         hit.line_end,
                         hit.language,
                         hit.kind,
-                        hit.score
+                        hit.score,
+                        stale_warning
                     ),
                 }
             }
@@ -211,6 +214,14 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn stale_warning(stale: bool) -> &'static str {
+    if stale {
+        " [STALE - file modified since index]"
+    } else {
+        ""
+    }
 }
 
 fn print_index_stats(

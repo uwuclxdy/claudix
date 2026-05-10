@@ -161,6 +161,7 @@ impl Claudix {
 
     pub async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
         let searcher = Searcher::new(
+            self.project_root.clone(),
             self.store.clone(),
             Arc::clone(&self.embedder),
             self.config.search.clone(),

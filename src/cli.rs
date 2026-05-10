@@ -21,6 +21,7 @@ pub struct SearchHit {
     pub line_start: u32,
     pub line_end: u32,
     pub score: f32,
+    pub stale: bool,
     pub snippet: String,
 }
 
@@ -286,6 +287,7 @@ async fn run_search_with_claudix(
                 line_start: result.chunk.line_range.start,
                 line_end: result.chunk.line_range.end,
                 score: result.score,
+                stale: result.stale,
                 snippet: result.chunk.content,
             })
             .collect(),

@@ -1,12 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use tokio::task;
+use tokio::{fs, task};
 
 use crate::config::SearchConfig;
 use crate::embedding::Provider;
-use crate::error::{ClaudixError, Result};
+use crate::enumeration::hash_bytes;
+use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::store::{Store, StoredChunk};
 use crate::types::{
     ByteRange, Chunk, ChunkId, ChunkKind, Dimension, FileHash, Language, LineRange, RelativePath,
@@ -25,18 +27,26 @@ pub struct SearchQuery {
 pub struct SearchResult {
     pub chunk: Chunk,
     pub score: f32,
+    pub stale: bool,
 }
 
 #[derive(Clone)]
 pub struct Searcher {
+    project_root: PathBuf,
     store: Store,
     embedder: Arc<dyn Provider>,
     config: SearchConfig,
 }
 
 impl Searcher {
-    pub fn new(store: Store, embedder: Arc<dyn Provider>, config: SearchConfig) -> Self {
+    pub fn new(
+        project_root: PathBuf,
+        store: Store,
+        embedder: Arc<dyn Provider>,
+        config: SearchConfig,
+    ) -> Self {
         Self {
+            project_root,
             store,
             embedder,
             config,
@@ -76,10 +86,14 @@ impl Searcher {
         let query_vector = vectors.into_iter().next().unwrap_or_default();
         validate_query_vector(&query_vector, self.embedder.dimensions())?;
         let config = self.config.clone();
+        let project_root = self.project_root.clone();
 
-        task::spawn_blocking(move || rank_rows(query, rows, query_vector, config))
-            .await
-            .map_err(|error| ClaudixError::Store(format!("search task failed: {error}")))?
+        let mut results =
+            task::spawn_blocking(move || rank_rows(query, rows, query_vector, config))
+                .await
+                .map_err(|error| ClaudixError::Store(format!("search task failed: {error}")))??;
+        mark_stale_results(&project_root, &mut results).await?;
+        Ok(results)
     }
 }
 
@@ -166,6 +180,7 @@ fn rank_rows(
             Some(SearchResult {
                 chunk: stored_chunk_to_chunk(row),
                 score: boosted_score,
+                stale: false,
             })
         })
         .collect::<Vec<_>>();
@@ -180,6 +195,40 @@ fn effective_top_k(requested: usize, default_top_k: usize) -> usize {
     } else {
         requested
     }
+}
+
+async fn mark_stale_results(project_root: &Path, results: &mut [SearchResult]) -> Result<()> {
+    for result in results {
+        result.stale = result_is_stale(project_root, &result.chunk).await?;
+    }
+
+    Ok(())
+}
+
+async fn result_is_stale(project_root: &Path, chunk: &Chunk) -> Result<bool> {
+    let path = resolve_chunk_path(project_root, &chunk.file_path)?;
+    let Ok(contents) = fs::read(path).await else {
+        return Ok(true);
+    };
+
+    Ok(hash_bytes(&contents) != chunk.file_hash)
+}
+
+fn resolve_chunk_path(project_root: &Path, relative_path: &RelativePath) -> Result<PathBuf> {
+    let path = relative_path.to_path_buf();
+    for component in path.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(ClaudixError::PathTraversal {
+                path,
+                recovery: RecoveryHint("Only read search result files inside $CLAUDE_PROJECT_DIR"),
+            });
+        }
+    }
+
+    Ok(project_root.join(path))
 }
 
 fn validate_query_vector(vector: &[f32], dimensions: Dimension) -> Result<()> {
@@ -777,8 +826,13 @@ mod tests {
         index_fixture(&store, embedder.as_ref(), fixture.root(), &config).await?;
 
         Ok(SearchHarness {
+            searcher: Searcher::new(
+                fixture.root().to_path_buf(),
+                store,
+                embedder,
+                config.search.clone(),
+            ),
             _fixture: fixture,
-            searcher: Searcher::new(store, embedder, config.search.clone()),
         })
     }
 
@@ -791,7 +845,12 @@ mod tests {
             dimension: Dimension(384),
             vectors: vec![vec![f32::NAN; 384]],
         });
-        let searcher = Searcher::new(harness.searcher.store, embedder, harness.searcher.config);
+        let searcher = Searcher::new(
+            harness.searcher.project_root,
+            harness.searcher.store,
+            embedder,
+            harness.searcher.config,
+        );
 
         let error = searcher
             .search_all(SearchQuery {
@@ -828,6 +887,64 @@ mod tests {
         assert!(!results.is_empty());
         assert_eq!(results[0].chunk.name.as_deref(), Some("add"));
         assert_eq!(results[0].chunk.file_path.as_str(), "src/math.rs");
+        assert!(!results[0].stale);
+    }
+
+    #[tokio::test]
+    async fn search_marks_modified_source_file_stale() {
+        let harness = search_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            tokio::fs::write(
+                harness.searcher.project_root.join("src/math.rs"),
+                "pub fn subtract(left: i32, right: i32) -> i32 { left - right }\n",
+            )
+            .await
+            .is_ok()
+        );
+
+        let results = harness
+            .searcher
+            .search(SearchQuery {
+                query: "add".to_owned(),
+                top_k: 10,
+                language_filter: None,
+                path_prefix: None,
+            })
+            .await;
+        assert!(results.is_ok());
+        let results = results.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(!results.is_empty());
+        assert!(results[0].stale);
+    }
+
+    #[tokio::test]
+    async fn search_marks_missing_source_file_stale() {
+        let harness = search_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            tokio::fs::remove_file(harness.searcher.project_root.join("src/math.rs"))
+                .await
+                .is_ok()
+        );
+
+        let results = harness
+            .searcher
+            .search(SearchQuery {
+                query: "add".to_owned(),
+                top_k: 10,
+                language_filter: None,
+                path_prefix: None,
+            })
+            .await;
+        assert!(results.is_ok());
+        let results = results.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(!results.is_empty());
+        assert!(results[0].stale);
     }
 
     #[tokio::test]
