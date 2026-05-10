@@ -487,15 +487,16 @@ mod tests {
     }
 
     #[test]
-    fn reindex_request_defaults_force_to_false() {
-        let request: ReindexRequest = serde_json::from_str("{}").expect("valid empty object");
+    fn reindex_request_defaults_force_to_false() -> serde_json::Result<()> {
+        let request: ReindexRequest = serde_json::from_str("{}")?;
         assert!(!request.force);
+        Ok(())
     }
 
     #[test]
-    fn reindex_request_parses_force_true() {
-        let request: ReindexRequest =
-            serde_json::from_str(r#"{"force":true}"#).expect("valid force flag");
+    fn reindex_request_parses_force_true() -> serde_json::Result<()> {
+        let request: ReindexRequest = serde_json::from_str(r#"{"force":true}"#)?;
         assert!(request.force);
+        Ok(())
     }
 }

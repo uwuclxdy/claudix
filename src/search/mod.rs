@@ -624,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn rank_rows_handles_dominant_dense_with_bm25_hits() {
+    fn rank_rows_handles_dominant_dense_with_bm25_hits() -> Result<()> {
         use crate::config::{HybridWeights, SearchConfig};
         use crate::store::StoredChunk;
 
@@ -678,17 +678,18 @@ mod tests {
             path_prefix: None,
         };
 
-        let results = rank_rows(query, rows, query_vector, config).expect("rank_rows must succeed");
+        let results = rank_rows(query, rows, query_vector, config)?;
         assert_eq!(results.len(), 2, "both chunks should pass the filter");
         assert_eq!(
             results[0].chunk.name.as_deref(),
             Some("handle_session_start"),
             "identifier_boost should lift handle_session_start above new()"
         );
+        Ok(())
     }
 
     #[test]
-    fn rank_rows_filters_results_below_min_score() {
+    fn rank_rows_filters_results_below_min_score() -> Result<()> {
         use crate::config::{HybridWeights, SearchConfig};
         use crate::store::StoredChunk;
 
@@ -728,14 +729,14 @@ mod tests {
             path_prefix: None,
         };
 
-        let results = rank_rows(query, rows, vec![1.0, 0.0, 0.0, 0.0], config)
-            .expect("rank_rows must succeed");
+        let results = rank_rows(query, rows, vec![1.0, 0.0, 0.0, 0.0], config)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.name.as_deref(), Some("strong_match"));
+        Ok(())
     }
 
     #[test]
-    fn rank_rows_returns_multiple_results_for_code_query() {
+    fn rank_rows_returns_multiple_results_for_code_query() -> Result<()> {
         use crate::config::{HybridWeights, SearchConfig};
         use crate::store::StoredChunk;
 
@@ -795,7 +796,7 @@ mod tests {
             path_prefix: None,
         };
 
-        let results = rank_rows(query, rows, query_vector, config).expect("rank_rows must succeed");
+        let results = rank_rows(query, rows, query_vector, config)?;
         assert!(
             results.len() >= 2,
             "BM25 should match handle_session_start and others: got {} results",
@@ -807,6 +808,7 @@ mod tests {
             top_name, "new",
             "trivial new() should not rank first when BM25 matches exist"
         );
+        Ok(())
     }
 
     struct SearchHarness {

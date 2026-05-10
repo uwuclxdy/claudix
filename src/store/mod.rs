@@ -1565,12 +1565,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_chunks_returns_more_than_default_lancedb_limit() {
+    async fn read_chunks_returns_more_than_default_lancedb_limit() -> Result<()> {
         // Regression test: LanceDB Query::new() sets limit=Some(10) by default.
         // read_all_rows must override it or >10 chunks are silently truncated.
-        let project_root = tempdir().expect("tempdir");
+        let project_root = tempdir()?;
         let config = Config::default();
-        let store = Store::new(project_root.path(), &config).expect("store init");
+        let store = Store::new(project_root.path(), &config)?;
 
         let chunks: Vec<_> = (1u64..=15)
             .map(|i| {
@@ -1584,34 +1584,29 @@ mod tests {
             })
             .collect();
 
-        store
-            .replace_chunks(&chunks, &config)
-            .await
-            .expect("replace chunks");
+        store.replace_chunks(&chunks, &config).await?;
 
-        let rows = store.read_chunks().await.expect("read chunks");
+        let rows = store.read_chunks().await?;
         assert_eq!(
             rows.len(),
             15,
             "read_chunks must return all rows, not just the LanceDB default of 10"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn incremental_file_state_splits_changed_and_unchanged() {
-        let project_root = tempdir().expect("tempdir");
+    async fn incremental_file_state_splits_changed_and_unchanged() -> Result<()> {
+        let project_root = tempdir()?;
         let config = Config::default();
-        let store = Store::new(project_root.path(), &config).expect("store init");
+        let store = Store::new(project_root.path(), &config)?;
 
         // Seed: two files, file_hash = chunk_id byte repeated
         let initial = vec![
             sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
             sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
         ];
-        store
-            .replace_chunks(&initial, &config)
-            .await
-            .expect("replace chunks");
+        store.replace_chunks(&initial, &config).await?;
 
         // a.rs unchanged (same hash [1;16]), b.rs changed (new hash [9;16])
         let current_files = vec![
@@ -1619,10 +1614,7 @@ mod tests {
             ("src/b.rs".to_owned(), [9u8; 16]),
         ];
 
-        let (changed_paths, unchanged_rows) = store
-            .incremental_file_state(&current_files)
-            .await
-            .expect("incremental state");
+        let (changed_paths, unchanged_rows) = store.incremental_file_state(&current_files).await?;
 
         assert!(
             !changed_paths.contains("src/a.rs"),
@@ -1634,34 +1626,30 @@ mod tests {
         );
         assert_eq!(unchanged_rows.len(), 1);
         assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn incremental_file_state_drops_deleted_files() {
-        let project_root = tempdir().expect("tempdir");
+    async fn incremental_file_state_drops_deleted_files() -> Result<()> {
+        let project_root = tempdir()?;
         let config = Config::default();
-        let store = Store::new(project_root.path(), &config).expect("store init");
+        let store = Store::new(project_root.path(), &config)?;
 
         let initial = vec![
             sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
             sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
         ];
-        store
-            .replace_chunks(&initial, &config)
-            .await
-            .expect("replace chunks");
+        store.replace_chunks(&initial, &config).await?;
 
         // b.rs is not present in current_files (deleted)
         let current_files = vec![("src/a.rs".to_owned(), [1u8; 16])];
 
-        let (changed_paths, unchanged_rows) = store
-            .incremental_file_state(&current_files)
-            .await
-            .expect("incremental state");
+        let (changed_paths, unchanged_rows) = store.incremental_file_state(&current_files).await?;
 
         assert!(changed_paths.is_empty());
         assert_eq!(unchanged_rows.len(), 1);
         assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
+        Ok(())
     }
 
     #[tokio::test]

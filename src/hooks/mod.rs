@@ -887,8 +887,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_tool_use_triggers_reindex_for_notebook_edit() {
-        let fixture = TestFixture::new("small_rust").unwrap();
+    async fn post_tool_use_triggers_reindex_for_notebook_edit() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
         write_config(fixture.root(), &stub_config());
 
         let payload = json!({
@@ -897,12 +897,12 @@ mod tests {
                 "notebook_path": fixture.root().join("analysis.ipynb"),
             }
         });
-        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
-        assert!(response.is_ok());
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
         assert!(
-            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            response.is_none(),
             "NotebookEdit must trigger reindex and return None"
         );
+        Ok(())
     }
 
     #[tokio::test]

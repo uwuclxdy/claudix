@@ -511,24 +511,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_full_preserves_unchanged_file_chunks_on_second_run() {
-        let fixture = TestFixture::new("small_rust").expect("test fixture");
+    async fn index_full_preserves_unchanged_file_chunks_on_second_run() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
         let config = stub_config();
-        let claudix = test_claudix(fixture.root().to_path_buf(), config).expect("test claudix");
+        let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
 
-        claudix.index_full().await.expect("initial index");
+        claudix.index_full().await?;
 
         // Modify only src/lib.rs; src/math.rs is untouched.
         fs::write(
             fixture.root().join("src/lib.rs"),
             "pub mod math;\n\npub fn salute(name: &str) -> String { format!(\"hi {name}\") }\n",
         )
-        .await
-        .expect("write modification");
+        .await?;
 
-        claudix.index_full().await.expect("second index");
+        claudix.index_full().await?;
 
-        let rows = claudix.store.read_chunks().await.expect("read chunks");
+        let rows = claudix.store.read_chunks().await?;
         let names: BTreeSet<_> = rows.iter().filter_map(|r| r.name.clone()).collect();
 
         assert!(names.contains("salute"), "changed file must be re-embedded");
@@ -537,6 +536,7 @@ mod tests {
             names.contains("add"),
             "unchanged file chunks must be preserved"
         );
+        Ok(())
     }
 
     #[tokio::test]
