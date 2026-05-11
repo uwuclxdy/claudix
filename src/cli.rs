@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,13 +9,13 @@ use serde::Serialize;
 use tokio::fs;
 use tokio::sync::mpsc;
 
-use crate::Claudix;
 use crate::config::{self, validate_project_relative_path};
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::hooks::HookEvent;
 use crate::search::SearchQuery;
-use crate::store::Store;
+use crate::store::{IndexLockGuard, Store};
 use crate::types::{Language, RelativePath};
+use crate::{Claudix, IndexFileStatus, IndexProgress};
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchHit {
@@ -38,6 +39,41 @@ pub struct SearchOutput {
 pub struct IndexOutput {
     pub file_count: usize,
     pub chunk_count: usize,
+}
+
+pub struct StderrIndexProgress;
+
+impl IndexProgress for StderrIndexProgress {
+    fn start(&mut self, total_files: usize) -> Result<()> {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "indexing 0/{total_files} files")?;
+        Ok(())
+    }
+
+    fn file(
+        &mut self,
+        processed_files: usize,
+        total_files: usize,
+        path: &RelativePath,
+        status: IndexFileStatus,
+    ) -> Result<()> {
+        let status = match status {
+            IndexFileStatus::Indexed => "indexed",
+            IndexFileStatus::Verified => "verified",
+        };
+        let mut stderr = io::stderr().lock();
+        writeln!(
+            stderr,
+            "{status} {processed_files}/{total_files} {}",
+            path.as_str()
+        )?;
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        io::stderr().lock().flush()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -105,27 +141,57 @@ pub async fn run_search(
 }
 
 pub async fn run_index(project_root: impl AsRef<Path>) -> Result<IndexOutput> {
-    let project_root = canonical_project_root(project_root.as_ref())?;
-    require_git_repo(&project_root)?;
-    let config = config::load(&project_root)?;
-    let store = Store::new(&project_root, &config)?;
-    let _lock = store
-        .acquire_index_lock()
-        .ok_or_else(|| crate::error::ClaudixError::Store("index already running".to_owned()))?;
-    let claudix = match Claudix::new(project_root.clone(), Arc::new(config.clone())).await {
-        Ok(claudix) => claudix,
-        Err(error) if requires_clean_reindex(&error) => {
-            store.clear_chunks(&config).await?;
-            Claudix::new(project_root, Arc::new(config)).await?
-        }
-        Err(error) => return Err(error),
-    };
-    let stats = claudix.index_full().await?;
+    let session = IndexSession::new(project_root).await?;
+    let stats = session.claudix.index_full().await?;
 
     Ok(IndexOutput {
         file_count: stats.file_count,
         chunk_count: stats.chunk_count,
     })
+}
+
+pub async fn run_index_with_progress(project_root: impl AsRef<Path>) -> Result<IndexOutput> {
+    let session = IndexSession::new(project_root).await?;
+    let mut progress = StderrIndexProgress;
+    let stats = session
+        .claudix
+        .index_full_with_progress(&mut progress)
+        .await?;
+
+    Ok(IndexOutput {
+        file_count: stats.file_count,
+        chunk_count: stats.chunk_count,
+    })
+}
+
+struct IndexSession {
+    claudix: Claudix,
+    _lock: IndexLockGuard,
+}
+
+impl IndexSession {
+    async fn new(project_root: impl AsRef<Path>) -> Result<Self> {
+        let project_root = canonical_project_root(project_root.as_ref())?;
+        require_git_repo(&project_root)?;
+        let config = config::load(&project_root)?;
+        let store = Store::new(&project_root, &config)?;
+        let lock = store
+            .acquire_index_lock()
+            .ok_or_else(|| crate::error::ClaudixError::Store("index already running".to_owned()))?;
+        let claudix = match Claudix::new(project_root.clone(), Arc::new(config.clone())).await {
+            Ok(claudix) => claudix,
+            Err(error) if requires_clean_reindex(&error) => {
+                store.clear_chunks(&config).await?;
+                Claudix::new(project_root, Arc::new(config)).await?
+            }
+            Err(error) => return Err(error),
+        };
+
+        Ok(Self {
+            claudix,
+            _lock: lock,
+        })
+    }
 }
 
 pub async fn run_status(project_root: impl AsRef<Path>) -> Result<StatusOutput> {

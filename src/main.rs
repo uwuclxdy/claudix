@@ -22,6 +22,8 @@ enum Command {
     Index {
         #[arg(long, help = "Clear the index before re-indexing")]
         force: bool,
+        #[arg(long, help = "Show live indexing progress")]
+        progress: bool,
     },
     #[command(about = "Search indexed code semantically")]
     Search {
@@ -86,11 +88,15 @@ async fn run() -> Result<()> {
     let project_root = active_project_root()?;
 
     match cli.command {
-        Command::Index { force } => {
+        Command::Index { force, progress } => {
             if force {
                 cli::run_clear_index(&project_root).await?;
             }
-            let output = cli::run_index(&project_root).await?;
+            let output = if progress {
+                cli::run_index_with_progress(&project_root).await?
+            } else {
+                cli::run_index(&project_root).await?
+            };
             println!(
                 "indexed {} files into {} chunks",
                 output.file_count, output.chunk_count

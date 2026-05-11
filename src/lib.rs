@@ -46,6 +46,45 @@ pub struct IndexStats {
     pub chunk_count: usize,
 }
 
+pub enum IndexFileStatus {
+    Indexed,
+    Verified,
+}
+
+pub trait IndexProgress {
+    fn start(&mut self, total_files: usize) -> Result<()>;
+    fn file(
+        &mut self,
+        processed_files: usize,
+        total_files: usize,
+        path: &RelativePath,
+        status: IndexFileStatus,
+    ) -> Result<()>;
+    fn finish(&mut self) -> Result<()>;
+}
+
+pub struct NoopIndexProgress;
+
+impl IndexProgress for NoopIndexProgress {
+    fn start(&mut self, _total_files: usize) -> Result<()> {
+        Ok(())
+    }
+
+    fn file(
+        &mut self,
+        _processed_files: usize,
+        _total_files: usize,
+        _path: &RelativePath,
+        _status: IndexFileStatus,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 impl Claudix {
     pub async fn new(project_root: PathBuf, config: Arc<Config>) -> Result<Self> {
         let embedder = build_provider(config.as_ref()).await?;
@@ -84,6 +123,14 @@ impl Claudix {
     }
 
     pub async fn index_full(&self) -> Result<IndexStats> {
+        let mut progress = NoopIndexProgress;
+        self.index_full_with_progress(&mut progress).await
+    }
+
+    pub async fn index_full_with_progress(
+        &self,
+        progress: &mut dyn IndexProgress,
+    ) -> Result<IndexStats> {
         let files = FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?
             .enumerate()?;
 
@@ -95,12 +142,9 @@ impl Claudix {
         let (changed_paths, unchanged_rows) =
             self.store.incremental_file_state(&current_files).await?;
 
-        let changed_files: Vec<_> = files
-            .into_iter()
-            .filter(|f| changed_paths.contains(f.relative_path.as_str()))
-            .collect();
-
-        let chunks = self.collect_chunks(&changed_files).await?;
+        let chunks = self
+            .collect_chunks(&files, &changed_paths, progress)
+            .await?;
         let embedded_chunks = self.embed_chunks(chunks).await?;
         let stats = self
             .store
@@ -174,13 +218,37 @@ impl Claudix {
         self.embedder.health_check().await
     }
 
-    async fn collect_chunks(&self, files: &[EnumeratedFile]) -> Result<Vec<Chunk>> {
+    async fn collect_chunks(
+        &self,
+        files: &[EnumeratedFile],
+        changed_paths: &std::collections::HashSet<String>,
+        progress: &mut dyn IndexProgress,
+    ) -> Result<Vec<Chunk>> {
         let mut chunks = Vec::new();
+        let total_files = files.len();
+        progress.start(total_files)?;
 
-        for file in files {
-            chunks.extend(self.collect_file_chunks(file).await?);
+        for (index, file) in files.iter().enumerate() {
+            let processed_files = index + 1;
+            if changed_paths.contains(file.relative_path.as_str()) {
+                chunks.extend(self.collect_file_chunks(file).await?);
+                progress.file(
+                    processed_files,
+                    total_files,
+                    &file.relative_path,
+                    IndexFileStatus::Indexed,
+                )?;
+            } else {
+                progress.file(
+                    processed_files,
+                    total_files,
+                    &file.relative_path,
+                    IndexFileStatus::Verified,
+                )?;
+            }
         }
 
+        progress.finish()?;
         Ok(chunks)
     }
 
