@@ -30,7 +30,7 @@ use embedding::{BundledProvider, FallbackProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator};
 use error::RecoveryHint;
 use search::{SearchQuery, SearchResult, Searcher};
-use store::Store;
+use store::{Store, stored_chunks_from_embedded};
 use tokio::{fs, task};
 
 pub struct Claudix {
@@ -49,38 +49,17 @@ pub struct IndexStats {
 pub enum IndexFileStatus {
     Indexed,
     Verified,
+    Skipped(&'static str),
 }
 
 pub trait IndexProgress {
-    fn start(&mut self, total_files: usize) -> Result<()>;
-    fn file(
-        &mut self,
-        processed_files: usize,
-        total_files: usize,
-        path: &RelativePath,
-        status: IndexFileStatus,
-    ) -> Result<()>;
-    fn finish(&mut self) -> Result<()>;
+    fn file(&mut self, path: &RelativePath, status: IndexFileStatus) -> Result<()>;
 }
 
 pub struct NoopIndexProgress;
 
 impl IndexProgress for NoopIndexProgress {
-    fn start(&mut self, _total_files: usize) -> Result<()> {
-        Ok(())
-    }
-
-    fn file(
-        &mut self,
-        _processed_files: usize,
-        _total_files: usize,
-        _path: &RelativePath,
-        _status: IndexFileStatus,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<()> {
+    fn file(&mut self, _path: &RelativePath, _status: IndexFileStatus) -> Result<()> {
         Ok(())
     }
 }
@@ -132,24 +111,45 @@ impl Claudix {
         progress: &mut dyn IndexProgress,
     ) -> Result<IndexStats> {
         let files = FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?
-            .enumerate()?;
+            .enumerate_with_progress(Some(progress))?;
 
         let current_files: Vec<(String, [u8; 16])> = files
             .iter()
             .map(|f| (f.relative_path.as_str().to_owned(), f.file_hash.0))
             .collect();
 
-        let (changed_paths, unchanged_rows) =
-            self.store.incremental_file_state(&current_files).await?;
-
-        let chunks = self
-            .collect_chunks(&files, &changed_paths, progress)
-            .await?;
-        let embedded_chunks = self.embed_chunks(chunks).await?;
-        let stats = self
+        let (changed_paths, unchanged_rows) = self
             .store
-            .persist_incremental(&embedded_chunks, unchanged_rows, self.config.as_ref())
+            .incremental_file_state_with_progress(&current_files, Some(progress))
             .await?;
+        let mut rows = unchanged_rows;
+
+        for file in files
+            .iter()
+            .filter(|file| changed_paths.contains(file.relative_path.as_str()))
+        {
+            let chunks = self.collect_file_chunks(file).await?;
+            if chunks.is_empty() {
+                progress.file(
+                    &file.relative_path,
+                    IndexFileStatus::Skipped("no indexable chunks"),
+                )?;
+                continue;
+            }
+
+            let embedded_chunks = self.embed_chunks(chunks).await?;
+            rows.retain(|row| row.file_path != file.relative_path.as_str());
+            rows.extend(stored_chunks_from_embedded(
+                &embedded_chunks,
+                Dimension(self.config.embedding.dimensions),
+            )?);
+            self.store
+                .persist_incremental(&[], rows.clone(), self.config.as_ref())
+                .await?;
+            progress.file(&file.relative_path, IndexFileStatus::Indexed)?;
+        }
+
+        let stats = self.store.chunk_stats().await?;
 
         Ok(IndexStats {
             file_count: stats.file_count,
@@ -216,40 +216,6 @@ impl Claudix {
 
     pub async fn embedder_health_check(&self) -> Result<()> {
         self.embedder.health_check().await
-    }
-
-    async fn collect_chunks(
-        &self,
-        files: &[EnumeratedFile],
-        changed_paths: &std::collections::HashSet<String>,
-        progress: &mut dyn IndexProgress,
-    ) -> Result<Vec<Chunk>> {
-        let mut chunks = Vec::new();
-        let total_files = files.len();
-        progress.start(total_files)?;
-
-        for (index, file) in files.iter().enumerate() {
-            let processed_files = index + 1;
-            if changed_paths.contains(file.relative_path.as_str()) {
-                chunks.extend(self.collect_file_chunks(file).await?);
-                progress.file(
-                    processed_files,
-                    total_files,
-                    &file.relative_path,
-                    IndexFileStatus::Indexed,
-                )?;
-            } else {
-                progress.file(
-                    processed_files,
-                    total_files,
-                    &file.relative_path,
-                    IndexFileStatus::Verified,
-                )?;
-            }
-        }
-
-        progress.finish()?;
-        Ok(chunks)
     }
 
     async fn collect_file_chunks(&self, file: &EnumeratedFile) -> Result<Vec<Chunk>> {

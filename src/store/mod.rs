@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::types::{Dimension, EmbeddedChunk, RelativePath};
 use crate::util::now_rfc3339;
+use crate::{IndexFileStatus, IndexProgress};
 
 pub const SCHEMA_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -277,21 +278,45 @@ impl Store {
         &self,
         current_files: &[(String, [u8; 16])],
     ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
+        self.incremental_file_state_with_progress(current_files, None)
+            .await
+    }
+
+    pub async fn incremental_file_state_with_progress(
+        &self,
+        current_files: &[(String, [u8; 16])],
+        mut progress: Option<&mut dyn IndexProgress>,
+    ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
         let stored_rows = self.read_chunks().await?;
 
         let mut stored_hash_by_path: HashMap<&str, [u8; 16]> = HashMap::new();
+        let mut stored_path_set: HashSet<&str> = HashSet::new();
         for row in &stored_rows {
             stored_hash_by_path
                 .entry(&row.file_path)
                 .or_insert(row.file_hash);
+            stored_path_set.insert(row.file_path.as_str());
         }
 
         let mut changed_paths: HashSet<String> = HashSet::new();
         for (path, hash) in current_files {
             match stored_hash_by_path.get(path.as_str()) {
-                Some(stored_hash) if stored_hash == hash => {}
+                Some(stored_hash) if stored_hash == hash => {
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress
+                            .file(&RelativePath::new(path.as_str()), IndexFileStatus::Verified)?;
+                    }
+                }
                 _ => {
                     changed_paths.insert(path.clone());
+                    if !stored_path_set.contains(path.as_str())
+                        && let Some(progress) = progress.as_deref_mut()
+                    {
+                        progress.file(
+                            &RelativePath::new(path.as_str()),
+                            IndexFileStatus::Skipped("not present in index"),
+                        )?;
+                    }
                 }
             }
         }
@@ -656,7 +681,7 @@ fn validate_vector(vector: &[f32], dimension: Dimension) -> Result<()> {
     Ok(())
 }
 
-fn stored_chunks_from_embedded(
+pub(crate) fn stored_chunks_from_embedded(
     chunks: &[EmbeddedChunk],
     dimension: Dimension,
 ) -> Result<Vec<StoredChunk>> {

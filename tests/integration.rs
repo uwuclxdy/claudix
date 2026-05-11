@@ -397,16 +397,61 @@ fn index_progress_writes_status_to_stderr() {
         "expected final summary on stdout, got: {stdout}"
     );
     assert!(
-        stderr.contains("indexing 0/") && stderr.contains(" files"),
-        "expected progress start on stderr, got: {stderr}"
+        stderr.contains("indexed src/lib.rs") && stderr.contains("indexed src/math.rs"),
+        "expected indexed files on stderr, got: {stderr}"
     );
     assert!(
-        stderr.contains("indexed ") && stderr.contains("src/lib.rs"),
-        "expected indexed file on stderr, got: {stderr}"
+        stderr.contains("skipped test-config.toml: no indexable chunks"),
+        "expected skipped reason on stderr, got: {stderr}"
     );
     assert!(
-        !stdout.contains("indexing 0/"),
+        !stdout.contains("indexed src/lib.rs"),
         "progress status leaked to stdout: {stdout}"
+    );
+}
+
+#[test]
+fn index_progress_reports_verified_files_after_reindex() {
+    use assert_cmd::cargo::cargo_bin;
+    use std::process::{Command, Stdio};
+
+    let fixture = TestFixture::new("small_rust");
+    assert!(fixture.is_ok(), "fixture setup failed");
+    let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+    let root = fixture.root();
+
+    let config_path = root.join("test-config.toml");
+    let write_cfg = std::fs::write(
+        &config_path,
+        "[embedding]\nmodel = \"stub-v1\"\ndimensions = 8\n",
+    );
+    assert!(write_cfg.is_ok(), "write test config failed");
+
+    let first = Command::new(cargo_bin("claudix"))
+        .current_dir(root)
+        .env("CLAUDE_PROJECT_DIR", root)
+        .env("CIRRUS_CONFIG", &config_path)
+        .arg("index")
+        .stdin(Stdio::null())
+        .status();
+    assert!(first.is_ok(), "failed to spawn claudix binary");
+    assert!(first.ok().unwrap_or_else(|| unreachable!()).success());
+
+    let output = Command::new(cargo_bin("claudix"))
+        .current_dir(root)
+        .env("CLAUDE_PROJECT_DIR", root)
+        .env("CIRRUS_CONFIG", &config_path)
+        .args(["index", "--progress"])
+        .stdin(Stdio::null())
+        .output();
+    assert!(output.is_ok(), "failed to spawn claudix binary");
+    let output = output.ok().unwrap_or_else(|| unreachable!());
+
+    assert!(output.status.success(), "reindex failed: {}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("verified src/lib.rs") && stderr.contains("verified src/math.rs"),
+        "expected verified files on stderr, got: {stderr}"
     );
 }
 
@@ -446,7 +491,7 @@ fn index_without_progress_does_not_write_status() {
         "expected final summary on stdout, got: {stdout}"
     );
     assert!(
-        !stderr.contains("indexing 0/"),
+        !stderr.contains("indexed src/lib.rs"),
         "unexpected progress status on stderr: {stderr}"
     );
 }

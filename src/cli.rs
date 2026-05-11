@@ -44,34 +44,16 @@ pub struct IndexOutput {
 pub struct StderrIndexProgress;
 
 impl IndexProgress for StderrIndexProgress {
-    fn start(&mut self, total_files: usize) -> Result<()> {
+    fn file(&mut self, path: &RelativePath, status: IndexFileStatus) -> Result<()> {
         let mut stderr = io::stderr().lock();
-        writeln!(stderr, "indexing 0/{total_files} files")?;
-        Ok(())
-    }
-
-    fn file(
-        &mut self,
-        processed_files: usize,
-        total_files: usize,
-        path: &RelativePath,
-        status: IndexFileStatus,
-    ) -> Result<()> {
-        let status = match status {
-            IndexFileStatus::Indexed => "indexed",
-            IndexFileStatus::Verified => "verified",
-        };
-        let mut stderr = io::stderr().lock();
-        writeln!(
-            stderr,
-            "{status} {processed_files}/{total_files} {}",
-            path.as_str()
-        )?;
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        io::stderr().lock().flush()?;
+        match status {
+            IndexFileStatus::Indexed => writeln!(stderr, "indexed {}", path.as_str())?,
+            IndexFileStatus::Verified => writeln!(stderr, "verified {}", path.as_str())?,
+            IndexFileStatus::Skipped(reason) => {
+                writeln!(stderr, "skipped {}: {reason}", path.as_str())?
+            }
+        }
+        stderr.flush()?;
         Ok(())
     }
 }

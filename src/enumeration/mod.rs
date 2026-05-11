@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::config::Config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::types::{FileHash, Language, RelativePath};
+use crate::{IndexFileStatus, IndexProgress};
 
 pub use filters::PathFilters;
 
@@ -35,6 +36,13 @@ impl FileEnumerator {
     }
 
     pub fn enumerate(&self) -> Result<Vec<EnumeratedFile>> {
+        self.enumerate_with_progress(None)
+    }
+
+    pub fn enumerate_with_progress(
+        &self,
+        mut progress: Option<&mut dyn IndexProgress>,
+    ) -> Result<Vec<EnumeratedFile>> {
         let repo = git::discover_repository(&self.project_root)?;
         let tracked_and_untracked = git::list_candidate_paths(&repo)?;
         let filters = PathFilters::load(&self.project_root)?;
@@ -42,12 +50,26 @@ impl FileEnumerator {
         let mut files = Vec::new();
         for relative_path in tracked_and_untracked {
             if !filters.is_included(&relative_path) {
+                if let Some(progress) = progress.as_deref_mut() {
+                    progress.file(
+                        &relative_path,
+                        IndexFileStatus::Skipped("excluded by index filters"),
+                    )?;
+                }
                 continue;
             }
 
             let force_indexed = filters.is_force_included(&relative_path);
-            if let Some(file) = self.enumerate_one(relative_path, force_indexed)? {
-                files.push(file);
+            match self.enumerate_one(relative_path.clone(), force_indexed)? {
+                Some(file) => files.push(file),
+                None => {
+                    if let Some(progress) = progress.as_deref_mut() {
+                        progress.file(
+                            &relative_path,
+                            IndexFileStatus::Skipped("not an indexable file"),
+                        )?;
+                    }
+                }
             }
         }
 
