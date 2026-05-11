@@ -88,7 +88,7 @@ impl FileEnumerator {
             }
             target_path
         } else {
-            if metadata.len() > self.max_file_size_bytes() {
+            if !metadata.is_file() || metadata.len() > self.max_file_size_bytes() {
                 return Ok(None);
             }
             absolute_path.clone()
@@ -355,6 +355,25 @@ mod tests {
             .collect();
 
         assert!(!paths.contains("src/link.rs"));
+    }
+
+    #[test]
+    fn directories_are_skipped() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let directory_path = fixture.root().join("src/directory.rs");
+        assert!(fs::create_dir_all(&directory_path).is_ok());
+
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), Config::default());
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let directory = RelativePath::new("src/directory.rs");
+        let file = enumerator.enumerate_one(directory, false);
+
+        assert!(file.is_ok());
+        assert!(file.ok().unwrap_or_else(|| unreachable!()).is_none());
     }
 
     #[test]
