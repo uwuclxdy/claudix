@@ -383,7 +383,18 @@ impl Store {
         sort_rows(&mut merged_rows);
 
         let stats = stats_from_rows(&merged_rows);
-        let file_hashes = file_hashes_from_rows(&merged_rows);
+        // Preserve no-chunk file hashes from the existing manifest so that files
+        // that produce no chunks but were tracked by a prior index_full are not
+        // forgotten by a per-file replace operation.
+        let base = self
+            .read_manifest()?
+            .map(|m| m.file_hashes)
+            .unwrap_or_default();
+        let mut file_hashes = base;
+        for path in &replacement_paths {
+            file_hashes.remove(path.as_str());
+        }
+        file_hashes.extend(file_hashes_from_rows(&merged_rows));
         self.persist_rows(merged_rows, dimension).await?;
         self.sync_manifest_with_timestamp(config, &stats, file_hashes, false)?;
         Ok(stats)
@@ -404,10 +415,29 @@ impl Store {
         sort_rows(&mut remaining_rows);
 
         let stats = stats_from_rows(&remaining_rows);
-        let file_hashes = file_hashes_from_rows(&remaining_rows);
+        let base = self
+            .read_manifest()?
+            .map(|m| m.file_hashes)
+            .unwrap_or_default();
+        let mut file_hashes = base;
+        file_hashes.remove(relative_path.as_str());
+        file_hashes.extend(file_hashes_from_rows(&remaining_rows));
         self.persist_rows(remaining_rows, dimension).await?;
         self.sync_manifest_with_timestamp(config, &stats, file_hashes, false)?;
         Ok(stats)
+    }
+
+    pub fn note_file_hash(
+        &self,
+        path: &RelativePath,
+        hash: [u8; 16],
+        config: &Config,
+    ) -> Result<()> {
+        let mut manifest = self
+            .read_manifest()?
+            .unwrap_or_else(|| Manifest::new(&config.embedding.model, config.embedding.dimensions));
+        manifest.file_hashes.insert(path.as_str().to_owned(), hash);
+        self.write_manifest(&manifest)
     }
 
     pub async fn clear_chunks(&self, config: &Config) -> Result<()> {
@@ -1725,6 +1755,105 @@ mod tests {
         assert!(changed_paths.is_empty());
         assert_eq!(unchanged_rows.len(), 1);
         assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn replace_file_chunks_preserves_no_chunk_hashes() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        // Record a no-chunk file hash directly in the manifest.
+        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        manifest
+            .file_hashes
+            .insert("src/empty.rs".to_owned(), [7u8; 16]);
+        store.write_manifest(&manifest)?;
+
+        // Now replace chunks for a different chunk-having file.
+        let chunks = vec![sample_chunk(
+            1,
+            "src/a.rs",
+            "fn_a",
+            "fn a() {}",
+            &[1.0; 384],
+        )];
+        store.replace_file_chunks(&chunks, &config).await?;
+
+        let saved = store.read_manifest()?.expect("manifest must exist");
+        assert_eq!(
+            saved.file_hashes.get("src/empty.rs").copied(),
+            Some([7u8; 16]),
+            "replace_file_chunks must not discard no-chunk file hashes"
+        );
+        assert!(saved.file_hashes.contains_key("src/a.rs"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_file_chunks_preserves_no_chunk_hashes() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        manifest
+            .file_hashes
+            .insert("src/empty.rs".to_owned(), [7u8; 16]);
+        store.write_manifest(&manifest)?;
+
+        let chunks = vec![
+            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
+            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
+        ];
+        store.replace_chunks(&chunks, &config).await?;
+        // Patch the manifest to include the no-chunk entry (replace_chunks doesn't merge).
+        let mut manifest = store.read_manifest()?.expect("manifest must exist");
+        manifest
+            .file_hashes
+            .insert("src/empty.rs".to_owned(), [7u8; 16]);
+        store.write_manifest(&manifest)?;
+
+        store
+            .delete_file_chunks(&RelativePath::new("src/b.rs"), &config)
+            .await?;
+
+        let saved = store.read_manifest()?.expect("manifest must exist");
+        assert_eq!(
+            saved.file_hashes.get("src/empty.rs").copied(),
+            Some([7u8; 16]),
+            "delete_file_chunks must not discard no-chunk file hashes"
+        );
+        assert!(!saved.file_hashes.contains_key("src/b.rs"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn note_file_hash_records_entry_without_touching_chunks() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        let chunks = vec![sample_chunk(
+            1,
+            "src/a.rs",
+            "fn_a",
+            "fn a() {}",
+            &[1.0; 384],
+        )];
+        store.replace_chunks(&chunks, &config).await?;
+
+        store.note_file_hash(&RelativePath::new("src/empty.rs"), [5u8; 16], &config)?;
+
+        let saved = store.read_manifest()?.expect("manifest must exist");
+        assert_eq!(
+            saved.file_hashes.get("src/empty.rs").copied(),
+            Some([5u8; 16])
+        );
+        // chunk count for a.rs must be unchanged
+        let rows = store.read_chunks().await?;
+        assert_eq!(rows.len(), 1);
         Ok(())
     }
 

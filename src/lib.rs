@@ -189,9 +189,15 @@ impl Claudix {
         let chunks = self.collect_file_chunks(&file).await?;
         let embedded_chunks = self.embed_chunks(chunks).await?;
         let stats = if embedded_chunks.is_empty() {
-            self.store
+            let stats = self
+                .store
                 .delete_file_chunks(&relative_path, self.config.as_ref())
-                .await?
+                .await?;
+            // File still exists but produces no chunks; record its hash so that
+            // subsequent calls don't re-process it until the content changes.
+            self.store
+                .note_file_hash(&relative_path, file.file_hash.0, self.config.as_ref())?;
+            stats
         } else {
             self.store
                 .replace_file_chunks(&embedded_chunks, self.config.as_ref())
@@ -588,6 +594,52 @@ mod tests {
         let stats = stats.ok().unwrap_or_else(|| unreachable!());
         // Chunk count unchanged — no re-embedding happened.
         assert_eq!(stats.chunk_count, 3);
+    }
+
+    #[tokio::test]
+    async fn reindex_file_records_hash_for_no_chunk_file() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        // Write a binary file that will produce no chunks.
+        fs::write(fixture.root().join("binary.bin"), [0xff, 0xfe, 0xfd]).await?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
+
+        claudix.index_full().await?;
+
+        // After index_full the binary file's hash is recorded.
+        let (hash_before, _) = claudix
+            .store
+            .stored_file_hash_and_stats(&RelativePath::new("binary.bin"))
+            .await?;
+        assert!(
+            hash_before.is_some(),
+            "hash must be stored for no-chunk file after index_full"
+        );
+
+        // Calling reindex_file on the same (unchanged) file must return immediately
+        // and not clear the stored hash.
+        let calls_before = {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let embedder: Arc<dyn Provider> = Arc::new(CountingProvider {
+                inner: StubProvider::with_model_id(
+                    claudix.config().embedding.model.clone(),
+                    Dimension(claudix.config().embedding.dimensions),
+                ),
+                calls: calls.clone(),
+            });
+            let c2 = test_claudix_with_embedder(
+                claudix.project_root().to_path_buf(),
+                claudix.config().clone(),
+                embedder,
+            )?;
+            c2.reindex_file(std::path::Path::new("binary.bin")).await?;
+            calls.load(Ordering::Relaxed)
+        };
+        assert_eq!(
+            calls_before, 0,
+            "unchanged no-chunk file must not trigger embedding"
+        );
+        Ok(())
     }
 
     #[tokio::test]
