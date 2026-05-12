@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -55,6 +55,8 @@ pub struct Manifest {
     pub last_incremental_at: Option<String>,
     pub chunk_count: u64,
     pub file_count: u64,
+    #[serde(default)]
+    pub file_hashes: BTreeMap<String, [u8; 16]>,
 }
 
 impl Manifest {
@@ -67,6 +69,7 @@ impl Manifest {
             last_incremental_at: None,
             chunk_count: 0,
             file_count: 0,
+            file_hashes: BTreeMap::new(),
         }
     }
 }
@@ -266,10 +269,8 @@ impl Store {
         relative_path: &RelativePath,
     ) -> Result<(Option<[u8; 16]>, StoreStats)> {
         let rows = self.read_chunks().await?;
-        let hash = rows
-            .iter()
-            .find(|row| row.file_path == relative_path.as_str())
-            .map(|row| row.file_hash);
+        let file_hashes = self.stored_file_hashes(&rows)?;
+        let hash = file_hashes.get(relative_path.as_str()).copied();
         let stats = stats_from_rows(&rows);
         Ok((hash, stats))
     }
@@ -288,19 +289,13 @@ impl Store {
         mut progress: Option<&mut dyn IndexProgress>,
     ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
         let stored_rows = self.read_chunks().await?;
-
-        let mut stored_hash_by_path: HashMap<&str, [u8; 16]> = HashMap::new();
-        let mut stored_path_set: HashSet<&str> = HashSet::new();
-        for row in &stored_rows {
-            stored_hash_by_path
-                .entry(&row.file_path)
-                .or_insert(row.file_hash);
-            stored_path_set.insert(row.file_path.as_str());
-        }
+        let stored_file_hashes = self.stored_file_hashes(&stored_rows)?;
+        let stored_path_set: HashSet<&str> =
+            stored_file_hashes.keys().map(String::as_str).collect();
 
         let mut changed_paths: HashSet<String> = HashSet::new();
         for (path, hash) in current_files {
-            match stored_hash_by_path.get(path.as_str()) {
+            match stored_file_hashes.get(path.as_str()) {
                 Some(stored_hash) if stored_hash == hash => {
                     if let Some(progress) = progress.as_deref_mut() {
                         progress
@@ -340,6 +335,7 @@ impl Store {
         new_chunks: &[EmbeddedChunk],
         unchanged_rows: Vec<StoredChunk>,
         config: &Config,
+        current_files: &[(String, [u8; 16])],
     ) -> Result<StoreStats> {
         let dimension = Dimension(config.embedding.dimensions);
         let new_rows = stored_chunks_from_embedded(new_chunks, dimension)?;
@@ -349,8 +345,9 @@ impl Store {
         sort_rows(&mut merged_rows);
 
         let stats = stats_from_rows(&merged_rows);
+        let file_hashes = current_files.iter().cloned().collect();
         self.persist_rows(merged_rows, dimension).await?;
-        self.sync_manifest(config, &stats)?;
+        self.sync_manifest(config, &stats, file_hashes)?;
         Ok(stats)
     }
 
@@ -362,8 +359,9 @@ impl Store {
         let dimension = Dimension(config.embedding.dimensions);
         let rows = stored_chunks_from_embedded(chunks, dimension)?;
         let stats = stats_from_rows(&rows);
+        let file_hashes = file_hashes_from_rows(&rows);
         self.persist_rows(rows, dimension).await?;
-        self.sync_manifest(config, &stats)?;
+        self.sync_manifest(config, &stats, file_hashes)?;
         Ok(stats)
     }
 
@@ -385,8 +383,9 @@ impl Store {
         sort_rows(&mut merged_rows);
 
         let stats = stats_from_rows(&merged_rows);
+        let file_hashes = file_hashes_from_rows(&merged_rows);
         self.persist_rows(merged_rows, dimension).await?;
-        self.sync_manifest_with_timestamp(config, &stats, false)?;
+        self.sync_manifest_with_timestamp(config, &stats, file_hashes, false)?;
         Ok(stats)
     }
 
@@ -405,8 +404,9 @@ impl Store {
         sort_rows(&mut remaining_rows);
 
         let stats = stats_from_rows(&remaining_rows);
+        let file_hashes = file_hashes_from_rows(&remaining_rows);
         self.persist_rows(remaining_rows, dimension).await?;
-        self.sync_manifest_with_timestamp(config, &stats, false)?;
+        self.sync_manifest_with_timestamp(config, &stats, file_hashes, false)?;
         Ok(stats)
     }
 
@@ -475,14 +475,20 @@ impl Store {
         Ok(table_names.iter().any(|name| name == CHUNKS_TABLE_NAME))
     }
 
-    fn sync_manifest(&self, config: &Config, stats: &StoreStats) -> Result<()> {
-        self.sync_manifest_with_timestamp(config, stats, true)
+    fn sync_manifest(
+        &self,
+        config: &Config,
+        stats: &StoreStats,
+        file_hashes: BTreeMap<String, [u8; 16]>,
+    ) -> Result<()> {
+        self.sync_manifest_with_timestamp(config, stats, file_hashes, true)
     }
 
     fn sync_manifest_with_timestamp(
         &self,
         config: &Config,
         stats: &StoreStats,
+        file_hashes: BTreeMap<String, [u8; 16]>,
         full_index: bool,
     ) -> Result<()> {
         let mut manifest = self
@@ -493,11 +499,27 @@ impl Store {
         manifest.dimensions = config.embedding.dimensions;
         manifest.chunk_count = u64::try_from(stats.chunk_count).unwrap_or(u64::MAX);
         manifest.file_count = u64::try_from(stats.file_count).unwrap_or(u64::MAX);
+        manifest.file_hashes = file_hashes;
         manifest.last_incremental_at = Some(timestamp.clone());
         if full_index {
             manifest.last_full_index_at = Some(timestamp);
         }
         self.write_manifest(&manifest)
+    }
+
+    fn stored_file_hashes(
+        &self,
+        stored_rows: &[StoredChunk],
+    ) -> Result<BTreeMap<String, [u8; 16]>> {
+        let Some(manifest) = self.read_manifest()? else {
+            return Ok(file_hashes_from_rows(stored_rows));
+        };
+
+        if manifest.file_hashes.is_empty() {
+            return Ok(file_hashes_from_rows(stored_rows));
+        }
+
+        Ok(manifest.file_hashes)
     }
 }
 
@@ -931,6 +953,12 @@ fn distinct_file_paths(rows: &[StoredChunk]) -> BTreeSet<String> {
     rows.iter().map(|row| row.file_path.clone()).collect()
 }
 
+fn file_hashes_from_rows(rows: &[StoredChunk]) -> BTreeMap<String, [u8; 16]> {
+    rows.iter()
+        .map(|row| (row.file_path.clone(), row.file_hash))
+        .collect()
+}
+
 fn stats_from_rows(rows: &[StoredChunk]) -> StoreStats {
     StoreStats {
         chunk_count: rows.len(),
@@ -997,6 +1025,7 @@ mod tests {
         assert_eq!(manifest.dimensions, 512);
         assert_eq!(manifest.chunk_count, 0);
         assert_eq!(manifest.file_count, 0);
+        assert!(manifest.file_hashes.is_empty());
         assert!(manifest.last_full_index_at.is_none());
         assert!(manifest.last_incremental_at.is_none());
     }
@@ -1561,6 +1590,7 @@ mod tests {
         assert_eq!(manifest.dimensions, 768);
         assert_eq!(manifest.chunk_count, 0);
         assert_eq!(manifest.file_count, 0);
+        assert!(manifest.file_hashes.is_empty());
     }
 
     #[tokio::test]
@@ -1651,6 +1681,27 @@ mod tests {
         );
         assert_eq!(unchanged_rows.len(), 1);
         assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_file_state_uses_manifest_hashes_without_chunks() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        manifest.file_count = 1;
+        manifest
+            .file_hashes
+            .insert("src/empty.rs".to_owned(), [7u8; 16]);
+        store.write_manifest(&manifest)?;
+
+        let current_files = vec![("src/empty.rs".to_owned(), [7u8; 16])];
+        let (changed_paths, unchanged_rows) = store.incremental_file_state(&current_files).await?;
+
+        assert!(changed_paths.is_empty());
+        assert!(unchanged_rows.is_empty());
         Ok(())
     }
 

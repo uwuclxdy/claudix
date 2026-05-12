@@ -143,13 +143,13 @@ impl Claudix {
                 &embedded_chunks,
                 Dimension(self.config.embedding.dimensions),
             )?);
-            self.store
-                .persist_incremental(&[], rows.clone(), self.config.as_ref())
-                .await?;
             progress.file(&file.relative_path, IndexFileStatus::Indexed)?;
         }
 
-        let stats = self.store.chunk_stats().await?;
+        let stats = self
+            .store
+            .persist_incremental(&[], rows, self.config.as_ref(), &current_files)
+            .await?;
 
         Ok(IndexStats {
             file_count: stats.file_count,
@@ -356,7 +356,9 @@ fn reject_relative_escape(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::embedding::StubProvider;
+    use async_trait::async_trait;
     use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     mod fixture {
         include!(concat!(
@@ -383,6 +385,50 @@ mod tests {
             config.embedding.model.clone(),
             Dimension(config.embedding.dimensions),
         ));
+
+        Ok(Claudix {
+            config: Arc::new(config),
+            project_root,
+            embedder,
+            store,
+        })
+    }
+
+    struct CountingProvider {
+        inner: StubProvider,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for CountingProvider {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn dimensions(&self) -> Dimension {
+            self.inner.dimensions()
+        }
+
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+
+        async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(batch.len(), Ordering::Relaxed);
+            self.inner.embed(batch).await
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            self.inner.health_check().await
+        }
+    }
+
+    fn test_claudix_with_embedder(
+        project_root: PathBuf,
+        config: Config,
+        embedder: Arc<dyn Provider>,
+    ) -> Result<Claudix> {
+        let store = Store::new(&project_root, &config)?;
 
         Ok(Claudix {
             config: Arc::new(config),
@@ -542,6 +588,30 @@ mod tests {
         let stats = stats.ok().unwrap_or_else(|| unreachable!());
         // Chunk count unchanged — no re-embedding happened.
         assert_eq!(stats.chunk_count, 3);
+    }
+
+    #[tokio::test]
+    async fn index_full_skips_unchanged_files_without_chunks() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        fs::write(fixture.root().join("src/empty.rs"), "pub mod child;\n").await?;
+        let config = stub_config();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Provider> = Arc::new(CountingProvider {
+            inner: StubProvider::with_model_id(
+                config.embedding.model.clone(),
+                Dimension(config.embedding.dimensions),
+            ),
+            calls: calls.clone(),
+        });
+        let claudix = test_claudix_with_embedder(fixture.root().to_path_buf(), config, embedder)?;
+
+        claudix.index_full().await?;
+        let first_call_count = calls.load(Ordering::Relaxed);
+
+        claudix.index_full().await?;
+
+        assert_eq!(calls.load(Ordering::Relaxed), first_call_count);
+        Ok(())
     }
 
     #[tokio::test]
