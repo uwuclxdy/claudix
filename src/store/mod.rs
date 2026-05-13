@@ -330,6 +330,46 @@ impl Store {
         Ok((changed_paths, unchanged_rows))
     }
 
+    /// Bump `last_full_index_at` without rewriting the LanceDB table when the
+    /// stored manifest already lists exactly `current_files` (same paths, same
+    /// hashes) under the active embedding model.
+    ///
+    /// Returns `Some(stats)` if the fast path applied; `None` if the caller
+    /// must fall through to [`Self::persist_incremental`].
+    pub fn touch_manifest_if_in_sync(
+        &self,
+        current_files: &[(String, [u8; 16])],
+        config: &Config,
+    ) -> Result<Option<StoreStats>> {
+        let Some(mut manifest) = self.read_manifest()? else {
+            return Ok(None);
+        };
+        if manifest.embedding_model != config.embedding.model
+            || manifest.dimensions != config.embedding.dimensions
+        {
+            return Ok(None);
+        }
+        if manifest.file_hashes.len() != current_files.len() {
+            return Ok(None);
+        }
+        for (path, hash) in current_files {
+            match manifest.file_hashes.get(path) {
+                Some(stored) if stored == hash => {}
+                _ => return Ok(None),
+            }
+        }
+
+        let stats = StoreStats {
+            chunk_count: usize::try_from(manifest.chunk_count).unwrap_or(usize::MAX),
+            file_count: usize::try_from(manifest.file_count).unwrap_or(usize::MAX),
+        };
+        let timestamp = now_rfc3339();
+        manifest.last_incremental_at = Some(timestamp.clone());
+        manifest.last_full_index_at = Some(timestamp);
+        self.write_manifest(&manifest)?;
+        Ok(Some(stats))
+    }
+
     pub async fn persist_incremental(
         &self,
         new_chunks: &[EmbeddedChunk],

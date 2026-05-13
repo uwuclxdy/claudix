@@ -122,6 +122,18 @@ impl Claudix {
             .store
             .incremental_file_state_with_progress(&current_files, Some(progress))
             .await?;
+
+        if changed_paths.is_empty()
+            && let Some(stats) = self
+                .store
+                .touch_manifest_if_in_sync(&current_files, self.config.as_ref())?
+        {
+            return Ok(IndexStats {
+                file_count: stats.file_count,
+                chunk_count: stats.chunk_count,
+            });
+        }
+
         let mut rows = unchanged_rows;
 
         for file in files
@@ -693,6 +705,64 @@ mod tests {
             "unchanged file chunks must be preserved"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn index_full_skips_lancedb_rewrite_when_nothing_changed() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
+
+        claudix.index_full().await?;
+
+        let chunks_dir = claudix
+            .store
+            .state_dir_path()
+            .join("index")
+            .join("chunks.lance");
+        let before = snapshot_dir(&chunks_dir);
+        assert!(
+            !before.is_empty(),
+            "first index_full should have written chunks.lance"
+        );
+
+        claudix.index_full().await?;
+
+        let after = snapshot_dir(&chunks_dir);
+        assert_eq!(
+            before, after,
+            "chunks.lance must not be rewritten when every file is verified as unchanged"
+        );
+
+        let manifest = claudix.store.read_manifest()?;
+        let manifest = manifest.unwrap_or_else(|| unreachable!());
+        assert!(
+            manifest.last_full_index_at.is_some(),
+            "verification run must still bump last_full_index_at"
+        );
+        Ok(())
+    }
+
+    fn snapshot_dir(dir: &Path) -> BTreeSet<(PathBuf, u64)> {
+        fn walk(dir: &Path, into: &mut BTreeSet<(PathBuf, u64)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    walk(&path, into);
+                } else {
+                    into.insert((path, metadata.len()));
+                }
+            }
+        }
+        let mut set = BTreeSet::new();
+        walk(dir, &mut set);
+        set
     }
 
     #[tokio::test]
