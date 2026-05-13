@@ -29,7 +29,7 @@ test-stub = []
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.52.2", features = ["full"] }
+tokio = { version = "1.52.3", features = ["full"] }
 futures = "0.3.32"
 
 # CLI
@@ -96,7 +96,7 @@ tempfile = "3.27.0"
 async-trait = "0.1.89"
 
 [dev-dependencies]
-assert_cmd = "2.2.1"
+assert_cmd = "2.2.2"
 predicates = "3.1.4"
 tokio-test = "0.4.5"
 
