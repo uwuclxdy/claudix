@@ -59,22 +59,38 @@ impl Provider for HttpProvider {
             return Ok(Vec::new());
         }
 
-        let response = self
-            .client
-            .post(self.embeddings_url())
-            .json(&EmbeddingRequest {
-                model: &self.model_id,
-                input: batch,
-            })
-            .send()
-            .await
-            .map_err(|source| ClaudixError::EmbeddingUnreachable {
-                endpoint: self.endpoint.clone(),
-                source,
-                recovery: RecoveryHint(
-                    "Run /claudix:doctor to check the embedding endpoint or switch to the bundled provider",
-                ),
-            })?;
+        let mut attempt = 0_u32;
+        let mut delay = RETRY_BASE_DELAY;
+        let response = loop {
+            attempt += 1;
+            let send_result = self
+                .client
+                .post(self.embeddings_url())
+                .json(&EmbeddingRequest {
+                    model: &self.model_id,
+                    input: batch,
+                })
+                .send()
+                .await;
+
+            match send_result {
+                Ok(response) => break response,
+                Err(source) if attempt < MAX_RETRY_ATTEMPTS && is_retryable_transport(&source) => {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(RETRY_MAX_DELAY);
+                    continue;
+                }
+                Err(source) => {
+                    return Err(ClaudixError::EmbeddingUnreachable {
+                        endpoint: self.endpoint.clone(),
+                        source,
+                        recovery: RecoveryHint(
+                            "Run /claudix:doctor to check the embedding endpoint or switch to the bundled provider",
+                        ),
+                    });
+                }
+            }
+        };
 
         let response = response.error_for_status().map_err(|source| {
             ClaudixError::EmbeddingUnreachable {
@@ -151,9 +167,20 @@ fn build_client(timeout: Duration, bearer_token: Option<&str>) -> Result<reqwest
 
     reqwest::Client::builder()
         .timeout(timeout)
+        .connect_timeout(timeout.min(Duration::from_secs(10)))
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_idle_timeout(Some(Duration::from_secs(20)))
         .default_headers(headers)
         .build()
         .map_err(ClaudixError::from)
+}
+
+const MAX_RETRY_ATTEMPTS: u32 = 3;
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+
+fn is_retryable_transport(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_connect() || error.is_request()
 }
 
 fn normalize_endpoint(endpoint: String) -> Result<String> {
