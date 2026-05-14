@@ -171,13 +171,14 @@ impl Claudix {
 
     pub async fn reindex_file(&self, path: &Path) -> Result<IndexStats> {
         let relative_path = self.relative_path_from_input(path)?;
-        let files = FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?
-            .enumerate()?;
 
-        let Some(file) = files
-            .into_iter()
-            .find(|file| file.relative_path == relative_path)
-        else {
+        if let Some(stats) = self.skip_unchanged_target(&relative_path).await? {
+            return Ok(stats);
+        }
+
+        let enumerator =
+            FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?;
+        let Some(file) = enumerator.enumerate_one(relative_path.clone(), false)? else {
             let stats = self
                 .store
                 .delete_file_chunks(&relative_path, self.config.as_ref())
@@ -234,6 +235,41 @@ impl Claudix {
 
     pub async fn embedder_health_check(&self) -> Result<()> {
         self.embedder.health_check().await
+    }
+
+    async fn skip_unchanged_target(
+        &self,
+        relative_path: &RelativePath,
+    ) -> Result<Option<IndexStats>> {
+        let Some(manifest) = self.store.read_manifest()? else {
+            return Ok(None);
+        };
+        let Some(stored_hash) = manifest.file_hashes.get(relative_path.as_str()).copied() else {
+            return Ok(None);
+        };
+        if manifest.embedding_model != self.config.embedding.model
+            || manifest.dimensions != self.config.embedding.dimensions
+        {
+            return Ok(None);
+        }
+
+        let absolute_path = self.project_root.join(relative_path.to_path_buf());
+        let bytes = match fs::read(&absolute_path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if bytes.len() as u64 > self.config.indexing.max_file_size_kb.saturating_mul(1024) {
+            return Ok(None);
+        }
+        if enumeration::hash_bytes(&bytes).0 != stored_hash {
+            return Ok(None);
+        }
+
+        Ok(Some(IndexStats {
+            file_count: usize::try_from(manifest.file_count).unwrap_or(usize::MAX),
+            chunk_count: usize::try_from(manifest.chunk_count).unwrap_or(usize::MAX),
+        }))
     }
 
     async fn collect_file_chunks(&self, file: &EnumeratedFile) -> Result<Vec<Chunk>> {

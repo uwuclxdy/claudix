@@ -76,7 +76,7 @@ impl FileEnumerator {
         Ok(files)
     }
 
-    fn enumerate_one(
+    pub(crate) fn enumerate_one(
         &self,
         relative_path: RelativePath,
         force_indexed: bool,
