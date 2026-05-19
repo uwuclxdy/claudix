@@ -439,10 +439,15 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
         return None;
     }
 
-    let already_acked = fs::read_to_string(&ack_path)
-        .ok()
-        .map(|content| content.trim() == marker.prior_ts)
-        .unwrap_or(false);
+    // Pre-first-index state has `prior_ts == "none"` indefinitely, so suppressing
+    // duplicate-ts acks would silence every consecutive failure on a fresh repo.
+    // Always surface failure for that sentinel; gate dedup on real timestamps.
+    let is_first_index = marker.prior_ts == "none";
+    let already_acked = !is_first_index
+        && fs::read_to_string(&ack_path)
+            .ok()
+            .map(|content| content.trim() == marker.prior_ts)
+            .unwrap_or(false);
     let _ = fs::write(&ack_path, &marker.prior_ts);
     let _ = fs::remove_file(&marker_path);
 
@@ -1462,6 +1467,34 @@ mod tests {
         assert!(try_claim_pending_index_marker(&marker_path, &payload));
         let marker = read_pending_index_marker(&marker_path);
         assert!(marker.is_some());
+    }
+
+    #[tokio::test]
+    async fn check_index_ready_resurfaces_failure_for_first_index_sentinel() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Pre-ack the "none" sentinel so a naive dedup check would suppress.
+        let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
+        fs::write(&ack_path, "none")?;
+
+        let stale_created_at = "2025-01-01T00:00:00Z";
+        let payload = format!("none\n{stale_created_at}\n0\n");
+        fs::write(store.pending_index_marker_path(), payload)?;
+
+        let response = check_index_ready(fixture.root(), &config);
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("ended without updating the index"),
+            "repeat failures before the first successful index must still surface, got: {context}"
+        );
+        Ok(())
     }
 
     #[tokio::test]
