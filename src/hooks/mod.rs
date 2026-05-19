@@ -280,18 +280,16 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
 
     let config = config::load(project_root).ok();
 
-    // Spawn the per-file reindex first so the just-finished edit reaches the
-    // index even when we also attach a background-index-ready notification.
-    // Skip when a watcher is already alive AND its filter would pick up this
-    // path: in that case it will reindex via notify and double-spawning would
-    // race on the LanceDB store. A gitignored edit the watcher would silently
-    // drop still needs the hook to fire so the change reaches the index.
+    // Always spawn the per-file reindex when the watcher is configured to run.
+    // The watcher's `WatchFilter` is loaded once at startup, so a `.gitignore`
+    // edit mid-session can desync the hook's view from the watcher's; the only
+    // correctness-preserving choice is to always spawn and let
+    // `acquire_reindex_lock` serialize against the watcher.
     if is_write_tool(tool_name)
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
         && let Some(input) = payload.tool_input
         && let Some(file_path) = input.file_path.or(input.notebook_path)
-        && !watcher_will_reindex(project_root, cfg, &file_path)
     {
         spawn_background_reindex_file(project_root, &file_path);
     }
@@ -299,36 +297,6 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
     Ok(config
         .as_ref()
         .and_then(|cfg| check_index_ready(project_root, cfg)))
-}
-
-fn watch_is_alive(project_root: &Path, config: &Config) -> bool {
-    let Ok(store) = Store::new(project_root, config) else {
-        return false;
-    };
-    let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
-    watch_marker_is_alive(&marker_path)
-}
-
-/// Whether the live watcher would notice and reindex an edit to `file_path`.
-///
-/// The watcher applies [`crate::enumeration::WatchFilter`] before queueing a
-/// reindex, so gitignored paths it would silently drop must still flow through
-/// the hook's per-file reindex. Returns `false` when no watcher is alive,
-/// when the path falls outside the project root, or when the filter would
-/// skip the path; returns `true` only when both conditions hold.
-fn watcher_will_reindex(project_root: &Path, config: &Config, file_path: &str) -> bool {
-    if !watch_is_alive(project_root, config) {
-        return false;
-    }
-    let path = Path::new(file_path);
-    let relative = match path.strip_prefix(project_root) {
-        Ok(relative) => relative,
-        Err(_) if path.is_relative() => path,
-        Err(_) => return false,
-    };
-    crate::enumeration::WatchFilter::load(project_root)
-        .map(|filter| filter.is_watchable(relative))
-        .unwrap_or(false)
 }
 
 fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
