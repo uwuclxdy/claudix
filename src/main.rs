@@ -260,7 +260,13 @@ fn active_project_root() -> Result<std::path::PathBuf> {
 
 async fn run_hook_command(project_root: &std::path::Path, event: hooks::HookEvent) {
     let payload = read_stdin_payload();
-    let project_root = project_root.to_path_buf();
+    // Canonicalize so `path.strip_prefix(project_root)` lines up with the
+    // canonical paths the watcher and `Store::new` use internally. A raw
+    // `CLAUDE_PROJECT_DIR` with symlinks or trailing separators would otherwise
+    // make hook-side path arithmetic disagree with the rest of the binary.
+    let project_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
     let handle = tokio::spawn(async move { hooks::run(&project_root, event, &payload).await });
 
     match handle.await {
