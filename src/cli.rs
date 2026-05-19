@@ -220,7 +220,25 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
 
     let store = Store::new(&project_root, &config)?;
     store.ensure_layout()?;
-    let marker = WatchMarkerGuard::install(store.state_dir_path().join(WATCH_MARKER_FILE_NAME))?;
+    let marker = Arc::new(WatchMarkerGuard::install(
+        store.state_dir_path().join(WATCH_MARKER_FILE_NAME),
+    )?);
+
+    // Cold ONNX loads can exceed the marker stale window; refresh the marker
+    // from a side task while the watcher itself is still booting so concurrent
+    // SessionStarts do not misclassify us as dead and spawn a duplicate.
+    let early_heartbeat = {
+        let marker = Arc::clone(&marker);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(WATCH_HEARTBEAT_SECS));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                marker.heartbeat();
+            }
+        })
+    };
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut watcher = RecommendedWatcher::new(
@@ -236,6 +254,10 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
 
     let filter = WatchFilter::load(&project_root)?;
     let claudix = Claudix::new(project_root.clone(), Arc::new(config)).await?;
+
+    early_heartbeat.abort();
+    let _ = early_heartbeat.await;
+
     let mut pending = VecDeque::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(WATCH_HEARTBEAT_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
