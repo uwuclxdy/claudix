@@ -366,14 +366,9 @@ pub async fn run_reindex_file(
     let config = config::load(&project_root)?;
     let store = Store::new(&project_root, &config)?;
 
-    if store.full_index_running() {
-        let status = status_from_store(&store, &config).await?;
-        return Ok(IndexOutput {
-            file_count: status.file_count,
-            chunk_count: status.chunk_count,
-        });
-    }
-
+    // Block on the shared chunk-writer lock instead of short-circuiting on a
+    // running full index: bailing here loses the user's edit until they save
+    // again, since the reindex-file child returns 0 with no retry path.
     let _reindex_lock = store.acquire_reindex_lock()?;
     let claudix = Claudix::new(project_root, Arc::new(config)).await?;
     let stats = claudix.reindex_file(path.as_ref()).await?;

@@ -26,8 +26,10 @@ use crate::{IndexFileStatus, IndexProgress};
 pub const SCHEMA_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const LOCK_FILE_NAME: &str = "index.lock";
-const REINDEX_LOCK_FILE_NAME: &str = "reindex.lock";
-const REINDEX_LOCK_WAIT_MS: u64 = 5_000;
+// Long enough to outlast a full index on a large repo; the per-file reindex
+// is a background subprocess, so a generous deadline is preferable to giving
+// up and silently losing the user's edit.
+const REINDEX_LOCK_WAIT_MS: u64 = 1_800_000;
 const REINDEX_LOCK_POLL_MS: u64 = 50;
 const LOCK_TERMINATION_GRACE_MS: u64 = 2_000;
 const LOCK_TERMINATION_POLL_MS: u64 = 100;
@@ -156,13 +158,16 @@ impl Store {
         &self.paths.state_dir
     }
 
-    /// Serialize per-file reindexes against each other. Distinct from the
-    /// full-index lock so a long-running `claudix index` doesn't starve
-    /// background `reindex-file` jobs (or vice versa — callers that must not
-    /// race a full index check [`Self::full_index_running`] separately).
+    /// Block until the shared chunk-writer lock is available, then claim it.
+    ///
+    /// Shares [`LOCK_FILE_NAME`] with [`Self::acquire_index_lock`] so a full
+    /// index and a per-file reindex can never rewrite the chunk table at the
+    /// same time. The deadline is long enough to outlast a full index on a
+    /// large repo; if the holder dies or never wrote its PID, the dead-lock
+    /// recovery branch reclaims it on the next poll.
     pub fn acquire_reindex_lock(&self) -> Result<IndexLockGuard> {
         fs::create_dir_all(&self.paths.state_dir)?;
-        let lock_path = self.paths.state_dir.join(REINDEX_LOCK_FILE_NAME);
+        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
         let deadline = std::time::Instant::now() + Duration::from_millis(REINDEX_LOCK_WAIT_MS);
 
         loop {
