@@ -517,9 +517,12 @@ pub fn parse_hook_event(value: &str) -> Result<HookEvent> {
         "SessionStart" => Ok(HookEvent::SessionStart),
         "PostToolUse" => Ok(HookEvent::PostToolUse),
         "PreToolUse" => Ok(HookEvent::PreToolUse),
+        "UserPromptSubmit" => Ok(HookEvent::UserPromptSubmit),
         _ => Err(ClaudixError::ConfigInvalid {
             message: format!("unknown hook event: {value}"),
-            recovery: RecoveryHint("Use one of: SessionStart, PostToolUse, PreToolUse"),
+            recovery: RecoveryHint(
+                "Use one of: SessionStart, PostToolUse, PreToolUse, UserPromptSubmit",
+            ),
         }),
     }
 }
@@ -1111,6 +1114,9 @@ mod tests {
 
         let event = parse_hook_event("PreToolUse");
         assert!(matches!(event, Ok(HookEvent::PreToolUse)));
+
+        let event = parse_hook_event("UserPromptSubmit");
+        assert!(matches!(event, Ok(HookEvent::UserPromptSubmit)));
     }
 
     #[test]

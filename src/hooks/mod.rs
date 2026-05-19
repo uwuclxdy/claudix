@@ -31,6 +31,7 @@ pub enum HookEvent {
     SessionStart,
     PostToolUse,
     PreToolUse,
+    UserPromptSubmit,
 }
 
 pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result<Option<Value>> {
@@ -47,6 +48,7 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
         HookEvent::SessionStart => handle_session_start(project_root, payload).await,
         HookEvent::PostToolUse => handle_post_tool_use(project_root, payload).await,
         HookEvent::PreToolUse => handle_pre_tool_use(project_root, payload).await,
+        HookEvent::UserPromptSubmit => handle_user_prompt_submit(project_root).await,
     }
 }
 
@@ -419,7 +421,14 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
 
     Ok(config
         .as_ref()
-        .and_then(|cfg| check_index_ready(project_root, cfg)))
+        .and_then(|cfg| check_index_ready(project_root, cfg, "PostToolUse")))
+}
+
+async fn handle_user_prompt_submit(project_root: &Path) -> Result<Option<Value>> {
+    let config = config::load(project_root).ok();
+    Ok(config
+        .as_ref()
+        .and_then(|cfg| check_index_ready(project_root, cfg, "UserPromptSubmit")))
 }
 
 fn watcher_alive(project_root: &Path, config: &Config) -> bool {
@@ -430,7 +439,7 @@ fn watcher_alive(project_root: &Path, config: &Config) -> bool {
     watch_marker_is_alive(&marker_path)
 }
 
-fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
+fn check_index_ready(project_root: &Path, config: &Config, event_name: &str) -> Option<Value> {
     let store = Store::new(project_root, config).ok()?;
     let marker_path = store.pending_index_marker_path();
     let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
@@ -464,11 +473,11 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
         let Some(manifest) = manifest else {
             // ts changed but the manifest is gone — treat as a failed run so
             // the user is informed instead of silently dropping the signal.
-            return Some(indexing_failed_response());
+            return Some(indexing_failed_response(event_name));
         };
         return Some(json!({
             "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
+                "hookEventName": event_name,
                 "additionalContext": format!(
                     "claudix indexing complete — {} files, {} chunks. Semantic search is now ready: \
                      use search_code for conceptual queries, identifier lookups, and cross-file discovery.",
@@ -505,13 +514,13 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
         return None;
     }
 
-    Some(indexing_failed_response())
+    Some(indexing_failed_response(event_name))
 }
 
-fn indexing_failed_response() -> Value {
+fn indexing_failed_response(event_name: &str) -> Value {
     json!({
         "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
+            "hookEventName": event_name,
             "additionalContext":
                 "claudix background indexing ended without updating the index — it may have failed. \
                  Run /claudix:doctor to diagnose.",
@@ -789,9 +798,8 @@ fn strip_command_prefixes(command: &str) -> &str {
                 let mut after_assignments = rest;
                 for token in rest.split_whitespace() {
                     if token.contains('=') && !token.starts_with('=') {
-                        after_assignments = after_assignments
-                            .trim_start_matches(token)
-                            .trim_start();
+                        after_assignments =
+                            after_assignments.trim_start_matches(token).trim_start();
                     } else {
                         break;
                     }
@@ -1683,7 +1691,7 @@ mod tests {
         let payload = format!("none\n{stale_created_at}\n0\n");
         fs::write(store.pending_index_marker_path(), payload)?;
 
-        let response = check_index_ready(fixture.root(), &config);
+        let response = check_index_ready(fixture.root(), &config, "PostToolUse");
         let response = response.unwrap_or(Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -1691,6 +1699,43 @@ mod tests {
         assert!(
             context.contains("ended without updating the index"),
             "repeat failures before the first successful index must still surface, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_surfaces_indexing_completion() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Marker says the prior index timestamp was "none"; the manifest now
+        // has a fresh successful timestamp, so the handler must surface the
+        // completion message even though no write tool fired.
+        let stale_created_at = "2025-01-01T00:00:00Z";
+        let payload = format!("none\n{stale_created_at}\n0\n");
+        fs::write(store.pending_index_marker_path(), payload)?;
+        let mut manifest = Manifest::new(config.embedding.model.clone(), 8);
+        manifest.file_count = 3;
+        manifest.chunk_count = 12;
+        manifest.last_full_index_at = Some(crate::util::now_rfc3339());
+        store.write_manifest(&manifest)?;
+
+        let response = run(fixture.root(), HookEvent::UserPromptSubmit, "{}").await?;
+        let response = response.unwrap_or(Value::Null);
+        assert_eq!(
+            response["hookSpecificOutput"]["hookEventName"].as_str(),
+            Some("UserPromptSubmit"),
+            "response must carry the firing event name"
+        );
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("indexing complete"),
+            "expected completion context, got: {context}"
         );
         Ok(())
     }
@@ -1711,7 +1756,7 @@ mod tests {
         let payload = format!("none\n{stale_created_at}\n{my_pid}\n");
         fs::write(store.pending_index_marker_path(), payload)?;
 
-        let response = check_index_ready(fixture.root(), &config);
+        let response = check_index_ready(fixture.root(), &config, "PostToolUse");
         assert!(
             response.is_none(),
             "must not declare failure while spawned child is alive"
@@ -1737,7 +1782,7 @@ mod tests {
         let payload = format!("none\n{stale_created_at}\n");
         fs::write(store.pending_index_marker_path(), payload)?;
 
-        let response = check_index_ready(fixture.root(), &config);
+        let response = check_index_ready(fixture.root(), &config, "PostToolUse");
         let response = response.unwrap_or(Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
