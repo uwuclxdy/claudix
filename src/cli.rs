@@ -277,6 +277,7 @@ pub async fn run_reindex_file(
         });
     }
 
+    let _reindex_lock = store.acquire_reindex_lock()?;
     let claudix = Claudix::new(project_root, Arc::new(config)).await?;
     let stats = claudix.reindex_file(path.as_ref()).await?;
 

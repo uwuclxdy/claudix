@@ -26,6 +26,9 @@ use crate::{IndexFileStatus, IndexProgress};
 pub const SCHEMA_VERSION: u32 = 1;
 const MANIFEST_FILE_NAME: &str = "manifest.json";
 const LOCK_FILE_NAME: &str = "index.lock";
+const REINDEX_LOCK_FILE_NAME: &str = "reindex.lock";
+const REINDEX_LOCK_WAIT_MS: u64 = 5_000;
+const REINDEX_LOCK_POLL_MS: u64 = 50;
 const LOCK_STALE_SECS: u64 = 7_200;
 const LOCK_TERMINATION_GRACE_MS: u64 = 2_000;
 const LOCK_TERMINATION_POLL_MS: u64 = 100;
@@ -152,6 +155,38 @@ impl Store {
 
     pub fn state_dir_path(&self) -> &Path {
         &self.paths.state_dir
+    }
+
+    /// Serialize per-file reindexes against each other. Distinct from the
+    /// full-index lock so a long-running `claudix index` doesn't starve
+    /// background `reindex-file` jobs (or vice versa — callers that must not
+    /// race a full index check [`Self::full_index_running`] separately).
+    pub fn acquire_reindex_lock(&self) -> Result<IndexLockGuard> {
+        fs::create_dir_all(&self.paths.state_dir)?;
+        let lock_path = self.paths.state_dir.join(REINDEX_LOCK_FILE_NAME);
+        let deadline =
+            std::time::Instant::now() + Duration::from_millis(REINDEX_LOCK_WAIT_MS);
+
+        loop {
+            if let Ok(mut file) = fs::File::create_new(&lock_path) {
+                let _ = writeln!(file, "{}", std::process::id());
+                return Ok(IndexLockGuard {
+                    path: lock_path,
+                });
+            }
+            if let Some(pid) = read_lock_pid(&lock_path)
+                && !process_running(pid)
+            {
+                let _ = fs::remove_file(&lock_path);
+                continue;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ClaudixError::Store(
+                    "reindex lock contention: another reindex job is in progress".to_owned(),
+                ));
+            }
+            thread::sleep(Duration::from_millis(REINDEX_LOCK_POLL_MS));
+        }
     }
 
     pub fn acquire_index_lock(&self) -> Option<IndexLockGuard> {

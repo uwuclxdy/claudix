@@ -247,9 +247,12 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
 
     // Spawn the per-file reindex first so the just-finished edit reaches the
     // index even when we also attach a background-index-ready notification.
+    // Skip when a watcher is already alive: it will pick the change up via
+    // notify and double-spawning would race on the LanceDB store.
     if is_write_tool(tool_name)
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
+        && !watch_is_alive(project_root, cfg)
         && let Some(input) = payload.tool_input
         && let Some(file_path) = input.file_path.or(input.notebook_path)
     {
@@ -259,6 +262,14 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
     Ok(config
         .as_ref()
         .and_then(|cfg| check_index_ready(project_root, cfg)))
+}
+
+fn watch_is_alive(project_root: &Path, config: &Config) -> bool {
+    let Ok(store) = Store::new(project_root, config) else {
+        return false;
+    };
+    let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
+    watch_marker_is_alive(&marker_path)
 }
 
 fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
