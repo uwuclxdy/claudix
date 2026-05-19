@@ -251,6 +251,18 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
             _ = tokio::time::sleep(Duration::from_millis(250)), if !pending.is_empty() => {
                 let paths = drain_unique_paths(&mut pending);
                 for path in paths {
+                    // Serialize against concurrent reindex-file CLI/MCP calls and
+                    // any duplicate watcher that slipped through the marker claim.
+                    let _reindex_lock = match store.acquire_reindex_lock() {
+                        Ok(lock) => lock,
+                        Err(error) => {
+                            tracing::warn!(
+                                "claudix watch skipped reindex of {}: {error}",
+                                path.display()
+                            );
+                            continue;
+                        }
+                    };
                     if let Err(error) = claudix.reindex_file(&path).await {
                         tracing::warn!("claudix watch failed to reindex {}: {error}", path.display());
                     }

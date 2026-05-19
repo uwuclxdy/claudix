@@ -93,20 +93,48 @@ fn spawn_background_watch(project_root: &Path, config: &Config) -> bool {
         return false;
     }
     let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
-    if watch_marker_is_alive(&marker_path) {
-        return false;
-    }
-    // Stale marker — clear so the new child can take over without a freshness
-    // window from the dead writer's timestamp.
-    let _ = fs::remove_file(&marker_path);
-
-    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("watch")]) else {
+    let Some(mut marker_file) = try_claim_watch_marker(&marker_path) else {
         return false;
     };
-    // Seed the marker with the spawned child's PID so a concurrent
-    // SessionStart sees a live entry before the child finishes booting.
-    let _ = fs::write(marker_path, child_pid.to_string());
+
+    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("watch")]) else {
+        drop(marker_file);
+        let _ = fs::remove_file(&marker_path);
+        return false;
+    };
+    // Replace the placeholder claim with the spawned child PID so concurrent
+    // SessionStarts see a live entry before the child finishes booting.
+    use std::io::Write as _;
+    let _ = marker_file.write_all(child_pid.to_string().as_bytes());
     true
+}
+
+/// Atomically reserve the watch marker for the duration of one watcher.
+///
+/// Returns the opened file handle on success so the caller can overwrite the
+/// placeholder content with the spawned child PID. Returns `None` if a live
+/// watcher already holds the marker. A stale marker is removed once and the
+/// claim retried; persistent contention after retry returns `None`.
+fn try_claim_watch_marker(marker_path: &Path) -> Option<std::fs::File> {
+    use std::fs::OpenOptions;
+    for _ in 0..2 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker_path)
+        {
+            Ok(file) => return Some(file),
+            Err(_) => {
+                if watch_marker_is_alive(marker_path) {
+                    return None;
+                }
+                if fs::remove_file(marker_path).is_err() {
+                    return None;
+                }
+            }
+        }
+    }
+    None
 }
 
 fn watch_marker_is_alive(marker_path: &Path) -> bool {
