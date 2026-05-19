@@ -67,6 +67,18 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
 
     let marker_path = store.pending_index_marker_path();
     let manifest = store.read_manifest().ok().flatten();
+
+    // Skip respawning when the existing index is fresh, populated, and matches
+    // the configured embedding model. Without this guard every SessionStart
+    // after the 60s marker window triggers a full reindex of an unchanged repo.
+    if let Some(ref manifest) = manifest
+        && manifest.chunk_count > 0
+        && manifest.embedding_model == config.embedding.model
+        && !index_is_stale(manifest, config)
+    {
+        return false;
+    }
+
     let prior_ts = manifest
         .as_ref()
         .and_then(|m| m.last_full_index_at.as_deref())
@@ -1593,5 +1605,47 @@ mod tests {
         let mut manifest = Manifest::new("stub-v1", 8);
         manifest.last_full_index_at = Some(crate::util::now_rfc3339());
         assert!(!index_is_stale(&manifest, &config));
+    }
+
+    #[tokio::test]
+    async fn spawn_background_index_skips_when_manifest_fresh_and_populated() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+
+        Claudix::new(fixture.root().to_path_buf(), Arc::new(config.clone()))
+            .await?
+            .index_full()
+            .await?;
+
+        let store = Store::new(fixture.root(), &config)?;
+        let marker_path = store.pending_index_marker_path();
+        let _ = fs::remove_file(&marker_path);
+
+        assert!(
+            !spawn_background_index(fixture.root(), &config),
+            "fresh non-empty matching-model index must not respawn"
+        );
+        assert!(
+            !marker_path.exists(),
+            "no pending marker should be written when spawn is skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn spawn_background_index_runs_when_manifest_missing() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        assert!(
+            spawn_background_index(fixture.root(), &config),
+            "missing manifest must trigger a spawn"
+        );
+        Ok(())
     }
 }
