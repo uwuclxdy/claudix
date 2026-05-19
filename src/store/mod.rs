@@ -164,15 +164,12 @@ impl Store {
     pub fn acquire_reindex_lock(&self) -> Result<IndexLockGuard> {
         fs::create_dir_all(&self.paths.state_dir)?;
         let lock_path = self.paths.state_dir.join(REINDEX_LOCK_FILE_NAME);
-        let deadline =
-            std::time::Instant::now() + Duration::from_millis(REINDEX_LOCK_WAIT_MS);
+        let deadline = std::time::Instant::now() + Duration::from_millis(REINDEX_LOCK_WAIT_MS);
 
         loop {
             if let Ok(mut file) = fs::File::create_new(&lock_path) {
                 let _ = writeln!(file, "{}", std::process::id());
-                return Ok(IndexLockGuard {
-                    path: lock_path,
-                });
+                return Ok(IndexLockGuard { path: lock_path });
             }
             if let Some(pid) = read_lock_pid(&lock_path)
                 && !process_running(pid)

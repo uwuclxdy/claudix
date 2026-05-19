@@ -10,10 +10,10 @@ use tokio::fs;
 use tokio::sync::mpsc;
 
 use crate::config::{self, validate_project_relative_path};
+use crate::enumeration::WatchFilter;
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::hooks::HookEvent;
 use crate::search::SearchQuery;
-use crate::enumeration::WatchFilter;
 use crate::store::{IndexLockGuard, Store};
 use crate::types::{Language, RelativePath};
 use crate::{Claudix, IndexFileStatus, IndexProgress};
