@@ -356,6 +356,7 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
         && cfg.hooks.auto_reembed_on_edit
         && let Some(input) = payload.tool_input
         && let Some(file_path) = input.file_path.or(input.notebook_path)
+        && is_indexable_path(&file_path)
     {
         spawn_background_reindex_file(project_root, &file_path);
     }
@@ -443,6 +444,22 @@ fn indexing_failed_response() -> Value {
 
 fn is_write_tool(tool_name: &str) -> bool {
     matches!(tool_name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
+}
+
+/// Whether the file at `file_path` belongs to a language claudix can chunk.
+///
+/// PostToolUse fires for every Write/Edit; spawning a full `claudix
+/// reindex-file` process for unsupported types (`.json`, `.md`, `.png`,
+/// lockfiles, …) just burns startup cost on a no-op.
+fn is_indexable_path(file_path: &str) -> bool {
+    let extension = Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+    !matches!(
+        crate::types::Language::from_extension(extension),
+        crate::types::Language::Unknown
+    )
 }
 
 fn spawn_background_reindex_file(project_root: &Path, file_path: &str) {
@@ -1387,6 +1404,20 @@ mod tests {
             context.contains("search_code MCP tool"),
             "context must include tip to use search_code directly, got: {context}"
         );
+    }
+
+    #[test]
+    fn is_indexable_path_recognises_supported_extensions() {
+        for path in ["src/lib.rs", "foo.py", "bar.tsx", "baz.cpp", "main.go"] {
+            assert!(is_indexable_path(path), "expected indexable: {path}");
+        }
+    }
+
+    #[test]
+    fn is_indexable_path_skips_unsupported_extensions() {
+        for path in ["README.md", "package.json", "logo.png", "Cargo.lock", "notes"] {
+            assert!(!is_indexable_path(path), "expected skipped: {path}");
+        }
     }
 
     #[test]
