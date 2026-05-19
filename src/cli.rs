@@ -192,12 +192,52 @@ struct WatchMarkerGuard {
 }
 
 impl WatchMarkerGuard {
+    /// Claim the watcher marker for this process.
+    ///
+    /// Coordinates with `spawn_background_watch`, which `create_new`s the marker
+    /// and pre-writes the spawned child's PID — that hand-off case finds our own
+    /// PID already stored and adopts the file. A stale marker (PID dead) is
+    /// reclaimed; a live foreign PID returns an error so the duplicate watcher
+    /// exits instead of clobbering the original.
     fn install(path: PathBuf) -> Result<Self> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&path, std::process::id().to_string())?;
-        Ok(Self { path })
+
+        let my_pid = std::process::id();
+        for _ in 0..2 {
+            if let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(&path) {
+                let _ = writeln!(file, "{my_pid}");
+                return Ok(Self { path });
+            }
+
+            let existing = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|content| content.trim().parse::<u32>().ok());
+            match existing {
+                Some(pid) if pid == my_pid => {
+                    let _ = std::fs::write(&path, format!("{my_pid}\n"));
+                    return Ok(Self { path });
+                }
+                Some(pid) if !crate::store::process_running(pid) => {
+                    let _ = std::fs::remove_file(&path);
+                }
+                Some(_) => {
+                    return Err(ClaudixError::Store(
+                        "another claudix watch process is already running".to_owned(),
+                    ));
+                }
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+        Err(ClaudixError::Store(
+            "watcher marker claim failed".to_owned(),
+        ))
     }
 
     fn heartbeat(&self) {
@@ -207,7 +247,14 @@ impl WatchMarkerGuard {
 
 impl Drop for WatchMarkerGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only remove if we still hold the marker. Another process may have
+        // reclaimed it after our heartbeat task stalled (e.g. SIGSTOP).
+        let existing = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|content| content.trim().parse::<u32>().ok());
+        if existing == Some(std::process::id()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -966,6 +1013,99 @@ mod tests {
             claudix,
             store,
         })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watch_marker_install_refuses_live_foreign_pid() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let path = dir.path().join("watch.pid");
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        let foreign_pid = child.id();
+        assert!(std::fs::write(&path, foreign_pid.to_string()).is_ok());
+
+        let result = WatchMarkerGuard::install(path.clone());
+        let stored_after = std::fs::read_to_string(&path).ok();
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            matches!(result, Err(ClaudixError::Store(_))),
+            "expected error when a live foreign PID owns the marker"
+        );
+        assert_eq!(
+            stored_after.as_deref().map(str::trim),
+            Some(foreign_pid.to_string().as_str()),
+            "foreign marker contents must be untouched"
+        );
+    }
+
+    #[test]
+    fn watch_marker_install_clears_malformed_marker() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let path = dir.path().join("watch.pid");
+        assert!(std::fs::write(&path, "not-a-pid").is_ok());
+
+        let marker = WatchMarkerGuard::install(path.clone());
+        assert!(marker.is_ok(), "malformed marker must be reclaimable");
+    }
+
+    #[test]
+    fn watch_marker_install_takes_over_dead_pid() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let path = dir.path().join("watch.pid");
+        // PID 0 is never running on Linux; use a guaranteed-dead value via crate helper.
+        let dead_pid = pick_dead_pid();
+        assert!(std::fs::write(&path, dead_pid.to_string()).is_ok());
+
+        let marker = WatchMarkerGuard::install(path.clone());
+        assert!(marker.is_ok(), "must reclaim a stale marker");
+        let stored = std::fs::read_to_string(&path).ok();
+        assert_eq!(
+            stored.as_deref().map(str::trim),
+            Some(std::process::id().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn watch_marker_install_adopts_handoff_with_own_pid() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let path = dir.path().join("watch.pid");
+        assert!(std::fs::write(&path, std::process::id().to_string()).is_ok());
+
+        let marker = WatchMarkerGuard::install(path.clone());
+        assert!(marker.is_ok(), "must adopt parent's hand-off claim");
+    }
+
+    #[test]
+    fn watch_marker_drop_leaves_foreign_pid_alone() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let path = dir.path().join("watch.pid");
+        let marker = WatchMarkerGuard::install(path.clone())
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        // Simulate another process reclaiming the marker before our drop runs.
+        let foreign_pid = if std::process::id() == 1 { 2 } else { 1 };
+        assert!(std::fs::write(&path, foreign_pid.to_string()).is_ok());
+
+        drop(marker);
+        assert!(
+            path.exists(),
+            "drop must not remove a marker reclaimed by another process"
+        );
+    }
+
+    fn pick_dead_pid() -> u32 {
+        for candidate in [9_999_999u32, 8_888_888, 7_777_777] {
+            if !crate::store::process_running(candidate) {
+                return candidate;
+            }
+        }
+        9_999_999
     }
 
     #[test]
