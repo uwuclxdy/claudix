@@ -126,10 +126,13 @@ fn pending_index_marker_is_fresh(marker_path: &Path) -> bool {
     let Some(marker) = read_pending_index_marker(marker_path) else {
         return false;
     };
+    // `duration_since` errors when `created_at` is in the future — clock skew
+    // or restore-from-backup. Treat that as expired so a single bad timestamp
+    // can't permanently jam the auto-indexer.
     SystemTime::now()
         .duration_since(marker.created_at)
         .map(|age| age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS.saturating_mul(2)))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 struct PendingIndexMarker {
@@ -388,9 +391,14 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
     let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
     let marker = read_pending_index_marker(&marker_path)?;
 
-    let age = SystemTime::now()
-        .duration_since(marker.created_at)
-        .unwrap_or(Duration::ZERO);
+    // `created_at` in the future (clock skew, restored backup) would make
+    // `duration_since` error forever; treat that as "past every grace window"
+    // so the marker can be cleaned up instead of jamming the auto-indexer.
+    let now = SystemTime::now();
+    let age = match now.duration_since(marker.created_at) {
+        Ok(age) => age,
+        Err(_) => Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS.saturating_mul(2)),
+    };
     if age < Duration::from_secs(PENDING_INDEX_READY_GRACE_SECS) {
         return None;
     }
@@ -1455,6 +1463,22 @@ mod tests {
         let marker = read_pending_index_marker(&marker_path)
             .unwrap_or_else(|| unreachable!());
         assert_eq!(marker.prior_ts, "none", "first claim must remain in place");
+    }
+
+    #[test]
+    fn pending_index_marker_with_future_timestamp_is_not_fresh() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("indexing-pending");
+        // 1 hour in the future — simulates clock skew / backup restore.
+        let future = SystemTime::now() + Duration::from_secs(3_600);
+        let future_ts = crate::util::format_rfc3339(future);
+        fs::write(&marker_path, format!("none\n{future_ts}\n0\n"))
+            .unwrap_or_else(|_| unreachable!());
+
+        assert!(
+            !pending_index_marker_is_fresh(&marker_path),
+            "future-timestamped marker must be reclaimable"
+        );
     }
 
     #[test]
