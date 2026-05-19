@@ -441,9 +441,7 @@ fn queue_reindex_paths(
 
     pending.extend(event.paths.into_iter().filter_map(|path| {
         let relative = path.strip_prefix(project_root).ok()?;
-        if relative.components().next().is_none() {
-            return None;
-        }
+        relative.components().next()?;
         if !filter.is_watchable(relative) {
             return None;
         }

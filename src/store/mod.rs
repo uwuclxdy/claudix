@@ -1863,7 +1863,7 @@ mod tests {
         )];
         store.replace_file_chunks(&chunks, &config).await?;
 
-        let saved = store.read_manifest()?.expect("manifest must exist");
+        let saved = store.read_manifest()?.unwrap_or_else(|| unreachable!());
         assert_eq!(
             saved.file_hashes.get("src/empty.rs").copied(),
             Some([7u8; 16]),
@@ -1891,7 +1891,7 @@ mod tests {
         ];
         store.replace_chunks(&chunks, &config).await?;
         // Patch the manifest to include the no-chunk entry (replace_chunks doesn't merge).
-        let mut manifest = store.read_manifest()?.expect("manifest must exist");
+        let mut manifest = store.read_manifest()?.unwrap_or_else(|| unreachable!());
         manifest
             .file_hashes
             .insert("src/empty.rs".to_owned(), [7u8; 16]);
@@ -1901,7 +1901,7 @@ mod tests {
             .delete_file_chunks(&RelativePath::new("src/b.rs"), &config)
             .await?;
 
-        let saved = store.read_manifest()?.expect("manifest must exist");
+        let saved = store.read_manifest()?.unwrap_or_else(|| unreachable!());
         assert_eq!(
             saved.file_hashes.get("src/empty.rs").copied(),
             Some([7u8; 16]),
@@ -1928,7 +1928,7 @@ mod tests {
 
         store.note_file_hash(&RelativePath::new("src/empty.rs"), [5u8; 16], &config)?;
 
-        let saved = store.read_manifest()?.expect("manifest must exist");
+        let saved = store.read_manifest()?.unwrap_or_else(|| unreachable!());
         assert_eq!(
             saved.file_hashes.get("src/empty.rs").copied(),
             Some([5u8; 16])

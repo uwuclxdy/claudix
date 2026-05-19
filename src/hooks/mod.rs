@@ -437,10 +437,7 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
     // child is still alive we're inside the slow-boot window (cold ONNX
     // load, large config parse) — never declare failure yet. Only after the
     // PID exits and the failure grace has elapsed do we surface a failure.
-    if marker
-        .child_pid
-        .is_some_and(crate::store::process_running)
-    {
+    if marker.child_pid.is_some_and(crate::store::process_running) {
         return None;
     }
     if age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS) {
@@ -1445,8 +1442,7 @@ mod tests {
         let marker_path = dir.path().join("indexing-pending");
         let payload = format!("none\n{}\n0\n", now_rfc3339());
         assert!(try_claim_pending_index_marker(&marker_path, &payload));
-        let marker = read_pending_index_marker(&marker_path)
-            .unwrap_or_else(|| unreachable!());
+        let marker = read_pending_index_marker(&marker_path).unwrap_or_else(|| unreachable!());
         assert_eq!(marker.child_pid, None);
     }
 
@@ -1460,8 +1456,7 @@ mod tests {
         // Second claim while the first is still fresh must fail.
         let second = format!("ts-2\n{}\n", now_rfc3339());
         assert!(!try_claim_pending_index_marker(&marker_path, &second));
-        let marker = read_pending_index_marker(&marker_path)
-            .unwrap_or_else(|| unreachable!());
+        let marker = read_pending_index_marker(&marker_path).unwrap_or_else(|| unreachable!());
         assert_eq!(marker.prior_ts, "none", "first claim must remain in place");
     }
 
