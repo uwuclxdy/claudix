@@ -68,12 +68,23 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     let marker_path = store.pending_index_marker_path();
     let manifest = store.read_manifest().ok().flatten();
 
-    // Skip respawning when the existing index is fresh, populated, and matches
-    // the configured embedding model. Without this guard every SessionStart
-    // after the 60s marker window triggers a full reindex of an unchanged repo.
+    // Mismatched embedding model means the existing chunks have the wrong
+    // dimension. Spawning `claudix index` without `--force` would either fail
+    // or append vectors of a different shape — the user has to run
+    // `claudix clear && claudix index` (or equivalent) themselves; the
+    // session-start additionalContext already tells them so.
     if let Some(ref manifest) = manifest
         && manifest.chunk_count > 0
-        && manifest.embedding_model == config.embedding.model
+        && manifest.embedding_model != config.embedding.model
+    {
+        return false;
+    }
+
+    // Skip respawning when the existing index is fresh and populated. Without
+    // this guard every SessionStart after the 60s marker window triggers a
+    // full reindex of an unchanged repo.
+    if let Some(ref manifest) = manifest
+        && manifest.chunk_count > 0
         && !index_is_stale(manifest, config)
     {
         return false;
