@@ -79,7 +79,7 @@ where
 }
 
 fn spawn_background_watch(project_root: &Path, config: &Config) -> bool {
-    if !config.watch {
+    if !config.watch || !config.hooks.auto_reembed_on_edit {
         return false;
     }
     let Ok(store) = Store::new(project_root, config) else {
