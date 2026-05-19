@@ -370,7 +370,9 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         Some(message) => message,
         None => session_start_message(cli::setup_state(project_root).await),
     };
-    response["systemMessage"] = Value::String(user_message);
+    if !user_message.is_empty() {
+        response["systemMessage"] = Value::String(user_message);
+    }
     Ok(Some(response))
 }
 
