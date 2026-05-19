@@ -91,11 +91,12 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     // aged out yet); either way, leave it alone so its `created_at` keeps
     // anchoring the failure-grace clock.
     let placeholder = format!("{prior_ts}\n{}\n0\n", now_rfc3339());
+    // Leave the ack file alone — `check_index_ready` rewrites it on success and
+    // on each surfaced failure. Wiping it here would defeat dedup, so an index
+    // that keeps failing with the same `prior_ts` would re-notify every session.
     if !try_claim_pending_index_marker(&marker_path, &placeholder) {
         return false;
     }
-    let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
-    let _ = fs::remove_file(&ack_path);
 
     let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("index")]) else {
         let _ = fs::remove_file(&marker_path);
@@ -242,10 +243,13 @@ fn watch_marker_is_alive(marker_path: &Path) -> bool {
     let Ok(modified) = metadata.modified() else {
         return false;
     };
+    // `duration_since` errors when `modified` is in the future (clock skew or
+    // restored backup); treat that as expired so a single bad timestamp cannot
+    // permanently jam watcher respawn — matches `pending_index_marker_is_fresh`.
     let fresh = SystemTime::now()
         .duration_since(modified)
         .map(|age| age < Duration::from_secs(WATCH_MARKER_STALE_SECS))
-        .unwrap_or(true);
+        .unwrap_or(false);
     if !fresh {
         return false;
     }
@@ -1485,6 +1489,26 @@ mod tests {
         assert!(!try_claim_pending_index_marker(&marker_path, &second));
         let marker = read_pending_index_marker(&marker_path).unwrap_or_else(|| unreachable!());
         assert_eq!(marker.prior_ts, "none", "first claim must remain in place");
+    }
+
+    #[test]
+    fn watch_marker_with_future_mtime_is_not_alive() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join(WATCH_MARKER_FILE_NAME);
+        fs::write(&marker_path, std::process::id().to_string()).unwrap_or_else(|_| unreachable!());
+
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&marker_path)
+            .unwrap_or_else(|_| unreachable!());
+        let future = SystemTime::now() + Duration::from_secs(3_600);
+        file.set_modified(future).unwrap_or_else(|_| unreachable!());
+        drop(file);
+
+        assert!(
+            !watch_marker_is_alive(&marker_path),
+            "future-mtime watch marker must be reclaimable"
+        );
     }
 
     #[test]
