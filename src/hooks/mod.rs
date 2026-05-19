@@ -391,14 +391,13 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
 
     let config = config::load(project_root).ok();
 
-    // Always spawn the per-file reindex when the watcher is configured to run.
-    // The watcher's `WatchFilter` is loaded once at startup, so a `.gitignore`
-    // edit mid-session can desync the hook's view from the watcher's; the only
-    // correctness-preserving choice is to always spawn and let
-    // `acquire_reindex_lock` serialize against the watcher.
+    // Skip the per-edit spawn when a live watcher already covers file changes;
+    // otherwise rapid edits fan out N detached `reindex-file` processes that
+    // each cold-load ONNX before losing the in-process lock to the watcher.
     if is_write_tool(tool_name)
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
+        && !watcher_alive(project_root, cfg)
         && let Some(input) = payload.tool_input
         && let Some(file_path) = input.file_path.or(input.notebook_path)
     {
@@ -408,6 +407,14 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
     Ok(config
         .as_ref()
         .and_then(|cfg| check_index_ready(project_root, cfg)))
+}
+
+fn watcher_alive(project_root: &Path, config: &Config) -> bool {
+    let Ok(store) = Store::new(project_root, config) else {
+        return false;
+    };
+    let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
+    watch_marker_is_alive(&marker_path)
 }
 
 fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
@@ -1693,6 +1700,30 @@ mod tests {
             context.contains("building its first index"),
             "expected in-flight message for empty manifest with pending marker, got: {context}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_alive_reports_live_marker() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+        let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
+        fs::write(&marker_path, std::process::id().to_string())?;
+
+        assert!(
+            watcher_alive(fixture.root(), &config),
+            "current-PID watch marker must register as alive"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn watcher_alive_returns_false_without_marker() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        assert!(!watcher_alive(fixture.root(), &config));
         Ok(())
     }
 
