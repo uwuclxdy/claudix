@@ -229,32 +229,20 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
 
     let config = config::load(project_root).ok();
 
-    if let Some(ref cfg) = config
-        && let Some(notification) = check_index_ready(project_root, cfg)
+    // Spawn the per-file reindex first so the just-finished edit reaches the
+    // index even when we also attach a background-index-ready notification.
+    if is_write_tool(tool_name)
+        && let Some(cfg) = config.as_ref()
+        && cfg.hooks.auto_reembed_on_edit
+        && let Some(input) = payload.tool_input
+        && let Some(file_path) = input.file_path.or(input.notebook_path)
     {
-        return Ok(Some(notification));
+        spawn_background_reindex_file(project_root, &file_path);
     }
 
-    if !is_write_tool(tool_name) {
-        return Ok(None);
-    }
-
-    let Some(ref cfg) = config else {
-        return Ok(None);
-    };
-    if !cfg.hooks.auto_reembed_on_edit {
-        return Ok(None);
-    }
-
-    let Some(tool_input) = payload.tool_input else {
-        return Ok(None);
-    };
-    let Some(file_path) = tool_input.file_path.or(tool_input.notebook_path) else {
-        return Ok(None);
-    };
-
-    spawn_background_reindex_file(project_root, &file_path);
-    Ok(None)
+    Ok(config
+        .as_ref()
+        .and_then(|cfg| check_index_ready(project_root, cfg)))
 }
 
 fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
