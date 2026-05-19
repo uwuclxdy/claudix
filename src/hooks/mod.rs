@@ -316,7 +316,7 @@ where
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
     let config = config::load(project_root).ok();
 
-    let indexing = if let Some(ref config) = config
+    let indexing_spawned = if let Some(ref config) = config
         && config.hooks.auto_index_on_session_start
         && is_git_repo(project_root)
     {
@@ -330,10 +330,19 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         let _ = spawn_background_watch(project_root, config);
     }
 
-    let manifest = config
+    let store = config
         .as_ref()
-        .and_then(|config| Store::new(project_root, config).ok())
+        .and_then(|config| Store::new(project_root, config).ok());
+    let manifest = store
+        .as_ref()
         .and_then(|store| store.read_manifest().ok().flatten());
+    // A spawn that lost the claim (another session already started one) still
+    // counts as "in flight" for the user-facing message — otherwise we'd tell
+    // them the index is empty while it's actively being built.
+    let indexing_in_flight = indexing_spawned
+        || store.as_ref().is_some_and(|store| {
+            store.full_index_running() || store.pending_index_marker_path().exists()
+        });
 
     let indexed_file_count = manifest.as_ref().map(|m| m.file_count).unwrap_or(0);
     let indexed_chunk_count = manifest.as_ref().map(|m| m.chunk_count).unwrap_or(0);
@@ -351,7 +360,7 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         indexed_chunk_count,
         index_stale,
         model_mismatch,
-        indexing,
+        indexing_in_flight,
     );
     let user_message = match consume_pending_restart().await {
         Some(message) => message,
@@ -628,13 +637,15 @@ fn session_start_response(
     chunk_count: u64,
     stale: bool,
     model_mismatch: bool,
-    indexing_spawned: bool,
+    indexing_in_flight: bool,
 ) -> Value {
     let additional_context = if model_mismatch {
         "claudix semantic search unavailable — embedding model mismatch. Run `claudix clear && claudix index` to rebuild.".to_owned()
+    } else if chunk_count == 0 && indexing_in_flight {
+        "claudix is building its first index in the background — search_code will report when ready. Use Grep or Read in the meantime.".to_owned()
     } else if chunk_count == 0 {
         "claudix is installed but the index is empty. Run /claudix:index to build it; until then use Grep or Read for code discovery.".to_owned()
-    } else if indexing_spawned {
+    } else if indexing_in_flight {
         format!(
             "claudix semantic search ready — {file_count} files, {chunk_count} chunks (reindexing in background; you'll be notified when complete). \
              Use search_code for fast semantic search: conceptual queries, identifier lookups, cross-file discovery. \
@@ -1028,7 +1039,11 @@ mod tests {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        write_config(fixture.root(), &stub_config());
+        let mut config = stub_config();
+        // Disable auto-index so the additionalContext assertion stays focused on
+        // the empty-index state rather than the in-flight indexing message.
+        config.hooks.auto_index_on_session_start = false;
+        write_config(fixture.root(), &config);
 
         let response = run(fixture.root(), HookEvent::SessionStart, "{}").await;
         assert!(response.is_ok());
@@ -1629,6 +1644,30 @@ mod tests {
         assert!(
             !marker_path.exists(),
             "no pending marker should be written when spawn is skipped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_start_reports_indexing_in_flight_when_marker_exists() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let mut config = stub_config();
+        config.hooks.auto_index_on_session_start = false;
+        write_config(fixture.root(), &config);
+
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+        let payload = format!("none\n{}\n0\n", now_rfc3339());
+        fs::write(store.pending_index_marker_path(), payload)?;
+
+        let response = run(fixture.root(), HookEvent::SessionStart, "{}").await?;
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("building its first index"),
+            "expected in-flight message for empty manifest with pending marker, got: {context}"
         );
         Ok(())
     }
