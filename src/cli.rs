@@ -259,6 +259,7 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
     let _ = early_heartbeat.await;
 
     let mut pending = VecDeque::new();
+    let mut debounce_deadline: Option<tokio::time::Instant> = None;
     let mut heartbeat = tokio::time::interval(Duration::from_secs(WATCH_HEARTBEAT_SECS));
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat.tick().await; // first tick fires immediately; consume it before the loop
@@ -269,8 +270,21 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
                     return Ok(());
                 };
                 queue_reindex_paths(&project_root, &filter, event, &mut pending);
+                // Anchor the debounce window when the first event lands; further
+                // events do NOT extend it so a continuous file-event stream
+                // still gets drained on schedule instead of starving.
+                if debounce_deadline.is_none() && !pending.is_empty() {
+                    debounce_deadline =
+                        Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                }
             }
-            _ = tokio::time::sleep(Duration::from_millis(250)), if !pending.is_empty() => {
+            _ = async {
+                match debounce_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                debounce_deadline = None;
                 let paths = drain_unique_paths(&mut pending);
                 for path in paths {
                     // Serialize against concurrent reindex-file CLI/MCP calls and
