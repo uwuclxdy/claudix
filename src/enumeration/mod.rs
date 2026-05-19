@@ -9,7 +9,7 @@ use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::types::{FileHash, Language, RelativePath};
 use crate::{IndexFileStatus, IndexProgress};
 
-pub use filters::PathFilters;
+pub use filters::{PathFilters, WatchFilter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumeratedFile {

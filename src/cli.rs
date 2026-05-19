@@ -13,6 +13,7 @@ use crate::config::{self, validate_project_relative_path};
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::hooks::HookEvent;
 use crate::search::SearchQuery;
+use crate::enumeration::WatchFilter;
 use crate::store::{IndexLockGuard, Store};
 use crate::types::{Language, RelativePath};
 use crate::{Claudix, IndexFileStatus, IndexProgress};
@@ -233,6 +234,7 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
         .watch(&project_root, RecursiveMode::Recursive)
         .map_err(|error| ClaudixError::Store(format!("file watcher failed: {error}")))?;
 
+    let filter = WatchFilter::load(&project_root)?;
     let claudix = Claudix::new(project_root.clone(), Arc::new(config)).await?;
     let mut pending = VecDeque::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(WATCH_HEARTBEAT_SECS));
@@ -244,7 +246,7 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
                 let Some(event) = event else {
                     return Ok(());
                 };
-                queue_reindex_paths(&project_root, event, &mut pending);
+                queue_reindex_paths(&project_root, &filter, event, &mut pending);
             }
             _ = tokio::time::sleep(Duration::from_millis(250)), if !pending.is_empty() => {
                 let paths = drain_unique_paths(&mut pending);
@@ -336,6 +338,7 @@ fn requires_clean_reindex(error: &ClaudixError) -> bool {
 
 fn queue_reindex_paths(
     project_root: &Path,
+    filter: &WatchFilter,
     event: notify::Result<notify::Event>,
     pending: &mut VecDeque<PathBuf>,
 ) {
@@ -348,7 +351,10 @@ fn queue_reindex_paths(
 
     pending.extend(event.paths.into_iter().filter_map(|path| {
         let relative = path.strip_prefix(project_root).ok()?;
-        if relative.components().next().is_none() || relative.starts_with(Path::new(".claudix")) {
+        if relative.components().next().is_none() {
+            return None;
+        }
+        if !filter.is_watchable(relative) {
             return None;
         }
         Some(relative.to_path_buf())
@@ -1030,17 +1036,59 @@ mod tests {
 
     #[test]
     fn queue_reindex_paths_ignores_internal_state_paths() {
-        let root = Path::new("/tmp/project");
+        let tmp = tempfile::tempdir();
+        assert!(tmp.is_ok());
+        let tmp = tmp.ok().unwrap_or_else(|| unreachable!());
+        let root = tmp.path();
         let event = notify::Event {
             kind: EventKind::Modify(notify::event::ModifyKind::Data(
                 notify::event::DataChange::Content,
             )),
-            paths: vec![root.join("src/lib.rs"), root.join(".claudix/manifest.json")],
+            paths: vec![
+                root.join("src/lib.rs"),
+                root.join(".claudix/manifest.json"),
+                root.join(".git/HEAD"),
+            ],
             attrs: notify::event::EventAttributes::new(),
         };
+        let filter = WatchFilter::load(root);
+        assert!(filter.is_ok());
+        let filter = filter.ok().unwrap_or_else(|| unreachable!());
         let mut pending = VecDeque::new();
 
-        queue_reindex_paths(root, Ok(event), &mut pending);
+        queue_reindex_paths(root, &filter, Ok(event), &mut pending);
+
+        assert_eq!(
+            pending.into_iter().collect::<Vec<_>>(),
+            vec![PathBuf::from("src/lib.rs")]
+        );
+    }
+
+    #[test]
+    fn queue_reindex_paths_respects_project_gitignore() {
+        let tmp = tempfile::tempdir();
+        assert!(tmp.is_ok());
+        let tmp = tmp.ok().unwrap_or_else(|| unreachable!());
+        let root = tmp.path();
+        assert!(std::fs::write(root.join(".gitignore"), "target/\nnode_modules/\n").is_ok());
+
+        let event = notify::Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![
+                root.join("src/lib.rs"),
+                root.join("target/debug/build/foo"),
+                root.join("node_modules/pkg/index.js"),
+            ],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        let filter = WatchFilter::load(root);
+        assert!(filter.is_ok());
+        let filter = filter.ok().unwrap_or_else(|| unreachable!());
+        let mut pending = VecDeque::new();
+
+        queue_reindex_paths(root, &filter, Ok(event), &mut pending);
 
         assert_eq!(
             pending.into_iter().collect::<Vec<_>>(),
