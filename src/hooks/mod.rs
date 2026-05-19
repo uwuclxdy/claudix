@@ -71,7 +71,6 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
         .as_ref()
         .and_then(|m| m.last_full_index_at.as_deref())
         .unwrap_or("none");
-    let payload = format!("{prior_ts}\n{}\n", now_rfc3339());
 
     // The marker doubles as the "spawn in progress" sentinel. `create_new`
     // serializes concurrent SessionStarts so we don't double-spawn before
@@ -79,14 +78,23 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     // spawn means an index is already running (or just failed and hasn't
     // aged out yet); either way, leave it alone so its `created_at` keeps
     // anchoring the failure-grace clock.
-    if !try_claim_pending_index_marker(&marker_path, &payload) {
+    let placeholder = format!("{prior_ts}\n{}\n0\n", now_rfc3339());
+    if !try_claim_pending_index_marker(&marker_path, &placeholder) {
         return false;
     }
+    let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
+    let _ = fs::remove_file(&ack_path);
 
-    if spawn_detached_claudix(project_root, [OsStr::new("index")]).is_none() {
+    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("index")]) else {
         let _ = fs::remove_file(&marker_path);
         return false;
-    }
+    };
+    // Overwrite the placeholder with the spawned PID so `check_index_ready`
+    // can gate the failure decision on the child still being alive — slow
+    // ONNX cold loads or large config parses must not be misclassified as
+    // a crashed index.
+    let payload = format!("{prior_ts}\n{}\n{child_pid}\n", now_rfc3339());
+    let _ = fs::write(&marker_path, payload);
     true
 }
 
@@ -127,6 +135,10 @@ fn pending_index_marker_is_fresh(marker_path: &Path) -> bool {
 struct PendingIndexMarker {
     prior_ts: String,
     created_at: SystemTime,
+    /// PID of the spawned `claudix index` child, or `None` if the marker is
+    /// still the placeholder written before the child was forked (or a legacy
+    /// marker missing this line entirely).
+    child_pid: Option<u32>,
 }
 
 fn read_pending_index_marker(marker_path: &Path) -> Option<PendingIndexMarker> {
@@ -134,9 +146,14 @@ fn read_pending_index_marker(marker_path: &Path) -> Option<PendingIndexMarker> {
     let mut lines = content.lines();
     let prior_ts = lines.next()?.to_owned();
     let created_at = parse_rfc3339(lines.next()?).ok()?;
+    let child_pid = lines
+        .next()
+        .and_then(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != 0);
     Some(PendingIndexMarker {
         prior_ts,
         created_at,
+        child_pid,
     })
 }
 
@@ -408,10 +425,16 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
         }));
     }
 
-    // Manifest timestamp unchanged AND no index lock holder. The spawned
-    // process likely crashed before acquiring its lock; give it a longer
-    // grace before declaring failure so a slow boot (cold ONNX load, large
-    // config parse) isn't misclassified.
+    // Manifest timestamp unchanged AND no index lock holder. If the spawned
+    // child is still alive we're inside the slow-boot window (cold ONNX
+    // load, large config parse) — never declare failure yet. Only after the
+    // PID exits and the failure grace has elapsed do we surface a failure.
+    if marker
+        .child_pid
+        .is_some_and(crate::store::process_running)
+    {
+        return None;
+    }
     if age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS) {
         return None;
     }
@@ -1393,13 +1416,25 @@ mod tests {
     fn pending_index_marker_round_trips() {
         let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
         let marker_path = dir.path().join("indexing-pending");
-        let payload = format!("2026-04-20T00:00:00Z\n{}\n", now_rfc3339());
+        let payload = format!("2026-04-20T00:00:00Z\n{}\n42\n", now_rfc3339());
 
         assert!(try_claim_pending_index_marker(&marker_path, &payload));
         let marker = read_pending_index_marker(&marker_path);
         assert!(marker.is_some());
         let marker = marker.unwrap_or_else(|| unreachable!());
         assert_eq!(marker.prior_ts, "2026-04-20T00:00:00Z");
+        assert_eq!(marker.child_pid, Some(42));
+    }
+
+    #[test]
+    fn pending_index_marker_treats_zero_pid_as_placeholder() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("indexing-pending");
+        let payload = format!("none\n{}\n0\n", now_rfc3339());
+        assert!(try_claim_pending_index_marker(&marker_path, &payload));
+        let marker = read_pending_index_marker(&marker_path)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(marker.child_pid, None);
     }
 
     #[test]
@@ -1427,6 +1462,34 @@ mod tests {
         assert!(try_claim_pending_index_marker(&marker_path, &payload));
         let marker = read_pending_index_marker(&marker_path);
         assert!(marker.is_some());
+    }
+
+    #[tokio::test]
+    async fn check_index_ready_defers_failure_while_child_pid_alive() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Backdate the marker past the failure grace but record this test
+        // process as the spawned child — `check_index_ready` must defer the
+        // failure decision while that PID is still alive.
+        let stale_created_at = "2025-01-01T00:00:00Z";
+        let my_pid = std::process::id();
+        let payload = format!("none\n{stale_created_at}\n{my_pid}\n");
+        fs::write(store.pending_index_marker_path(), payload)?;
+
+        let response = check_index_ready(fixture.root(), &config);
+        assert!(
+            response.is_none(),
+            "must not declare failure while spawned child is alive"
+        );
+        assert!(
+            store.pending_index_marker_path().exists(),
+            "marker must survive the deferred decision"
+        );
+        Ok(())
     }
 
     #[tokio::test]
