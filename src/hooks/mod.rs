@@ -9,6 +9,9 @@ const HEALTH_CACHE_FILE_NAME: &str = "embedder-health";
 const HEALTH_CACHE_HEALTHY_TTL_SECS: u64 = 60;
 const HEALTH_CACHE_UNHEALTHY_TTL_SECS: u64 = 30;
 const PRE_TOOL_USE_TIMEOUT_MS: u64 = 1_500;
+const PENDING_INDEX_READY_GRACE_SECS: u64 = 3;
+const PENDING_INDEX_FAILURE_GRACE_SECS: u64 = 60;
+const PENDING_INDEX_ACK_FILE_NAME: &str = "indexing-pending-acked";
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -279,15 +282,15 @@ fn watch_is_alive(project_root: &Path, config: &Config) -> bool {
 fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
     let store = Store::new(project_root, config).ok()?;
     let marker_path = store.pending_index_marker_path();
+    let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
     let prior_ts = fs::read_to_string(&marker_path).ok()?;
-    let prior_ts = prior_ts.trim();
+    let prior_ts = prior_ts.trim().to_owned();
 
-    // Give the spawned process a few seconds to acquire its lock before declaring it done.
     let marker_age = fs::metadata(&marker_path)
         .ok()
         .and_then(|m| m.modified().ok())
-        .and_then(|t| SystemTime::now().duration_since(t).ok());
-    if marker_age.is_none_or(|age| age < Duration::from_secs(3)) {
+        .and_then(|t| SystemTime::now().duration_since(t).ok())?;
+    if marker_age < Duration::from_secs(PENDING_INDEX_READY_GRACE_SECS) {
         return None;
     }
 
@@ -295,26 +298,49 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
         return None;
     }
 
-    let _ = fs::remove_file(&marker_path);
     let manifest = store.read_manifest().ok()??;
     let current_ts = manifest.last_full_index_at.as_deref().unwrap_or("none");
 
-    let additional_context = if current_ts != prior_ts {
-        format!(
-            "claudix indexing complete — {} files, {} chunks. Semantic search is now ready: \
-             use search_code for conceptual queries, identifier lookups, and cross-file discovery.",
-            manifest.file_count, manifest.chunk_count
-        )
-    } else {
-        "claudix background indexing ended without updating the index — it may have failed. \
-         Run /claudix:doctor to diagnose."
-            .to_owned()
-    };
+    if current_ts != prior_ts {
+        let _ = fs::remove_file(&marker_path);
+        let _ = fs::remove_file(&ack_path);
+        return Some(json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": format!(
+                    "claudix indexing complete — {} files, {} chunks. Semantic search is now ready: \
+                     use search_code for conceptual queries, identifier lookups, and cross-file discovery.",
+                    manifest.file_count, manifest.chunk_count
+                ),
+            }
+        }));
+    }
+
+    // Manifest unchanged AND no index lock holder. The spawned process likely
+    // crashed before acquiring its lock; give it a longer grace before
+    // declaring failure so a slow boot (cold ONNX load, large config parse)
+    // isn't misclassified.
+    if marker_age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS) {
+        return None;
+    }
+
+    let already_acked = fs::read_to_string(&ack_path)
+        .ok()
+        .map(|content| content.trim() == prior_ts)
+        .unwrap_or(false);
+    let _ = fs::write(&ack_path, &prior_ts);
+    let _ = fs::remove_file(&marker_path);
+
+    if already_acked {
+        return None;
+    }
 
     Some(json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
-            "additionalContext": additional_context,
+            "additionalContext":
+                "claudix background indexing ended without updating the index — it may have failed. \
+                 Run /claudix:doctor to diagnose.",
         }
     }))
 }
