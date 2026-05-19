@@ -549,7 +549,7 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
 
     let query = match tool_name {
         "Grep" => {
-            if tool_input.path.is_some() || tool_input.include.is_some() {
+            if grep_input_has_scoping_flag(&tool_input) {
                 return Ok(None);
             }
             tool_input.pattern
@@ -920,6 +920,31 @@ struct ToolInput {
     command: Option<String>,
     path: Option<String>,
     include: Option<String>,
+    glob: Option<String>,
+    #[serde(rename = "type")]
+    file_type: Option<String>,
+    output_mode: Option<String>,
+    head_limit: Option<Value>,
+    #[serde(rename = "-A")]
+    after_lines: Option<Value>,
+    #[serde(rename = "-B")]
+    before_lines: Option<Value>,
+    #[serde(rename = "-C")]
+    context_lines: Option<Value>,
+    multiline: Option<bool>,
+}
+
+fn grep_input_has_scoping_flag(input: &ToolInput) -> bool {
+    input.path.is_some()
+        || input.include.is_some()
+        || input.glob.is_some()
+        || input.file_type.is_some()
+        || input.output_mode.is_some()
+        || input.head_limit.is_some()
+        || input.after_lines.is_some()
+        || input.before_lines.is_some()
+        || input.context_lines.is_some()
+        || input.multiline.is_some()
 }
 
 #[cfg(test)]
