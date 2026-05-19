@@ -248,29 +248,29 @@ fn try_claim_watch_marker(marker_path: &Path) -> Option<std::fs::File> {
 }
 
 fn watch_marker_is_alive(marker_path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(marker_path) else {
+        return false;
+    };
+    // PID liveness is the authoritative signal: a watcher that's been running
+    // for hours is still alive even if its heartbeat task briefly stalled
+    // past the mtime window. The earlier mtime-then-PID gate could declare a
+    // long-running watcher dead and double-spawn it.
+    if let Ok(pid) = content.trim().parse::<u32>() {
+        return crate::store::process_running(pid);
+    }
+    // Unparseable content is the brief window between
+    // `OpenOptions::create_new` and the parent writing the child PID. Fall
+    // back to mtime so a fresh placeholder marker isn't treated as dead.
     let Ok(metadata) = fs::metadata(marker_path) else {
         return false;
     };
     let Ok(modified) = metadata.modified() else {
         return false;
     };
-    // `duration_since` errors when `modified` is in the future (clock skew or
-    // restored backup); treat that as expired so a single bad timestamp cannot
-    // permanently jam watcher respawn — matches `pending_index_marker_is_fresh`.
-    let fresh = SystemTime::now()
+    SystemTime::now()
         .duration_since(modified)
         .map(|age| age < Duration::from_secs(WATCH_MARKER_STALE_SECS))
-        .unwrap_or(false);
-    if !fresh {
-        return false;
-    }
-    let Ok(content) = fs::read_to_string(marker_path) else {
-        return false;
-    };
-    let Ok(pid) = content.trim().parse::<u32>() else {
-        return false;
-    };
-    crate::store::process_running(pid)
+        .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -759,13 +759,49 @@ fn truncate_snippet(content: &str, max_lines: usize) -> String {
 }
 
 fn extract_search_command(command: Option<&str>) -> Option<String> {
-    let command = command?.trim();
+    let command = strip_command_prefixes(command?.trim());
     let args = command
         .strip_prefix("rg ")
         .or_else(|| command.strip_prefix("grep "))
-        .or_else(|| command.strip_prefix("ag "))?;
+        .or_else(|| command.strip_prefix("ag "))
+        .or_else(|| command.strip_prefix("ack "))
+        .or_else(|| command.strip_prefix("ripgrep "))
+        .or_else(|| command.strip_prefix("git grep "))?;
     let args = args.trim();
     extract_quoted_pattern(args).or_else(|| extract_unquoted_pattern(args))
+}
+
+/// Strip wrappers like `time rg ...`, `nice rg ...`, or `env FOO=bar rg ...`
+/// so the search-tool prefix matcher still finds `rg`/`grep`/etc.
+fn strip_command_prefixes(command: &str) -> &str {
+    const WRAPPERS: &[&str] = &["time ", "nice ", "stdbuf -oL ", "stdbuf -o0 "];
+    let mut command = command;
+    loop {
+        let stripped = WRAPPERS
+            .iter()
+            .find_map(|prefix| command.strip_prefix(prefix));
+        match stripped {
+            Some(rest) => command = rest.trim_start(),
+            None if command.starts_with("env ") => {
+                // `env KEY=VAL KEY2=VAL2 rg ...`: skip the assignments until
+                // we hit a non-assignment token (the actual command).
+                let rest = command["env ".len()..].trim_start();
+                let mut after_assignments = rest;
+                for token in rest.split_whitespace() {
+                    if token.contains('=') && !token.starts_with('=') {
+                        after_assignments = after_assignments
+                            .trim_start_matches(token)
+                            .trim_start();
+                    } else {
+                        break;
+                    }
+                }
+                command = after_assignments;
+            }
+            None => break,
+        }
+    }
+    command
 }
 
 fn extract_quoted_pattern(args: &str) -> Option<String> {
@@ -971,6 +1007,32 @@ mod tests {
         }
         assert!(!looks_like_regex("error handling"));
         assert!(!looks_like_regex("handle_session_start"));
+    }
+
+    #[test]
+    fn extract_search_command_handles_extra_tools_and_wrappers() {
+        assert_eq!(
+            extract_search_command(Some("git grep \"error handling\" -- src/")),
+            Some("error handling".to_owned())
+        );
+        assert_eq!(
+            extract_search_command(Some("time rg foo_bar")),
+            Some("foo_bar".to_owned())
+        );
+        assert_eq!(
+            extract_search_command(Some("nice rg \"some thing\"")),
+            Some("some thing".to_owned())
+        );
+        assert_eq!(
+            extract_search_command(Some("env FOO=1 BAR=2 rg target_pattern")),
+            Some("target_pattern".to_owned())
+        );
+        assert_eq!(
+            extract_search_command(Some("ack pattern")),
+            Some("pattern".to_owned())
+        );
+        // Non-search command must still return None.
+        assert_eq!(extract_search_command(Some("ls -la src/")), None);
     }
 
     #[test]
@@ -1542,7 +1604,21 @@ mod tests {
     }
 
     #[test]
-    fn watch_marker_with_future_mtime_is_not_alive() {
+    fn watch_marker_with_dead_pid_is_not_alive() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join(WATCH_MARKER_FILE_NAME);
+        // PID 0 never refers to a real process on Unix or Windows, so this
+        // exercises the "parsed PID but process is gone" branch.
+        fs::write(&marker_path, "0").unwrap_or_else(|_| unreachable!());
+
+        assert!(
+            !watch_marker_is_alive(&marker_path),
+            "watch marker with dead PID must be reclaimable"
+        );
+    }
+
+    #[test]
+    fn watch_marker_with_live_pid_ignores_mtime() {
         let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
         let marker_path = dir.path().join(WATCH_MARKER_FILE_NAME);
         fs::write(&marker_path, std::process::id().to_string()).unwrap_or_else(|_| unreachable!());
@@ -1551,13 +1627,15 @@ mod tests {
             .write(true)
             .open(&marker_path)
             .unwrap_or_else(|_| unreachable!());
-        let future = SystemTime::now() + Duration::from_secs(3_600);
-        file.set_modified(future).unwrap_or_else(|_| unreachable!());
+        // Past mtime that would have flunked the old stale-window gate — PID
+        // liveness is now authoritative so the watcher must still register alive.
+        let stale = SystemTime::now() - Duration::from_secs(WATCH_MARKER_STALE_SECS * 10);
+        file.set_modified(stale).unwrap_or_else(|_| unreachable!());
         drop(file);
 
         assert!(
-            !watch_marker_is_alive(&marker_path),
-            "future-mtime watch marker must be reclaimable"
+            watch_marker_is_alive(&marker_path),
+            "watch marker with live PID must stay alive regardless of mtime"
         );
     }
 
