@@ -29,7 +29,6 @@ const LOCK_FILE_NAME: &str = "index.lock";
 const REINDEX_LOCK_FILE_NAME: &str = "reindex.lock";
 const REINDEX_LOCK_WAIT_MS: u64 = 5_000;
 const REINDEX_LOCK_POLL_MS: u64 = 50;
-const LOCK_STALE_SECS: u64 = 7_200;
 const LOCK_TERMINATION_GRACE_MS: u64 = 2_000;
 const LOCK_TERMINATION_POLL_MS: u64 = 100;
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
@@ -208,20 +207,26 @@ impl Store {
 
     pub fn full_index_running(&self) -> bool {
         let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
-        if let Some(pid) = read_lock_pid(&lock_path) {
-            return process_running(pid);
+        let Ok(content) = fs::read_to_string(&lock_path) else {
+            return false;
+        };
+        match content.trim().parse::<u32>() {
+            // Lock has a parseable PID — defer to the OS.
+            Ok(pid) => process_running(pid),
+            // Lock exists but has no PID yet. This is the small window between
+            // `create_new` and `writeln!` in `acquire_index_lock`; the writer
+            // is racing to fill it in. Anything older than this window is
+            // corrupt and should not block recovery.
+            Err(_) if content.trim().is_empty() => fs::metadata(&lock_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                .is_some_and(|age| age < Duration::from_secs(5)),
+            // Lock has non-empty unparseable contents — almost certainly a
+            // crash mid-write or unrelated debris. Treat as dead so the next
+            // acquire can replace it instead of waiting hours.
+            Err(_) => false,
         }
-
-        let Ok(metadata) = fs::metadata(&lock_path) else {
-            return false;
-        };
-        let Ok(modified) = metadata.modified() else {
-            return false;
-        };
-        let Ok(age) = std::time::SystemTime::now().duration_since(modified) else {
-            return false;
-        };
-        age.as_secs() < LOCK_STALE_SECS
     }
 
     pub fn stop_index_lock_holder(&self) {
