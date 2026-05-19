@@ -183,12 +183,43 @@ pub async fn run_status(project_root: impl AsRef<Path>) -> Result<StatusOutput> 
     status_from_store(&store, &config).await
 }
 
+const WATCH_MARKER_FILE_NAME: &str = "watch.pid";
+const WATCH_HEARTBEAT_SECS: u64 = 30;
+
+struct WatchMarkerGuard {
+    path: PathBuf,
+}
+
+impl WatchMarkerGuard {
+    fn install(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, std::process::id().to_string())?;
+        Ok(Self { path })
+    }
+
+    fn heartbeat(&self) {
+        let _ = std::fs::write(&self.path, std::process::id().to_string());
+    }
+}
+
+impl Drop for WatchMarkerGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
     let project_root = canonical_project_root(project_root.as_ref())?;
     let config = config::load(&project_root)?;
     if !config.watch {
         return Ok(());
     }
+
+    let store = Store::new(&project_root, &config)?;
+    store.ensure_layout()?;
+    let marker = WatchMarkerGuard::install(store.state_dir_path().join(WATCH_MARKER_FILE_NAME))?;
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let mut watcher = RecommendedWatcher::new(
@@ -204,6 +235,9 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
 
     let claudix = Claudix::new(project_root.clone(), Arc::new(config)).await?;
     let mut pending = VecDeque::new();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(WATCH_HEARTBEAT_SECS));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await; // first tick fires immediately; consume it before the loop
     loop {
         tokio::select! {
             event = event_rx.recv() => {
@@ -219,6 +253,9 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
                         tracing::warn!("claudix watch failed to reindex {}: {error}", path.display());
                     }
                 }
+            }
+            _ = heartbeat.tick() => {
+                marker.heartbeat();
             }
         }
     }

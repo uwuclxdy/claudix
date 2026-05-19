@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, SystemTime};
 
 const WATCH_MARKER_FILE_NAME: &str = "watch.pid";
-const WATCH_MARKER_STALE_SECS: u64 = 43_200;
+const WATCH_MARKER_STALE_SECS: u64 = 120;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -55,7 +55,7 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
         return false;
     }
     let manifest = store.read_manifest().ok().flatten();
-    let spawned = spawn_detached_claudix(project_root, [OsStr::new("index")]);
+    let spawned = spawn_detached_claudix(project_root, [OsStr::new("index")]).is_some();
     if spawned {
         let _ = store.ensure_layout();
         let prior_ts = manifest
@@ -67,14 +67,11 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     spawned
 }
 
-fn spawn_detached_claudix<const N: usize, S>(project_root: &Path, args: [S; N]) -> bool
+fn spawn_detached_claudix<const N: usize, S>(project_root: &Path, args: [S; N]) -> Option<u32>
 where
     S: AsRef<OsStr>,
 {
-    let Ok(binary) = std::env::current_exe() else {
-        return false;
-    };
-
+    let binary = std::env::current_exe().ok()?;
     spawn_detached_command(project_root, binary.as_os_str(), args)
 }
 
@@ -89,29 +86,43 @@ fn spawn_background_watch(project_root: &Path, config: &Config) -> bool {
         return false;
     }
     let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
-    if watch_marker_is_fresh(&marker_path) {
+    if watch_marker_is_alive(&marker_path) {
         return false;
     }
+    // Stale marker — clear so the new child can take over without a freshness
+    // window from the dead writer's timestamp.
+    let _ = fs::remove_file(&marker_path);
 
-    let spawned = spawn_detached_claudix(project_root, [OsStr::new("watch")]);
-    if spawned {
-        let _ = fs::write(marker_path, std::process::id().to_string());
-    }
-    spawned
+    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("watch")]) else {
+        return false;
+    };
+    // Seed the marker with the spawned child's PID so a concurrent
+    // SessionStart sees a live entry before the child finishes booting.
+    let _ = fs::write(marker_path, child_pid.to_string());
+    true
 }
 
-fn watch_marker_is_fresh(marker_path: &Path) -> bool {
+fn watch_marker_is_alive(marker_path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(marker_path) else {
         return false;
     };
     let Ok(modified) = metadata.modified() else {
         return false;
     };
-    let Ok(age) = SystemTime::now().duration_since(modified) else {
-        return true;
+    let fresh = SystemTime::now()
+        .duration_since(modified)
+        .map(|age| age < Duration::from_secs(WATCH_MARKER_STALE_SECS))
+        .unwrap_or(true);
+    if !fresh {
+        return false;
+    }
+    let Ok(content) = fs::read_to_string(marker_path) else {
+        return false;
     };
-
-    age < Duration::from_secs(WATCH_MARKER_STALE_SECS)
+    let Ok(pid) = content.trim().parse::<u32>() else {
+        return false;
+    };
+    crate::store::process_running(pid)
 }
 
 #[cfg(unix)]
@@ -119,12 +130,15 @@ fn spawn_detached_command<const N: usize, S>(
     project_root: &Path,
     binary: &OsStr,
     args: [S; N],
-) -> bool
+) -> Option<u32>
 where
     S: AsRef<OsStr>,
 {
     use std::os::unix::process::CommandExt;
 
+    // `nohup` re-execs the binary, so its PID is the nohup process itself;
+    // for our liveness checks that's fine because the wrapper stays alive
+    // for the whole runtime of the child it execs into.
     std::process::Command::new("nohup")
         .arg(binary)
         .args(args.iter().map(AsRef::as_ref))
@@ -135,7 +149,8 @@ where
         .stderr(std::process::Stdio::null())
         .process_group(0)
         .spawn()
-        .is_ok()
+        .ok()
+        .map(|child| child.id())
 }
 
 #[cfg(windows)]
@@ -143,7 +158,7 @@ fn spawn_detached_command<const N: usize, S>(
     project_root: &Path,
     binary: &OsStr,
     args: [S; N],
-) -> bool
+) -> Option<u32>
 where
     S: AsRef<OsStr>,
 {
@@ -161,7 +176,8 @@ where
         .stderr(std::process::Stdio::null())
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
-        .is_ok()
+        .ok()
+        .map(|child| child.id())
 }
 
 async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Result<Option<Value>> {
@@ -293,7 +309,7 @@ fn is_write_tool(tool_name: &str) -> bool {
 }
 
 fn spawn_background_reindex_file(project_root: &Path, file_path: &str) {
-    let _ = spawn_detached_claudix(
+    spawn_detached_claudix(
         project_root,
         [OsStr::new("reindex-file"), OsStr::new(file_path)],
     );

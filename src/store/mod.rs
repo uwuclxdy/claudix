@@ -608,7 +608,7 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) {
 }
 
 #[cfg(unix)]
-fn process_running(pid: u32) -> bool {
+pub(crate) fn process_running(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stderr(Stdio::null())
@@ -633,7 +633,7 @@ fn kill_process(pid: u32) {
 }
 
 #[cfg(windows)]
-fn process_running(pid: u32) -> bool {
+pub(crate) fn process_running(pid: u32) -> bool {
     Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .output()
