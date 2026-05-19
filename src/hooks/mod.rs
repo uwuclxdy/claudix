@@ -24,7 +24,7 @@ use crate::config::{self, Config};
 use crate::error::{ClaudixError, Result};
 use crate::search::SearchQuery;
 use crate::store::{Manifest, Store};
-use crate::util::parse_rfc3339;
+use crate::util::{now_rfc3339, parse_rfc3339};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookEvent {
@@ -61,17 +61,83 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
     if store.full_index_running() {
         return false;
     }
-    let manifest = store.read_manifest().ok().flatten();
-    let spawned = spawn_detached_claudix(project_root, [OsStr::new("index")]).is_some();
-    if spawned {
-        let _ = store.ensure_layout();
-        let prior_ts = manifest
-            .as_ref()
-            .and_then(|m| m.last_full_index_at.as_deref())
-            .unwrap_or("none");
-        let _ = fs::write(store.pending_index_marker_path(), prior_ts);
+    if store.ensure_layout().is_err() {
+        return false;
     }
-    spawned
+
+    let marker_path = store.pending_index_marker_path();
+    let manifest = store.read_manifest().ok().flatten();
+    let prior_ts = manifest
+        .as_ref()
+        .and_then(|m| m.last_full_index_at.as_deref())
+        .unwrap_or("none");
+    let payload = format!("{prior_ts}\n{}\n", now_rfc3339());
+
+    // The marker doubles as the "spawn in progress" sentinel. `create_new`
+    // serializes concurrent SessionStarts so we don't double-spawn before
+    // the child has taken the full-index lock. A fresh marker from a prior
+    // spawn means an index is already running (or just failed and hasn't
+    // aged out yet); either way, leave it alone so its `created_at` keeps
+    // anchoring the failure-grace clock.
+    if !try_claim_pending_index_marker(&marker_path, &payload) {
+        return false;
+    }
+
+    if spawn_detached_claudix(project_root, [OsStr::new("index")]).is_none() {
+        let _ = fs::remove_file(&marker_path);
+        return false;
+    }
+    true
+}
+
+fn try_claim_pending_index_marker(marker_path: &Path, payload: &str) -> bool {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    for _ in 0..2 {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(marker_path)
+        {
+            Ok(mut file) => return file.write_all(payload.as_bytes()).is_ok(),
+            Err(_) => {
+                if pending_index_marker_is_fresh(marker_path) {
+                    return false;
+                }
+                if fs::remove_file(marker_path).is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn pending_index_marker_is_fresh(marker_path: &Path) -> bool {
+    let Some(marker) = read_pending_index_marker(marker_path) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(marker.created_at)
+        .map(|age| age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS.saturating_mul(2)))
+        .unwrap_or(true)
+}
+
+struct PendingIndexMarker {
+    prior_ts: String,
+    created_at: SystemTime,
+}
+
+fn read_pending_index_marker(marker_path: &Path) -> Option<PendingIndexMarker> {
+    let content = fs::read_to_string(marker_path).ok()?;
+    let mut lines = content.lines();
+    let prior_ts = lines.next()?.to_owned();
+    let created_at = parse_rfc3339(lines.next()?).ok()?;
+    Some(PendingIndexMarker {
+        prior_ts,
+        created_at,
+    })
 }
 
 fn spawn_detached_claudix<const N: usize, S>(project_root: &Path, args: [S; N]) -> Option<u32>
@@ -303,14 +369,12 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
     let store = Store::new(project_root, config).ok()?;
     let marker_path = store.pending_index_marker_path();
     let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
-    let prior_ts = fs::read_to_string(&marker_path).ok()?;
-    let prior_ts = prior_ts.trim().to_owned();
+    let marker = read_pending_index_marker(&marker_path)?;
 
-    let marker_age = fs::metadata(&marker_path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| SystemTime::now().duration_since(t).ok())?;
-    if marker_age < Duration::from_secs(PENDING_INDEX_READY_GRACE_SECS) {
+    let age = SystemTime::now()
+        .duration_since(marker.created_at)
+        .unwrap_or(Duration::ZERO);
+    if age < Duration::from_secs(PENDING_INDEX_READY_GRACE_SECS) {
         return None;
     }
 
@@ -318,12 +382,20 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
         return None;
     }
 
-    let manifest = store.read_manifest().ok()??;
-    let current_ts = manifest.last_full_index_at.as_deref().unwrap_or("none");
+    let manifest = store.read_manifest().ok().flatten();
+    let current_ts = manifest
+        .as_ref()
+        .and_then(|m| m.last_full_index_at.as_deref())
+        .unwrap_or("none");
 
-    if current_ts != prior_ts {
+    if current_ts != marker.prior_ts {
         let _ = fs::remove_file(&marker_path);
         let _ = fs::remove_file(&ack_path);
+        let Some(manifest) = manifest else {
+            // ts changed but the manifest is gone — treat as a failed run so
+            // the user is informed instead of silently dropping the signal.
+            return Some(indexing_failed_response());
+        };
         return Some(json!({
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
@@ -336,33 +408,37 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
         }));
     }
 
-    // Manifest unchanged AND no index lock holder. The spawned process likely
-    // crashed before acquiring its lock; give it a longer grace before
-    // declaring failure so a slow boot (cold ONNX load, large config parse)
-    // isn't misclassified.
-    if marker_age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS) {
+    // Manifest timestamp unchanged AND no index lock holder. The spawned
+    // process likely crashed before acquiring its lock; give it a longer
+    // grace before declaring failure so a slow boot (cold ONNX load, large
+    // config parse) isn't misclassified.
+    if age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS) {
         return None;
     }
 
     let already_acked = fs::read_to_string(&ack_path)
         .ok()
-        .map(|content| content.trim() == prior_ts)
+        .map(|content| content.trim() == marker.prior_ts)
         .unwrap_or(false);
-    let _ = fs::write(&ack_path, &prior_ts);
+    let _ = fs::write(&ack_path, &marker.prior_ts);
     let _ = fs::remove_file(&marker_path);
 
     if already_acked {
         return None;
     }
 
-    Some(json!({
+    Some(indexing_failed_response())
+}
+
+fn indexing_failed_response() -> Value {
+    json!({
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext":
                 "claudix background indexing ended without updating the index — it may have failed. \
                  Run /claudix:doctor to diagnose.",
         }
-    }))
+    })
 }
 
 fn is_write_tool(tool_name: &str) -> bool {
@@ -1311,6 +1387,76 @@ mod tests {
             context.contains("search_code MCP tool"),
             "context must include tip to use search_code directly, got: {context}"
         );
+    }
+
+    #[test]
+    fn pending_index_marker_round_trips() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("indexing-pending");
+        let payload = format!("2026-04-20T00:00:00Z\n{}\n", now_rfc3339());
+
+        assert!(try_claim_pending_index_marker(&marker_path, &payload));
+        let marker = read_pending_index_marker(&marker_path);
+        assert!(marker.is_some());
+        let marker = marker.unwrap_or_else(|| unreachable!());
+        assert_eq!(marker.prior_ts, "2026-04-20T00:00:00Z");
+    }
+
+    #[test]
+    fn pending_index_marker_claim_is_atomic() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("indexing-pending");
+        let first = format!("none\n{}\n", now_rfc3339());
+        assert!(try_claim_pending_index_marker(&marker_path, &first));
+
+        // Second claim while the first is still fresh must fail.
+        let second = format!("ts-2\n{}\n", now_rfc3339());
+        assert!(!try_claim_pending_index_marker(&marker_path, &second));
+        let marker = read_pending_index_marker(&marker_path)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(marker.prior_ts, "none", "first claim must remain in place");
+    }
+
+    #[test]
+    fn pending_index_marker_claim_replaces_legacy_or_unparseable() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("indexing-pending");
+        assert!(fs::write(&marker_path, "legacy-single-line").is_ok());
+
+        let payload = format!("none\n{}\n", now_rfc3339());
+        assert!(try_claim_pending_index_marker(&marker_path, &payload));
+        let marker = read_pending_index_marker(&marker_path);
+        assert!(marker.is_some());
+    }
+
+    #[tokio::test]
+    async fn check_index_ready_surfaces_failure_when_manifest_is_missing() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Backdate the marker past the failure grace; leave the manifest absent
+        // to simulate a first-time index that crashed before writing one.
+        let stale_created_at = "2025-01-01T00:00:00Z";
+        let payload = format!("none\n{stale_created_at}\n");
+        fs::write(store.pending_index_marker_path(), payload)?;
+
+        let response = check_index_ready(fixture.root(), &config);
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("ended without updating the index"),
+            "expected failure context, got: {context}"
+        );
+        assert!(
+            !store.pending_index_marker_path().exists(),
+            "marker must be cleaned up after surfacing failure"
+        );
+        Ok(())
     }
 
     #[test]
