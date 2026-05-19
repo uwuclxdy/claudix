@@ -55,15 +55,9 @@ fn spawn_background_index(project_root: &Path, config: &crate::config::Config) -
         return false;
     }
     let manifest = store.read_manifest().ok().flatten();
-    let needs_index = manifest
-        .as_ref()
-        .map(|m| index_is_stale(m, config))
-        .unwrap_or(true);
-    if !needs_index {
-        return false;
-    }
     let spawned = spawn_detached_claudix(project_root, [OsStr::new("index")]);
     if spawned {
+        let _ = store.ensure_layout();
         let prior_ts = manifest
             .as_ref()
             .and_then(|m| m.last_full_index_at.as_deref())
