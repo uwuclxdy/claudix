@@ -131,7 +131,7 @@ fn pending_index_marker_is_fresh(marker_path: &Path) -> bool {
     // can't permanently jam the auto-indexer.
     SystemTime::now()
         .duration_since(marker.created_at)
-        .map(|age| age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS.saturating_mul(2)))
+        .map(|age| age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS))
         .unwrap_or(false)
 }
 
@@ -397,7 +397,7 @@ fn check_index_ready(project_root: &Path, config: &Config) -> Option<Value> {
     let now = SystemTime::now();
     let age = match now.duration_since(marker.created_at) {
         Ok(age) => age,
-        Err(_) => Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS.saturating_mul(2)),
+        Err(_) => Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS),
     };
     if age < Duration::from_secs(PENDING_INDEX_READY_GRACE_SECS) {
         return None;
