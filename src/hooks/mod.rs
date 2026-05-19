@@ -5,6 +5,10 @@ use std::time::{Duration, SystemTime};
 
 const WATCH_MARKER_FILE_NAME: &str = "watch.pid";
 const WATCH_MARKER_STALE_SECS: u64 = 120;
+const HEALTH_CACHE_FILE_NAME: &str = "embedder-health";
+const HEALTH_CACHE_HEALTHY_TTL_SECS: u64 = 60;
+const HEALTH_CACHE_UNHEALTHY_TTL_SECS: u64 = 30;
+const PRE_TOOL_USE_TIMEOUT_MS: u64 = 1_500;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -14,7 +18,7 @@ use std::sync::Arc;
 use crate::Claudix;
 use crate::cli;
 use crate::config::{self, Config};
-use crate::error::Result;
+use crate::error::{ClaudixError, Result};
 use crate::search::SearchQuery;
 use crate::store::{Manifest, Store};
 use crate::util::parse_rfc3339;
@@ -369,21 +373,65 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
         return Ok(None);
     }
 
-    if let Ok(claudix) = Claudix::new(project_root.to_path_buf(), Arc::new(config.clone())).await {
-        let search_query = SearchQuery {
-            query: query.clone(),
-            top_k: config.search.top_k,
-            language_filter: None,
-            path_prefix: None,
-        };
-        if let Ok(results) = claudix.search(search_query).await
-            && !results.is_empty()
-        {
-            return Ok(Some(pre_tool_use_search_response(&query, results)));
-        }
+    let health_cache_path = store.state_dir_path().join(HEALTH_CACHE_FILE_NAME);
+    if matches!(read_cached_health(&health_cache_path), Some(false)) {
+        return Ok(None);
     }
 
-    Ok(None)
+    let search_query = SearchQuery {
+        query: query.clone(),
+        top_k: config.search.top_k,
+        language_filter: None,
+        path_prefix: None,
+    };
+    let project_root = project_root.to_path_buf();
+    let config_arc = Arc::new(config.clone());
+    let work = async move {
+        let claudix = Claudix::new(project_root, config_arc).await?;
+        let results = claudix.search(search_query).await?;
+        Ok::<_, ClaudixError>(results)
+    };
+
+    match tokio::time::timeout(Duration::from_millis(PRE_TOOL_USE_TIMEOUT_MS), work).await {
+        Ok(Ok(results)) => {
+            write_cached_health(&health_cache_path, true);
+            if results.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(pre_tool_use_search_response(&query, results)))
+            }
+        }
+        Ok(Err(_)) => {
+            write_cached_health(&health_cache_path, false);
+            Ok(None)
+        }
+        // Timeout doesn't necessarily mean the embedder is unhealthy — bundled
+        // ONNX cold-loads can exceed the budget — so pass through without
+        // poisoning the cache.
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_cached_health(marker_path: &Path) -> Option<bool> {
+    let metadata = fs::metadata(marker_path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let age = SystemTime::now().duration_since(modified).ok()?;
+    let content = fs::read_to_string(marker_path).ok()?;
+    let healthy = match content.trim() {
+        "1" => true,
+        "0" => false,
+        _ => return None,
+    };
+    let ttl = if healthy {
+        HEALTH_CACHE_HEALTHY_TTL_SECS
+    } else {
+        HEALTH_CACHE_UNHEALTHY_TTL_SECS
+    };
+    (age < Duration::from_secs(ttl)).then_some(healthy)
+}
+
+fn write_cached_health(marker_path: &Path, healthy: bool) {
+    let _ = fs::write(marker_path, if healthy { "1" } else { "0" });
 }
 
 async fn consume_pending_restart() -> Option<String> {
