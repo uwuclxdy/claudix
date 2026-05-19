@@ -518,7 +518,11 @@ fn spawn_background_reindex_file(project_root: &Path, file_path: &str) {
 }
 
 async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Result<Option<Value>> {
-    let config = config::load(project_root)?;
+    // Hooks must fail open: a corrupt config or unreadable store yields a
+    // passthrough, not a propagated error that could break the session.
+    let Ok(config) = config::load(project_root) else {
+        return Ok(None);
+    };
     if !config.hooks.intercept_grep {
         return Ok(None);
     }
@@ -548,9 +552,10 @@ async fn handle_pre_tool_use(project_root: &Path, payload: HookPayload) -> Resul
         return Ok(None);
     }
 
-    let store = Store::new(project_root, &config)?;
-    let manifest = store.read_manifest()?;
-    let Some(manifest) = manifest else {
+    let Ok(store) = Store::new(project_root, &config) else {
+        return Ok(None);
+    };
+    let Ok(Some(manifest)) = store.read_manifest() else {
         return Ok(None);
     };
     if index_is_stale(&manifest, &config) {
@@ -1699,6 +1704,29 @@ mod tests {
         assert!(
             context.contains("building its first index"),
             "expected in-flight message for empty manifest with pending marker, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_through_on_corrupt_config() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let claude_dir = fixture.root().join(".claude");
+        fs::create_dir_all(&claude_dir)?;
+        // Malformed TOML — config::load would error; the hook must fail open.
+        fs::write(
+            claude_dir.join("claudix.toml"),
+            "this is = not = valid toml [",
+        )?;
+
+        let payload = json!({
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "where is config loaded" }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await?;
+        assert!(
+            response.is_none(),
+            "corrupt config must passthrough, not error"
         );
         Ok(())
     }
