@@ -11,21 +11,11 @@ use crate::config;
 use crate::enumeration::WatchFilter;
 use crate::error::{ClaudixError, Result};
 use crate::store::Store;
+use crate::store::marker::{ClaimError, PidMarker};
 
 use super::canonical_project_root;
 
 pub(super) const WATCH_HEARTBEAT_SECS: u64 = 30;
-
-pub(super) fn install_watch_marker(path: PathBuf) -> Result<crate::store::marker::PidMarker> {
-    crate::store::marker::PidMarker::install(path).map_err(|error| match error {
-        crate::store::marker::ClaimError::AlreadyHeld => {
-            ClaudixError::Store("another claudix watch process is already running".to_owned())
-        }
-        crate::store::marker::ClaimError::Setup => {
-            ClaudixError::Store("watch marker setup failed".to_owned())
-        }
-    })
-}
 
 pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
     let project_root = canonical_project_root(project_root.as_ref())?;
@@ -36,7 +26,14 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
 
     let store = Store::new(&project_root, &config)?;
     store.ensure_layout()?;
-    let marker = Arc::new(install_watch_marker(store.watch_marker_path())?);
+    let marker = Arc::new(PidMarker::install(store.watch_marker_path()).map_err(
+        |error| match error {
+            ClaimError::AlreadyHeld => {
+                ClaudixError::Store("another claudix watch process is already running".to_owned())
+            }
+            ClaimError::Setup => ClaudixError::Store("watch marker setup failed".to_owned()),
+        },
+    )?);
 
     // Cold ONNX loads can exceed the marker stale window; refresh the marker
     // from a side task while the watcher itself is still booting so concurrent
