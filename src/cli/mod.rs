@@ -271,7 +271,6 @@ async fn run_search_with_claudix(
     language_filter: Option<Vec<String>>,
     path_prefix: Option<String>,
 ) -> Result<SearchOutput> {
-    validate_search_top_k(top_k)?;
     let query = SearchQuery {
         query,
         top_k,
