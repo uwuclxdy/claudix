@@ -179,8 +179,14 @@ impl Claudix {
         if !filter.is_watchable(&relative_path.to_path_buf()) {
             let manifest = self.store.read_manifest()?;
             return Ok(IndexStats {
-                file_count: manifest.as_ref().map(|m| m.file_count as usize).unwrap_or(0),
-                chunk_count: manifest.as_ref().map(|m| m.chunk_count as usize).unwrap_or(0),
+                file_count: manifest
+                    .as_ref()
+                    .map(|m| m.file_count as usize)
+                    .unwrap_or(0),
+                chunk_count: manifest
+                    .as_ref()
+                    .map(|m| m.chunk_count as usize)
+                    .unwrap_or(0),
             });
         }
 
@@ -925,7 +931,9 @@ mod tests {
 
         let after = claudix.store.read_chunks().await?;
         assert!(
-            after.iter().all(|row| !row.file_path.starts_with(".claudix")),
+            after
+                .iter()
+                .all(|row| !row.file_path.starts_with(".claudix")),
             "no chunk under .claudix/ should be embedded"
         );
         Ok(())

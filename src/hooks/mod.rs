@@ -775,128 +775,211 @@ fn truncate_snippet(content: &str, max_lines: usize) -> String {
 }
 
 fn extract_search_command(command: Option<&str>) -> Option<String> {
-    let command = strip_command_prefixes(command?.trim());
-    let args = command
-        .strip_prefix("rg ")
-        .or_else(|| command.strip_prefix("grep "))
-        .or_else(|| command.strip_prefix("ag "))
-        .or_else(|| command.strip_prefix("ack "))
-        .or_else(|| command.strip_prefix("ripgrep "))
-        .or_else(|| command.strip_prefix("git grep "))?;
-    let args = args.trim();
-    extract_quoted_pattern(args).or_else(|| extract_unquoted_pattern(args))
+    let command = command?.trim();
+    let tokens = shell_words::split(command).ok()?;
+    let mut idx = strip_command_wrappers(&tokens);
+    let tool = tokens.get(idx)?.as_str();
+    idx += 1;
+    match tool {
+        "rg" | "ripgrep" | "grep" | "ag" | "ack" => {}
+        "git" => {
+            if tokens.get(idx).map(String::as_str) != Some("grep") {
+                return None;
+            }
+            idx += 1;
+        }
+        _ => return None,
+    }
+    extract_pattern_from_args(&tokens[idx..])
 }
 
-/// Strip wrappers like `time rg ...`, `nice rg ...`, or `env FOO=bar rg ...`
-/// so the search-tool prefix matcher still finds `rg`/`grep`/etc.
-fn strip_command_prefixes(command: &str) -> &str {
-    const WRAPPERS: &[&str] = &["time ", "nice ", "stdbuf -oL ", "stdbuf -o0 "];
-    let mut command = command;
-    loop {
-        let stripped = WRAPPERS
-            .iter()
-            .find_map(|prefix| command.strip_prefix(prefix));
-        match stripped {
-            Some(rest) => command = rest.trim_start(),
-            None if command.starts_with("env ") => {
-                // `env KEY=VAL KEY2=VAL2 rg ...`: skip the assignments until
-                // we hit a non-assignment token (the actual command).
-                let rest = command["env ".len()..].trim_start();
-                let mut after_assignments = rest;
-                for token in rest.split_whitespace() {
+/// Skip `time`/`nice`/`stdbuf -oL`/`env KEY=VAL` wrappers in token form so the
+/// search-tool detector can still see the real command. Returns the index of
+/// the first non-wrapper token (or `tokens.len()` if the whole stream is
+/// wrappers — caller will treat that as "no command").
+fn strip_command_wrappers(tokens: &[String]) -> usize {
+    let mut idx = 0;
+    while idx < tokens.len() {
+        match tokens[idx].as_str() {
+            "time" | "nice" => idx += 1,
+            "stdbuf" => {
+                idx += 1;
+                if idx < tokens.len() {
+                    idx += 1;
+                }
+            }
+            "env" => {
+                idx += 1;
+                while let Some(token) = tokens.get(idx) {
                     if token.contains('=') && !token.starts_with('=') {
-                        after_assignments =
-                            after_assignments.trim_start_matches(token).trim_start();
+                        idx += 1;
                     } else {
                         break;
                     }
                 }
-                command = after_assignments;
             }
-            None => break,
+            _ => break,
         }
     }
-    command
+    idx
 }
 
-fn extract_quoted_pattern(args: &str) -> Option<String> {
-    let bytes = args.as_bytes();
-    let dq_pos = bytes.iter().position(|&b| b == b'"');
-    let sq_pos = bytes.iter().position(|&b| b == b'\'');
+/// Walk the rg/grep arg list and decide whether the call is a candidate for
+/// semantic-search interception. Returns the pattern only when the command is
+/// unambiguous: exactly one pattern, no output-mode flags, no positional path
+/// scope. Anything else returns `None`, which means passthrough.
+///
+/// `Grep` already gates output-mode flags via `grep_input_has_scoping_flag`;
+/// this is the equivalent for Bash invocations.
+fn extract_pattern_from_args(args: &[String]) -> Option<String> {
+    // Long flags whose mere presence breaks semantic-search substitution
+    // (counts, file lists, JSON, invert, context lines, output transforms).
+    const LONG_DISRUPTIVE: &[&str] = &[
+        "files-with-matches",
+        "files-without-match",
+        "files",
+        "count",
+        "count-matches",
+        "json",
+        "only-matching",
+        "invert-match",
+        "passthru",
+        "passthrough",
+        "quiet",
+        "after-context",
+        "before-context",
+        "context",
+        "vimgrep",
+        "no-filename",
+        "with-filename",
+        "stats",
+        "replace",
+        "file",
+    ];
+    // Long flags that take a value but don't change semantics — skip the value.
+    const LONG_VALUE_NEUTRAL: &[&str] = &[
+        "type",
+        "type-not",
+        "type-add",
+        "type-clear",
+        "glob",
+        "iglob",
+        "include",
+        "exclude",
+        "include-dir",
+        "exclude-dir",
+        "max-count",
+        "max-depth",
+        "max-filesize",
+        "color",
+        "colors",
+        "engine",
+        "encoding",
+        "threads",
+        "sort",
+        "sortr",
+        "pre",
+        "pre-glob",
+        "context-separator",
+        "field-context-separator",
+        "field-match-separator",
+        "dfa-size-limit",
+        "regex-size-limit",
+    ];
+    // Long flags whose value is itself a pattern (`-e/--regex PATTERN`).
+    const LONG_PATTERN: &[&str] = &["regex", "regexp"];
+    // Short single-character flags that are disruptive on their own or in a bundle.
+    const SHORT_DISRUPTIVE: &[char] = &['l', 'L', 'c', 'v', 'o', 'q', 'A', 'B', 'C', 'f'];
+    // Short value-taking neutral flags (consume the next token unless glued).
+    const SHORT_VALUE_NEUTRAL: &[char] = &['t', 'T', 'g', 'm'];
 
-    let (start, quote) = match (dq_pos, sq_pos) {
-        (Some(d), Some(s)) => {
-            if d < s {
-                (d, b'"')
-            } else {
-                (s, b'\'')
+    let mut explicit_patterns: Vec<String> = Vec::new();
+    let mut positionals: Vec<String> = Vec::new();
+    let mut idx = 0;
+
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+
+        if arg == "--" {
+            for tail in &args[idx + 1..] {
+                positionals.push(tail.clone());
             }
-        }
-        (Some(d), None) => (d, b'"'),
-        (None, Some(s)) => (s, b'\''),
-        (None, None) => return None,
-    };
-
-    let after = &args[start + 1..];
-    let quote = char::from(quote);
-    let mut pattern = String::new();
-    let mut escaped = false;
-    let mut closed = false;
-
-    for character in after.chars() {
-        if escaped {
-            if character == quote {
-                pattern.push(character);
-            } else {
-                pattern.push('\\');
-                pattern.push(character);
-            }
-            escaped = false;
-            continue;
-        }
-
-        if character == '\\' {
-            escaped = true;
-            continue;
-        }
-
-        if character == quote {
-            closed = true;
             break;
         }
 
-        pattern.push(character);
+        if let Some(rest) = arg.strip_prefix("--") {
+            if rest.is_empty() {
+                idx += 1;
+                continue;
+            }
+            let (name, embedded) = match rest.split_once('=') {
+                Some((n, v)) => (n, Some(v.to_owned())),
+                None => (rest, None),
+            };
+            if LONG_DISRUPTIVE.contains(&name) {
+                return None;
+            }
+            if LONG_PATTERN.contains(&name) {
+                let value = match embedded {
+                    Some(v) => v,
+                    None => {
+                        idx += 1;
+                        args.get(idx).cloned()?
+                    }
+                };
+                explicit_patterns.push(value);
+                idx += 1;
+                continue;
+            }
+            if LONG_VALUE_NEUTRAL.contains(&name) {
+                idx += if embedded.is_some() { 1 } else { 2 };
+                continue;
+            }
+            // Unknown long flag — assume valueless and move on.
+            idx += 1;
+            continue;
+        }
+
+        if let Some(rest) = arg.strip_prefix('-') {
+            if rest.is_empty() {
+                // Bare `-` is a positional (stdin in grep).
+                positionals.push(arg.to_owned());
+                idx += 1;
+                continue;
+            }
+            if rest.chars().any(|c| SHORT_DISRUPTIVE.contains(&c)) {
+                return None;
+            }
+            if let Some(stripped) = rest.strip_prefix('e') {
+                if stripped.is_empty() {
+                    idx += 1;
+                    explicit_patterns.push(args.get(idx).cloned()?);
+                    idx += 1;
+                } else {
+                    explicit_patterns.push(stripped.to_owned());
+                    idx += 1;
+                }
+                continue;
+            }
+            if rest.len() == 1
+                && let Some(ch) = rest.chars().next()
+                && SHORT_VALUE_NEUTRAL.contains(&ch)
+            {
+                idx += 2;
+                continue;
+            }
+            idx += 1;
+            continue;
+        }
+
+        positionals.push(arg.to_owned());
+        idx += 1;
     }
 
-    if escaped {
-        pattern.push('\\');
-    }
-    if !closed {
-        return None;
-    }
-
-    let pattern = pattern.trim();
-    if pattern.is_empty() {
-        None
-    } else {
-        Some(pattern.to_owned())
-    }
-}
-
-fn extract_unquoted_pattern(args: &str) -> Option<String> {
-    let tokens: Vec<&str> = args.split_whitespace().collect();
-    if tokens.iter().any(|t| t.starts_with('-')) {
-        return None;
-    }
-    let pattern_tokens: Vec<&str> = tokens
-        .iter()
-        .filter(|t| !t.contains('/') && !t.contains('\\'))
-        .copied()
-        .collect();
-    if pattern_tokens.len() == 1 && !pattern_tokens[0].is_empty() {
-        Some(pattern_tokens[0].to_owned())
-    } else {
-        None
+    match (explicit_patterns.len(), positionals.len()) {
+        (1, 0) => explicit_patterns.into_iter().next(),
+        (0, 1) => positionals.into_iter().next(),
+        _ => None,
     }
 }
 
@@ -1026,9 +1109,14 @@ mod tests {
 
     #[test]
     fn extract_search_command_handles_extra_tools_and_wrappers() {
+        // `git grep "x" -- src/` scopes to src/ — passthrough so the user keeps grep semantics.
         assert_eq!(
             extract_search_command(Some("git grep \"error handling\" -- src/")),
-            Some("error handling".to_owned())
+            None
+        );
+        assert_eq!(
+            extract_search_command(Some("git grep \"error handling some words\"")),
+            Some("error handling some words".to_owned())
         );
         assert_eq!(
             extract_search_command(Some("time rg foo_bar")),
@@ -1051,6 +1139,82 @@ mod tests {
     }
 
     #[test]
+    fn extract_search_command_passes_through_when_replace_consumes_first_quote() {
+        // `--replace="X"` no longer hijacks the pattern slot.
+        assert_eq!(
+            extract_search_command(Some("rg --replace=\"X\" \"actual pattern phrase\"")),
+            None,
+            "replace mode is disruptive — must passthrough so grep semantics survive"
+        );
+    }
+
+    #[test]
+    fn extract_search_command_passes_through_on_output_flags() {
+        for command in [
+            "rg -l \"phrase to find here\"",
+            "rg -c \"phrase to find here\"",
+            "rg --count \"phrase to find here\"",
+            "rg --count-matches \"phrase to find here\"",
+            "rg --files-with-matches \"phrase to find here\"",
+            "rg --json \"phrase to find here\"",
+            "rg -A 3 \"phrase to find here\"",
+            "rg -B 3 \"phrase to find here\"",
+            "rg -C 3 \"phrase to find here\"",
+            "rg --after-context=3 \"phrase to find here\"",
+            "rg -o \"phrase to find here\"",
+            "rg -v \"phrase to find here\"",
+            "rg -q \"phrase to find here\"",
+        ] {
+            assert_eq!(
+                extract_search_command(Some(command)),
+                None,
+                "output flag must trigger passthrough: {command}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_search_command_passes_through_on_positional_path_scope() {
+        assert_eq!(
+            extract_search_command(Some("rg \"phrase to find here\" tests/")),
+            None,
+            "positional path arg means user scoped the grep — passthrough"
+        );
+        assert_eq!(
+            extract_search_command(Some("grep -rn \"phrase to find here\" src/lib.rs")),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_search_command_handles_flag_values_via_equals() {
+        // `--type=rust` and `--glob=*.rs` value tokens must not be mistaken for the pattern.
+        assert_eq!(
+            extract_search_command(Some("rg --type=rust \"phrase to find here\"")),
+            Some("phrase to find here".to_owned())
+        );
+        assert_eq!(
+            extract_search_command(Some("rg --type rust \"phrase to find here\"")),
+            Some("phrase to find here".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_search_command_picks_explicit_e_pattern() {
+        assert_eq!(
+            extract_search_command(Some("rg -e \"phrase to find here\"")),
+            Some("phrase to find here".to_owned())
+        );
+        // Multiple `-e` flags signal OR-match semantics; passthrough.
+        assert_eq!(
+            extract_search_command(Some(
+                "rg -e \"first phrase here\" -e \"second phrase here\""
+            )),
+            None
+        );
+    }
+
+    #[test]
     fn looks_like_file_target_covers_all_supported_extensions() {
         for ext in &[
             ".rs", ".py", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".go", ".java", ".c", ".h", ".cpp",
@@ -1067,51 +1231,6 @@ mod tests {
         assert!(looks_like_file_target("search in src/"));
     }
 
-    #[test]
-    fn extract_unquoted_pattern_returns_sole_non_path_token() {
-        assert_eq!(
-            extract_unquoted_pattern("handle_session_start"),
-            Some("handle_session_start".to_owned())
-        );
-        assert_eq!(
-            extract_unquoted_pattern("handle_session_start src/"),
-            Some("handle_session_start".to_owned())
-        );
-        // Multiple non-path tokens → ambiguous, return None.
-        assert_eq!(extract_unquoted_pattern("foo bar"), None);
-        // Any flag → bail out entirely (flag value might be misidentified as pattern).
-        assert_eq!(
-            extract_unquoted_pattern("--type rust handle_session_start"),
-            None
-        );
-        // Path-only → None.
-        assert_eq!(extract_unquoted_pattern("src/lib.rs"), None);
-    }
-
-    #[test]
-    fn extract_quoted_pattern_uses_first_quote_type_as_delimiter() {
-        // Single-quoted pattern containing double quotes — must extract the full inner string.
-        assert_eq!(
-            extract_quoted_pattern(r#"'say "hello"'"#),
-            Some(r#"say "hello""#.to_owned())
-        );
-        // Double-quoted pattern (common case).
-        assert_eq!(
-            extract_quoted_pattern(r#""error handling""#),
-            Some("error handling".to_owned())
-        );
-        // Double-quoted pattern with trailing flags.
-        assert_eq!(
-            extract_quoted_pattern(r#"-rn "pattern" src/"#),
-            Some("pattern".to_owned())
-        );
-        assert_eq!(
-            extract_quoted_pattern(r#""error \"quoted\" message" src/"#),
-            Some(r#"error "quoted" message"#.to_owned())
-        );
-        // No quotes → None.
-        assert_eq!(extract_quoted_pattern("add src/"), None);
-    }
     use std::fs;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -1238,10 +1357,7 @@ mod tests {
     #[test]
     fn reindex_target_is_watchable_rejects_index_internal_paths() {
         let fixture = TestFixture::new("small_rust").unwrap_or_else(|_| unreachable!());
-        assert!(reindex_target_is_watchable(
-            fixture.root(),
-            "src/math.rs"
-        ));
+        assert!(reindex_target_is_watchable(fixture.root(), "src/math.rs"));
         assert!(!reindex_target_is_watchable(
             fixture.root(),
             ".claudix/manifest.json"
