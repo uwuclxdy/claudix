@@ -30,7 +30,6 @@ pub use chunk_row::StoredChunk;
 pub(crate) use chunk_row::stored_chunks_from_embedded;
 pub use lock::IndexLockGuard;
 pub use manifest::{Manifest, SCHEMA_VERSION};
-pub(crate) use marker::process_running;
 
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 const GITIGNORE_CONTENTS: &str = "*\n";

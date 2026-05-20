@@ -69,7 +69,7 @@ pub(super) fn check_index_ready(
     // child is still alive we're inside the slow-boot window (cold ONNX
     // load, large config parse) — never declare failure yet. Only after the
     // PID exits and the failure grace has elapsed do we surface a failure.
-    if marker.child_pid.is_some_and(crate::store::process_running) {
+    if marker.child_pid.is_some_and(crate::store::marker::process_running) {
         return None;
     }
     if age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS) {
