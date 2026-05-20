@@ -1,8 +1,12 @@
 ![claudix banner](media/claudix.png)
 
+![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/uwuclxdy/claudix/.github%2Fworkflows%2Frelease.yml?style=for-the-badge&cacheSeconds=60)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/uwuclxdy/claudix/total?style=for-the-badge&color=%2343ABE5&cacheSeconds=60)
+![Claude Code](https://img.shields.io/badge/Claude%20Code-D97757?style=for-the-badge)
+
 # Claude Index: claudix
 
-Local semantic search plugin for Claude Code. Works like Copilot's Codebase Semantic Index but for CC: Indexes your repository, embeds chunks with machine learning, and exposes search through Claude's slash commands, MCP tools, and grep interception.
+Copilot's Codebase Index but for Claude Code. Automatically indexes your repo, embeds with the embedding model of choice and provides semantic search through Claude's slash commands, MCP tools, and grep interception.
 
 ## What It Does
 
@@ -19,7 +23,7 @@ Core design goal: never break the session, always recover gracefully.
 
 ## Installation
 
-**Requires**: [Rust 1.83+](https://rustup.rs) and Claude Code.
+**Requires**: Claude Code 2.0.12+.
 
 claudix ships the bundled `bge-small-en-v1.5` embedder and uses it as the fallback when no embedding provider is configured. Set `embedding.provider = "http"` if you prefer LM Studio, Ollama, or another OpenAI-compatible embedding server.
 
@@ -38,17 +42,13 @@ irm https://raw.githubusercontent.com/uwuclxdy/claudix/mommy/install.bat | iex
 ### Manual
 
 ```bash
-cargo install claudix
-```
-
-Then register the plugin:
-
-```bash
 claude plugin marketplace add uwuclxdy/claudix
 claude plugin install claudix@claudix
 ```
 
-Restart Claude Code. Run `/claudix:doctor` to verify.
+The native binary downloads on first session (~150MB). Restart Claude Code, then run `/claudix:doctor` to verify.
+
+Targets without a prebuilt (e.g. linux-aarch64, darwin-x86_64) fall back to `cargo install claudix@<version>`. Install [Rust](https://rustup.rs) first if you are on one of those.
 
 ## Configuration
 
