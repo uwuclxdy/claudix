@@ -39,32 +39,23 @@ pub(crate) fn process_running(pid: u32) -> bool {
         })
 }
 
-/// Outcome of a `PidMarker::try_claim` call.
-pub enum MarkerClaim {
-    /// We created the marker and own it for our pid. Caller's
-    /// responsibility to remove on drop (typically via `PidMarker`).
-    Acquired,
-    /// Another live process holds the marker — do not take over.
-    HeldBy(u32),
-    /// Marker exists but its content is non-numeric and younger than
-    /// `stale_after`; this is the brief window between create_new and the
-    /// owner writing its pid. Treat as alive.
-    PendingClaim,
-}
-
 /// Atomically claim a pid-bearing marker file. Replaces dead-process
 /// markers; refuses live-foreign markers; treats unparseable young
-/// markers as live (handles the create-then-write race).
+/// markers as still-claiming (handles the create-then-write race).
 ///
 /// `stale_after` bounds how long an unparseable marker stays "young"
 /// before it can be reclaimed.
-pub fn try_claim(path: &Path, stale_after: Duration) -> MarkerClaim {
+///
+/// Returns `Ok(())` if we now own the marker. Every other outcome —
+/// live foreign owner, racing placeholder, failed reclaim — folds into
+/// `Err(AlreadyHeld)` because no caller acts on the distinction.
+pub fn try_claim(path: &Path, stale_after: Duration) -> Result<(), AlreadyHeld> {
     use std::fs::OpenOptions;
 
     for _ in 0..2 {
         if let Ok(mut file) = OpenOptions::new().write(true).create_new(true).open(path) {
             let _ = writeln!(file, "{}", std::process::id());
-            return MarkerClaim::Acquired;
+            return Ok(());
         }
 
         match read_pid(path) {
@@ -72,39 +63,41 @@ pub fn try_claim(path: &Path, stale_after: Duration) -> MarkerClaim {
                 // Adopt our own placeholder. Used when the parent process
                 // pre-wrote our pid before exec'ing into the watcher.
                 let _ = fs::write(path, format!("{}\n", std::process::id()));
-                return MarkerClaim::Acquired;
+                return Ok(());
             }
-            Some(pid) if process_running(pid) => return MarkerClaim::HeldBy(pid),
+            Some(pid) if process_running(pid) => return Err(AlreadyHeld),
             Some(_) => {
                 if fs::remove_file(path).is_err() {
-                    return MarkerClaim::PendingClaim;
+                    return Err(AlreadyHeld);
                 }
             }
             None => {
                 if marker_age(path).is_some_and(|age| age < stale_after) {
-                    return MarkerClaim::PendingClaim;
+                    return Err(AlreadyHeld);
                 }
                 if fs::remove_file(path).is_err() {
-                    return MarkerClaim::PendingClaim;
+                    return Err(AlreadyHeld);
                 }
             }
         }
     }
-    MarkerClaim::PendingClaim
+    Err(AlreadyHeld)
 }
 
-/// Return `Some(pid)` if the marker still exists and either parses as a
-/// pid whose process is alive, or — for unparseable content — was
-/// modified within `stale_after`. Otherwise `None`.
-pub fn live_owner(path: &Path, stale_after: Duration) -> Option<u32> {
-    let pid = read_pid(path);
-    match pid {
-        Some(pid) => process_running(pid).then_some(pid),
-        None => {
-            // Unparseable: fall back to mtime so a fresh placeholder isn't
-            // declared dead before the owner writes its pid.
-            marker_age(path).filter(|age| age < &stale_after).map(|_| 0)
-        }
+/// Marker was held by a live foreign process, or a placeholder claim
+/// hadn't aged out yet. Returned by [`try_claim`] and [`PidMarker::install`].
+#[derive(Debug, Clone, Copy)]
+pub struct AlreadyHeld;
+
+/// `true` if the marker still exists and either parses as a pid whose
+/// process is alive, or — for unparseable content — was modified within
+/// `stale_after`. The unparseable branch covers the brief window between
+/// `create_new` and the owner writing its pid; without it a placeholder
+/// marker would be declared dead before its owner finishes claiming it.
+pub fn is_alive(path: &Path, stale_after: Duration) -> bool {
+    match read_pid(path) {
+        Some(pid) => process_running(pid),
+        None => marker_age(path).is_some_and(|age| age < stale_after),
     }
 }
 
@@ -129,18 +122,18 @@ pub struct PidMarker {
 
 impl PidMarker {
     /// Claim the marker and wrap it in an RAII guard. Errors if the
-    /// marker is held by a live foreign process or the claim races out.
-    pub fn install(path: PathBuf) -> Result<Self, ClaimError> {
+    /// marker is held by a live foreign process, the claim races out,
+    /// or the parent directory cannot be created.
+    pub fn install(path: PathBuf) -> Result<Self, InstallError> {
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|_| ClaimError::Setup)?;
+            fs::create_dir_all(parent).map_err(|_| InstallError::Setup)?;
         }
         // PidMarker's contract is "we are the live owner" — bound the
         // stale window to the shared WATCH_MARKER_STALE_SECS so callers
         // and the marker's own claim path agree on what "stale" means.
-        match try_claim(&path, Duration::from_secs(WATCH_MARKER_STALE_SECS)) {
-            MarkerClaim::Acquired => Ok(Self { path }),
-            MarkerClaim::HeldBy(_) | MarkerClaim::PendingClaim => Err(ClaimError::AlreadyHeld),
-        }
+        try_claim(&path, Duration::from_secs(WATCH_MARKER_STALE_SECS))
+            .map_err(|AlreadyHeld| InstallError::AlreadyHeld)?;
+        Ok(Self { path })
     }
 
     pub fn path(&self) -> &Path {
@@ -161,12 +154,12 @@ impl Drop for PidMarker {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ClaimError {
+pub enum InstallError {
     AlreadyHeld,
     Setup,
 }
 
-impl std::fmt::Display for ClaimError {
+impl std::fmt::Display for InstallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AlreadyHeld => f.write_str("marker already held by a live process"),
@@ -175,7 +168,7 @@ impl std::fmt::Display for ClaimError {
     }
 }
 
-impl std::error::Error for ClaimError {}
+impl std::error::Error for InstallError {}
 
 #[cfg(test)]
 mod tests {
@@ -201,7 +194,7 @@ mod tests {
         let _ = child.wait();
 
         assert!(
-            matches!(result, Err(ClaimError::AlreadyHeld)),
+            matches!(result, Err(InstallError::AlreadyHeld)),
             "expected AlreadyHeld when a live foreign PID owns the marker"
         );
         assert_eq!(

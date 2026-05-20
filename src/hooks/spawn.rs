@@ -163,10 +163,7 @@ pub(super) fn spawn_background_watch(project_root: &Path, config: &Config) -> bo
     }
     let marker_path = store.watch_marker_path();
     let stale_after = Duration::from_secs(WATCH_MARKER_STALE_SECS);
-    if !matches!(
-        crate::store::marker::try_claim(&marker_path, stale_after),
-        crate::store::marker::MarkerClaim::Acquired
-    ) {
+    if crate::store::marker::try_claim(&marker_path, stale_after).is_err() {
         return false;
     }
 
@@ -333,11 +330,10 @@ mod tests {
         fs::write(&marker_path, "0").unwrap_or_else(|_| unreachable!());
 
         assert!(
-            crate::store::marker::live_owner(
+            !crate::store::marker::is_alive(
                 &marker_path,
                 Duration::from_secs(WATCH_MARKER_STALE_SECS)
-            )
-            .is_none(),
+            ),
             "watch marker with dead PID must be reclaimable"
         );
     }
@@ -359,11 +355,10 @@ mod tests {
         drop(file);
 
         assert!(
-            crate::store::marker::live_owner(
+            crate::store::marker::is_alive(
                 &marker_path,
                 Duration::from_secs(WATCH_MARKER_STALE_SECS)
-            )
-            .is_some(),
+            ),
             "watch marker with live PID must stay alive regardless of mtime"
         );
     }

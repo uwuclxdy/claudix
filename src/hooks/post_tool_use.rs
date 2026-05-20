@@ -49,11 +49,10 @@ pub(super) fn watcher_alive(project_root: &Path, config: &Config) -> bool {
     let Ok(store) = Store::new(project_root, config) else {
         return false;
     };
-    crate::store::marker::live_owner(
+    crate::store::marker::is_alive(
         &store.watch_marker_path(),
         Duration::from_secs(WATCH_MARKER_STALE_SECS),
     )
-    .is_some()
 }
 
 /// Decide whether a Write/Edit target deserves a background reindex spawn.

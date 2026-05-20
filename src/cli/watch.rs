@@ -11,7 +11,7 @@ use crate::config;
 use crate::enumeration::WatchFilter;
 use crate::error::{ClaudixError, Result};
 use crate::store::Store;
-use crate::store::marker::{ClaimError, PidMarker};
+use crate::store::marker::{InstallError, PidMarker};
 
 use super::canonical_project_root;
 
@@ -28,10 +28,10 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
     store.ensure_layout()?;
     let marker = Arc::new(PidMarker::install(store.watch_marker_path()).map_err(
         |error| match error {
-            ClaimError::AlreadyHeld => {
+            InstallError::AlreadyHeld => {
                 ClaudixError::Store("another claudix watch process is already running".to_owned())
             }
-            ClaimError::Setup => ClaudixError::Store("watch marker setup failed".to_owned()),
+            InstallError::Setup => ClaudixError::Store("watch marker setup failed".to_owned()),
         },
     )?);
 
