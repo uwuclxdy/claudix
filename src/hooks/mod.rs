@@ -3,7 +3,6 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-const WATCH_MARKER_FILE_NAME: &str = "watch.pid";
 const WATCH_MARKER_STALE_SECS: u64 = 120;
 const HEALTH_CACHE_FILE_NAME: &str = "embedder-health";
 const HEALTH_CACHE_HEALTHY_TTL_SECS: u64 = 60;
@@ -204,7 +203,7 @@ fn spawn_background_watch(project_root: &Path, config: &Config) -> bool {
     if store.ensure_layout().is_err() {
         return false;
     }
-    let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
+    let marker_path = store.watch_marker_path();
     let Some(mut marker_file) = try_claim_watch_marker(&marker_path) else {
         return false;
     };
@@ -432,7 +431,7 @@ fn watcher_alive(project_root: &Path, config: &Config) -> bool {
     let Ok(store) = Store::new(project_root, config) else {
         return false;
     };
-    let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
+    let marker_path = store.watch_marker_path();
     watch_marker_is_alive(&marker_path)
 }
 
@@ -1589,7 +1588,7 @@ mod tests {
     #[test]
     fn watch_marker_with_dead_pid_is_not_alive() {
         let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
-        let marker_path = dir.path().join(WATCH_MARKER_FILE_NAME);
+        let marker_path = dir.path().join("watch.pid");
         // PID 0 never refers to a real process on Unix or Windows, so this
         // exercises the "parsed PID but process is gone" branch.
         fs::write(&marker_path, "0").unwrap_or_else(|_| unreachable!());
@@ -1603,7 +1602,7 @@ mod tests {
     #[test]
     fn watch_marker_with_live_pid_ignores_mtime() {
         let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
-        let marker_path = dir.path().join(WATCH_MARKER_FILE_NAME);
+        let marker_path = dir.path().join("watch.pid");
         fs::write(&marker_path, std::process::id().to_string()).unwrap_or_else(|_| unreachable!());
 
         let file = fs::OpenOptions::new()
@@ -1873,7 +1872,7 @@ mod tests {
         let config = stub_config();
         let store = Store::new(fixture.root(), &config)?;
         store.ensure_layout()?;
-        let marker_path = store.state_dir_path().join(WATCH_MARKER_FILE_NAME);
+        let marker_path = store.watch_marker_path();
         fs::write(&marker_path, std::process::id().to_string())?;
 
         assert!(

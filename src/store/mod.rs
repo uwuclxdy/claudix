@@ -154,6 +154,10 @@ impl Store {
         self.paths.state_dir.join("indexing-pending")
     }
 
+    pub fn watch_marker_path(&self) -> std::path::PathBuf {
+        self.paths.state_dir.join("watch.pid")
+    }
+
     pub fn state_dir_path(&self) -> &Path {
         &self.paths.state_dir
     }

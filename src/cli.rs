@@ -184,7 +184,6 @@ pub async fn run_status(project_root: impl AsRef<Path>) -> Result<StatusOutput> 
     status_from_store(&store, &config).await
 }
 
-const WATCH_MARKER_FILE_NAME: &str = "watch.pid";
 const WATCH_HEARTBEAT_SECS: u64 = 30;
 
 struct WatchMarkerGuard {
@@ -267,9 +266,7 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
 
     let store = Store::new(&project_root, &config)?;
     store.ensure_layout()?;
-    let marker = Arc::new(WatchMarkerGuard::install(
-        store.state_dir_path().join(WATCH_MARKER_FILE_NAME),
-    )?);
+    let marker = Arc::new(WatchMarkerGuard::install(store.watch_marker_path())?);
 
     // Cold ONNX loads can exceed the marker stale window; refresh the marker
     // from a side task while the watcher itself is still booting so concurrent
