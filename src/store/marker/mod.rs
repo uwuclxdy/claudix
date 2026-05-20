@@ -1,7 +1,9 @@
 //! Pid-marker primitives shared by the watch process and the
 //! background-index spawn path. Each marker is a single file under the
-//! store's state directory whose contents are the pid of the live owner
-//! (plus optional payload lines).
+//! store's state directory whose contents are the pid of the live owner.
+//! The structured pending-index marker lives in [`pending_index`].
+
+pub(crate) mod pending_index;
 
 use std::fs;
 use std::io::Write;

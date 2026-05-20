@@ -1,14 +1,13 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::store::Store;
 use crate::store::marker::WATCH_MARKER_STALE_SECS;
-use crate::util::{now_rfc3339, parse_rfc3339};
-
-use super::ready_check::PENDING_INDEX_FAILURE_GRACE_SECS;
+use crate::store::marker::pending_index;
+use crate::util::now_rfc3339;
 
 pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bool {
     let Ok(store) = Store::new(project_root, config) else {
@@ -61,7 +60,7 @@ pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bo
     // Leave the ack file alone — `check_index_ready` rewrites it on success and
     // on each surfaced failure. Wiping it here would defeat dedup, so an index
     // that keeps failing with the same `prior_ts` would re-notify every session.
-    if !try_claim_pending_index_marker(&marker_path, &placeholder) {
+    if !pending_index::try_claim(&marker_path, &placeholder) {
         return false;
     }
 
@@ -76,68 +75,6 @@ pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bo
     let payload = format!("{prior_ts}\n{}\n{child_pid}\n", now_rfc3339());
     let _ = fs::write(&marker_path, payload);
     true
-}
-
-pub(super) fn try_claim_pending_index_marker(marker_path: &Path, payload: &str) -> bool {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-
-    for _ in 0..2 {
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(marker_path)
-        {
-            Ok(mut file) => return file.write_all(payload.as_bytes()).is_ok(),
-            Err(_) => {
-                if pending_index_marker_is_fresh(marker_path) {
-                    return false;
-                }
-                if fs::remove_file(marker_path).is_err() {
-                    return false;
-                }
-            }
-        }
-    }
-    false
-}
-
-fn pending_index_marker_is_fresh(marker_path: &Path) -> bool {
-    let Some(marker) = read_pending_index_marker(marker_path) else {
-        return false;
-    };
-    // `duration_since` errors when `created_at` is in the future — clock skew
-    // or restore-from-backup. Treat that as expired so a single bad timestamp
-    // can't permanently jam the auto-indexer.
-    SystemTime::now()
-        .duration_since(marker.created_at)
-        .map(|age| age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS))
-        .unwrap_or(false)
-}
-
-pub(super) struct PendingIndexMarker {
-    pub prior_ts: String,
-    pub created_at: SystemTime,
-    /// PID of the spawned `claudix index` child, or `None` if the marker is
-    /// still the placeholder written before the child was forked (or a legacy
-    /// marker missing this line entirely).
-    pub child_pid: Option<u32>,
-}
-
-pub(super) fn read_pending_index_marker(marker_path: &Path) -> Option<PendingIndexMarker> {
-    let content = fs::read_to_string(marker_path).ok()?;
-    let mut lines = content.lines();
-    let prior_ts = lines.next()?.to_owned();
-    let created_at = parse_rfc3339(lines.next()?).ok()?;
-    let child_pid = lines
-        .next()
-        .and_then(|line| line.trim().parse::<u32>().ok())
-        .filter(|pid| *pid != 0);
-    Some(PendingIndexMarker {
-        prior_ts,
-        created_at,
-        child_pid,
-    })
 }
 
 pub(super) fn spawn_detached_claudix<const N: usize, S>(
@@ -245,6 +182,7 @@ mod tests {
 
     use std::fs;
     use std::sync::Arc;
+    use std::time::SystemTime;
     use tempfile::tempdir;
 
     use crate::Claudix;
@@ -281,44 +219,6 @@ mod tests {
             )
             .is_ok()
         );
-    }
-
-    #[test]
-    fn pending_index_marker_round_trips() {
-        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
-        let marker_path = dir.path().join("indexing-pending");
-        let payload = format!("2026-04-20T00:00:00Z\n{}\n42\n", now_rfc3339());
-
-        assert!(try_claim_pending_index_marker(&marker_path, &payload));
-        let marker = read_pending_index_marker(&marker_path);
-        assert!(marker.is_some());
-        let marker = marker.unwrap_or_else(|| unreachable!());
-        assert_eq!(marker.prior_ts, "2026-04-20T00:00:00Z");
-        assert_eq!(marker.child_pid, Some(42));
-    }
-
-    #[test]
-    fn pending_index_marker_treats_zero_pid_as_placeholder() {
-        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
-        let marker_path = dir.path().join("indexing-pending");
-        let payload = format!("none\n{}\n0\n", now_rfc3339());
-        assert!(try_claim_pending_index_marker(&marker_path, &payload));
-        let marker = read_pending_index_marker(&marker_path).unwrap_or_else(|| unreachable!());
-        assert_eq!(marker.child_pid, None);
-    }
-
-    #[test]
-    fn pending_index_marker_claim_is_atomic() {
-        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
-        let marker_path = dir.path().join("indexing-pending");
-        let first = format!("none\n{}\n", now_rfc3339());
-        assert!(try_claim_pending_index_marker(&marker_path, &first));
-
-        // Second claim while the first is still fresh must fail.
-        let second = format!("ts-2\n{}\n", now_rfc3339());
-        assert!(!try_claim_pending_index_marker(&marker_path, &second));
-        let marker = read_pending_index_marker(&marker_path).unwrap_or_else(|| unreachable!());
-        assert_eq!(marker.prior_ts, "none", "first claim must remain in place");
     }
 
     #[test]
@@ -361,34 +261,6 @@ mod tests {
             ),
             "watch marker with live PID must stay alive regardless of mtime"
         );
-    }
-
-    #[test]
-    fn pending_index_marker_with_future_timestamp_is_not_fresh() {
-        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
-        let marker_path = dir.path().join("indexing-pending");
-        // 1 hour in the future — simulates clock skew / backup restore.
-        let future = SystemTime::now() + Duration::from_secs(3_600);
-        let future_ts = crate::util::format_rfc3339(future);
-        fs::write(&marker_path, format!("none\n{future_ts}\n0\n"))
-            .unwrap_or_else(|_| unreachable!());
-
-        assert!(
-            !pending_index_marker_is_fresh(&marker_path),
-            "future-timestamped marker must be reclaimable"
-        );
-    }
-
-    #[test]
-    fn pending_index_marker_claim_replaces_legacy_or_unparseable() {
-        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
-        let marker_path = dir.path().join("indexing-pending");
-        assert!(fs::write(&marker_path, "legacy-single-line").is_ok());
-
-        let payload = format!("none\n{}\n", now_rfc3339());
-        assert!(try_claim_pending_index_marker(&marker_path, &payload));
-        let marker = read_pending_index_marker(&marker_path);
-        assert!(marker.is_some());
     }
 
     #[tokio::test]

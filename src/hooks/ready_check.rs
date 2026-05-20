@@ -6,11 +6,9 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::store::Store;
-
-use super::spawn::read_pending_index_marker;
+use crate::store::marker::pending_index::{self, FAILURE_GRACE_SECS};
 
 pub(super) const PENDING_INDEX_READY_GRACE_SECS: u64 = 3;
-pub(super) const PENDING_INDEX_FAILURE_GRACE_SECS: u64 = 60;
 pub(super) const PENDING_INDEX_ACK_FILE_NAME: &str = "indexing-pending-acked";
 
 pub(super) fn check_index_ready(
@@ -21,7 +19,7 @@ pub(super) fn check_index_ready(
     let store = Store::new(project_root, config).ok()?;
     let marker_path = store.pending_index_marker_path();
     let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
-    let marker = read_pending_index_marker(&marker_path)?;
+    let marker = pending_index::read(&marker_path)?;
 
     // `created_at` in the future (clock skew, restored backup) would make
     // `duration_since` error forever; treat that as "past every grace window"
@@ -29,7 +27,7 @@ pub(super) fn check_index_ready(
     let now = SystemTime::now();
     let age = match now.duration_since(marker.created_at) {
         Ok(age) => age,
-        Err(_) => Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS),
+        Err(_) => Duration::from_secs(FAILURE_GRACE_SECS),
     };
     if age < Duration::from_secs(PENDING_INDEX_READY_GRACE_SECS) {
         return None;
@@ -72,7 +70,7 @@ pub(super) fn check_index_ready(
     if marker.child_pid.is_some_and(crate::store::marker::process_running) {
         return None;
     }
-    if age < Duration::from_secs(PENDING_INDEX_FAILURE_GRACE_SECS) {
+    if age < Duration::from_secs(FAILURE_GRACE_SECS) {
         return None;
     }
 
