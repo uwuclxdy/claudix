@@ -20,6 +20,7 @@ use std::sync::Arc;
 use crate::Claudix;
 use crate::cli;
 use crate::config::{self, Config};
+use crate::enumeration::WatchFilter;
 use crate::error::{ClaudixError, Result};
 use crate::search::SearchQuery;
 use crate::store::{Manifest, Store};
@@ -405,12 +406,16 @@ async fn handle_post_tool_use(project_root: &Path, payload: HookPayload) -> Resu
     // Skip the per-edit spawn when a live watcher already covers file changes;
     // otherwise rapid edits fan out N detached `reindex-file` processes that
     // each cold-load ONNX before losing the in-process lock to the watcher.
+    // Also skip ignored paths (.claudix/, .git/, gitignored) — spawning a
+    // reindex for `.claudix/manifest.json` would round-trip the index's own
+    // metadata back through the embedder.
     if is_write_tool(tool_name)
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
         && !watcher_alive(project_root, cfg)
         && let Some(input) = payload.tool_input
         && let Some(file_path) = input.file_path.or(input.notebook_path)
+        && reindex_target_is_watchable(project_root, &file_path)
     {
         spawn_background_reindex_file(project_root, &file_path);
     }
@@ -433,6 +438,34 @@ fn watcher_alive(project_root: &Path, config: &Config) -> bool {
     };
     let marker_path = store.watch_marker_path();
     watch_marker_is_alive(&marker_path)
+}
+
+/// Decide whether a Write/Edit target deserves a background reindex spawn.
+///
+/// Mirrors the watcher's `WatchFilter::is_watchable` check so PostToolUse
+/// doesn't fire a detached `claudix reindex-file` for `.claudix/manifest.json`,
+/// `.git/HEAD`, gitignored build artifacts, or paths outside the project root.
+/// Fail-open: any error during the check returns `true` so a legitimate edit
+/// is still reindexed if the filter setup itself fails.
+fn reindex_target_is_watchable(project_root: &Path, file_path: &str) -> bool {
+    let raw = Path::new(file_path);
+    let relative = if raw.is_absolute() {
+        let canonical = raw.canonicalize();
+        let absolute = canonical.as_deref().unwrap_or(raw);
+        match absolute.strip_prefix(project_root) {
+            Ok(relative) => relative.to_path_buf(),
+            Err(_) => return false,
+        }
+    } else {
+        raw.to_path_buf()
+    };
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+    match WatchFilter::load(project_root) {
+        Ok(filter) => filter.is_watchable(&relative),
+        Err(_) => true,
+    }
 }
 
 fn check_index_ready(project_root: &Path, config: &Config, event_name: &str) -> Option<Value> {
@@ -1200,6 +1233,27 @@ mod tests {
         let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
         assert!(response.is_ok());
         assert!(response.ok().unwrap_or_else(|| unreachable!()).is_none());
+    }
+
+    #[test]
+    fn reindex_target_is_watchable_rejects_index_internal_paths() {
+        let fixture = TestFixture::new("small_rust").unwrap_or_else(|_| unreachable!());
+        assert!(reindex_target_is_watchable(
+            fixture.root(),
+            "src/math.rs"
+        ));
+        assert!(!reindex_target_is_watchable(
+            fixture.root(),
+            ".claudix/manifest.json"
+        ));
+        assert!(!reindex_target_is_watchable(fixture.root(), ".git/HEAD"));
+        // Outside the project root: claude code generally resolves to absolute
+        // paths inside CLAUDE_PROJECT_DIR, but defend in depth.
+        let absolute_outside = std::env::temp_dir().join("nope.rs");
+        assert!(!reindex_target_is_watchable(
+            fixture.root(),
+            &absolute_outside.to_string_lossy(),
+        ));
     }
 
     #[tokio::test]

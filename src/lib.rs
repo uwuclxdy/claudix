@@ -27,7 +27,7 @@ use config::{Config, EmbeddingProvider};
 use embedding::StubProvider;
 use embedding::bundled::{BUNDLED_DIMENSIONS, BUNDLED_MODEL_ID};
 use embedding::{BundledProvider, FallbackProvider, HttpProvider, Provider};
-use enumeration::{EnumeratedFile, FileEnumerator};
+use enumeration::{EnumeratedFile, FileEnumerator, WatchFilter};
 use error::RecoveryHint;
 use search::{SearchQuery, SearchResult, Searcher};
 use store::{Store, stored_chunks_from_embedded};
@@ -171,6 +171,18 @@ impl Claudix {
 
     pub async fn reindex_file(&self, path: &Path) -> Result<IndexStats> {
         let relative_path = self.relative_path_from_input(path)?;
+
+        // Honour the same ignore set the watcher uses so a direct CLI/MCP call
+        // on `.claudix/manifest.json` or a gitignored build artifact does not
+        // embed index metadata back into the store.
+        let filter = WatchFilter::load(&self.project_root)?;
+        if !filter.is_watchable(&relative_path.to_path_buf()) {
+            let manifest = self.store.read_manifest()?;
+            return Ok(IndexStats {
+                file_count: manifest.as_ref().map(|m| m.file_count as usize).unwrap_or(0),
+                chunk_count: manifest.as_ref().map(|m| m.chunk_count as usize).unwrap_or(0),
+            });
+        }
 
         if let Some(stats) = self.skip_unchanged_target(&relative_path).await? {
             return Ok(stats);
@@ -890,5 +902,32 @@ mod tests {
             rows.iter().all(|row| row.file_path != "src/math.rs"),
             "stale chunks from emptied file must be removed"
         );
+    }
+
+    #[tokio::test]
+    async fn reindex_file_skips_index_internal_paths() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
+        claudix.index_full().await?;
+        let baseline = claudix.store.read_chunks().await?;
+
+        // `.claudix/` is the index's own state dir — embedding files under it
+        // would round-trip manifest data through the embedder.
+        let internal = fixture.root().join(".claudix").join("stray.rs");
+        if let Some(parent) = internal.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::write(&internal, b"pub fn stray() -> u32 { 1 }\n").await?;
+
+        let stats = claudix.reindex_file(Path::new(".claudix/stray.rs")).await?;
+        assert_eq!(stats.chunk_count, baseline.len());
+
+        let after = claudix.store.read_chunks().await?;
+        assert!(
+            after.iter().all(|row| !row.file_path.starts_with(".claudix")),
+            "no chunk under .claudix/ should be embedded"
+        );
+        Ok(())
     }
 }
