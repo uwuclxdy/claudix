@@ -28,24 +28,6 @@ impl Default for MultiLanguageChunker {
     }
 }
 
-pub trait Chunker {
-    fn chunk_as_text(
-        &self,
-        path: &RelativePath,
-        language: Language,
-        file_hash: FileHash,
-        content: &str,
-    ) -> Result<Vec<Chunk>>;
-
-    fn chunk(
-        &self,
-        path: &RelativePath,
-        language: Language,
-        file_hash: FileHash,
-        content: &str,
-    ) -> Result<Vec<Chunk>>;
-}
-
 impl MultiLanguageChunker {
     pub fn new() -> Self {
         Self::default()
@@ -99,28 +81,6 @@ impl MultiLanguageChunker {
             ),
             Language::Unknown => Ok(Vec::new()),
         }
-    }
-}
-
-impl Chunker for MultiLanguageChunker {
-    fn chunk_as_text(
-        &self,
-        path: &RelativePath,
-        language: Language,
-        file_hash: FileHash,
-        content: &str,
-    ) -> Result<Vec<Chunk>> {
-        MultiLanguageChunker::chunk_as_text(self, path, language, file_hash, content)
-    }
-
-    fn chunk(
-        &self,
-        path: &RelativePath,
-        language: Language,
-        file_hash: FileHash,
-        content: &str,
-    ) -> Result<Vec<Chunk>> {
-        MultiLanguageChunker::chunk(self, path, language, file_hash, content)
     }
 }
 
