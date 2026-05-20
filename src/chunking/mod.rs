@@ -1,7 +1,7 @@
-pub mod go;
-pub mod python;
-pub mod rust;
-pub mod typescript;
+mod go;
+mod python;
+mod rust;
+mod typescript;
 
 use tree_sitter::{Node, Parser};
 
@@ -28,7 +28,29 @@ impl Default for MultiLanguageChunker {
     }
 }
 
+pub trait Chunker {
+    fn chunk_as_text(
+        &self,
+        path: &RelativePath,
+        language: Language,
+        file_hash: FileHash,
+        content: &str,
+    ) -> Result<Vec<Chunk>>;
+
+    fn chunk(
+        &self,
+        path: &RelativePath,
+        language: Language,
+        file_hash: FileHash,
+        content: &str,
+    ) -> Result<Vec<Chunk>>;
+}
+
 impl MultiLanguageChunker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn with_fallback_params(chunk_lines: usize, overlap_lines: usize) -> Self {
         Self {
             fallback_chunk_lines: chunk_lines,
@@ -77,6 +99,28 @@ impl MultiLanguageChunker {
             ),
             Language::Unknown => Ok(Vec::new()),
         }
+    }
+}
+
+impl Chunker for MultiLanguageChunker {
+    fn chunk_as_text(
+        &self,
+        path: &RelativePath,
+        language: Language,
+        file_hash: FileHash,
+        content: &str,
+    ) -> Result<Vec<Chunk>> {
+        MultiLanguageChunker::chunk_as_text(self, path, language, file_hash, content)
+    }
+
+    fn chunk(
+        &self,
+        path: &RelativePath,
+        language: Language,
+        file_hash: FileHash,
+        content: &str,
+    ) -> Result<Vec<Chunk>> {
+        MultiLanguageChunker::chunk(self, path, language, file_hash, content)
     }
 }
 

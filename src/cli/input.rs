@@ -85,15 +85,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_language_filter_accepts_aliases() {
-        let parsed = parse_language_filter(Some(vec!["rs".to_owned(), "ts".to_owned()]));
-        assert!(parsed.is_err());
+    fn parse_language_filter_accepts_supported_aliases() {
+        let parsed = parse_language_filter(Some(vec![
+            " rust ".to_owned(),
+            "js".to_owned(),
+            "ts".to_owned(),
+            "c++".to_owned(),
+        ]));
 
-        let parsed = parse_language_filter(Some(vec![" rust ".to_owned(), "ts".to_owned()]));
         assert!(matches!(
             parsed,
-            Ok(Some(ref languages)) if languages == &vec![Language::Rust, Language::TypeScript]
+            Ok(Some(ref languages))
+                if languages == &vec![
+                    Language::Rust,
+                    Language::JavaScript,
+                    Language::TypeScript,
+                    Language::Cpp,
+                ]
         ));
+    }
+
+    #[test]
+    fn parse_language_filter_rejects_extensions() {
+        let parsed = parse_language_filter(Some(vec!["rs".to_owned()]));
+
+        assert!(matches!(parsed, Err(ClaudixError::ConfigInvalid { .. })));
     }
 
     #[test]
