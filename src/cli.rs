@@ -471,7 +471,7 @@ pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput
     let project_root = canonical_project_root(project_root.as_ref())?;
     let source_root = install_source_root(&project_root)?;
     let plugin_root = plugin_root_from_env(&project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT"))?;
-    let binary_path = plugin_root.join("bin").join(binary_name());
+    let binary_path = plugin_root.join("bin").join("claudix");
     let config_path = global_config_path()?;
 
     install_plugin_assets(&source_root, &plugin_root).await?;
@@ -611,10 +611,10 @@ async fn install_plugin_assets(project_root: &Path, plugin_root: &Path) -> Resul
     changed |= copy_plugin_asset(
         project_root,
         "bin/claudix",
-        plugin_root.join("bin").join(binary_name()),
+        plugin_root.join("bin").join("claudix"),
     )
     .await?;
-    make_executable(&plugin_root.join("bin").join(binary_name())).await?;
+    make_executable(&plugin_root.join("bin").join("claudix")).await?;
     changed |=
         copy_plugin_directory(project_root, "commands", plugin_root.join("commands")).await?;
     changed |= copy_plugin_directory(project_root, "scripts", plugin_root.join("scripts")).await?;
@@ -838,14 +838,6 @@ fn global_config_path() -> Result<PathBuf> {
             message: "home directory is not available".into(),
             recovery: RecoveryHint("Set HOME before running claudix install"),
         })
-}
-
-fn binary_name() -> &'static str {
-    if cfg!(windows) {
-        "claudix.exe"
-    } else {
-        "claudix"
-    }
 }
 
 fn require_git_repo(project_root: &Path) -> Result<()> {
@@ -1451,7 +1443,8 @@ mod tests {
         let plugin_manifest = plugin_manifest.ok().unwrap_or_default();
         assert!(plugin_manifest.contains("\"name\": \"claudix\""));
         assert!(plugin_manifest.contains("\"mcpServers\""));
-        assert!(plugin_manifest.contains("\"args\": [\"mcp\"]"));
+        assert!(plugin_manifest.contains("\"command\": \"bash\""));
+        assert!(plugin_manifest.contains("\"mcp\""));
 
         let hooks_manifest = fs::read_to_string(plugin_root.join("hooks").join("hooks.json")).await;
         assert!(hooks_manifest.is_ok());
@@ -1464,7 +1457,12 @@ mod tests {
 
         let wrapper = fs::read_to_string(plugin_root.join("bin").join("claudix")).await;
         assert!(wrapper.is_ok());
-        assert!(wrapper.ok().unwrap_or_default().contains("CARGO_BIN"));
+        assert!(
+            wrapper
+                .ok()
+                .unwrap_or_default()
+                .contains("ensure-binary.sh")
+        );
 
         let search_command =
             fs::read_to_string(plugin_root.join("commands").join("search.md")).await;
@@ -1473,9 +1471,12 @@ mod tests {
         assert!(search_command.contains("!`claudix search"));
         assert!(!search_command.contains("CLAUDE_PLUGIN_ROOT"));
 
-        let updater = fs::read_to_string(plugin_root.join("scripts").join("check-update.sh")).await;
-        assert!(updater.is_ok());
-        assert!(updater.ok().unwrap_or_default().contains("github.com"));
+        let ensure_script =
+            fs::read_to_string(plugin_root.join("scripts").join("ensure-binary.sh")).await;
+        assert!(ensure_script.is_ok());
+        let ensure_script = ensure_script.ok().unwrap_or_default();
+        assert!(ensure_script.contains("github.com"));
+        assert!(ensure_script.contains("CLAUDE_PLUGIN_DATA"));
     }
 
     #[test]
@@ -1560,14 +1561,5 @@ mod tests {
         assert!(config.contains("auto_reembed_on_edit = true"));
         assert!(config.contains("[search]"));
         assert!(config.contains("top_k = 10"));
-    }
-
-    #[test]
-    fn binary_name_matches_platform() {
-        if cfg!(windows) {
-            assert_eq!(binary_name(), "claudix.exe");
-        } else {
-            assert_eq!(binary_name(), "claudix");
-        }
     }
 }

@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! command -v cargo >/dev/null 2>&1; then
-  printf 'claudix: cargo is required. Install Rust from https://rustup.rs/\n' >&2
-  exit 1
-fi
-
-REPO="${CLAUDIX_INSTALL_REPO:-}"
-
-cargo install claudix
-
-if command -v claude >/dev/null 2>&1; then
-  claude plugin uninstall claudix@claudix || true
-  claude plugin marketplace rm claudix || true
-  claude plugin marketplace add uwuclxdy/claudix
-  claude plugin install claudix@claudix
-  plugin_root="$(claude plugin list --json | node -e 'let input=""; process.stdin.on("data", chunk => input += chunk); process.stdin.on("end", () => { const plugins = JSON.parse(input); const plugin = plugins.find(item => item.id === "claudix@claudix"); if (plugin) process.stdout.write(plugin.installPath); });')"
-  CLAUDE_PLUGIN_ROOT="$plugin_root" claudix install
-  printf '\nclaudix installed. Restart Claude Code to activate.\n'
-else
-  printf '\nclaudix binary installed. Open Claude Code and run:\n'
+if ! command -v claude >/dev/null 2>&1; then
+  printf 'claudix: claude CLI not found. Open Claude Code and run:\n'
   printf '  /plugin marketplace add uwuclxdy/claudix\n'
   printf '  /plugin install claudix@claudix\n'
-  printf 'Then restart Claude Code.\n'
+  printf 'Then restart Claude Code; the binary downloads on first session.\n'
+  exit 0
 fi
+
+claude plugin uninstall claudix@claudix || true
+claude plugin marketplace rm claudix || true
+claude plugin marketplace add uwuclxdy/claudix
+claude plugin install claudix@claudix
+
+# Prime the binary cache from the local checkout so the first session
+# does not stall on download. Uses the documented plugin-data path,
+# avoiding any dependency on `node` or `jq`.
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+plugin_data="${HOME}/.claude/plugins/data/claudix-claudix"
+mkdir -p "$plugin_data"
+CLAUDE_PLUGIN_ROOT="$script_dir" CLAUDE_PLUGIN_DATA="$plugin_data" \
+  bash "$script_dir/scripts/ensure-binary.sh" --install >/dev/null \
+  || printf 'claudix: binary install will retry on first session\n' >&2
+
+printf '\nclaudix installed. Restart Claude Code to activate.\n'

@@ -379,10 +379,7 @@ async fn handle_session_start(project_root: &Path, _payload: HookPayload) -> Res
         model_mismatch,
         indexing_in_flight,
     );
-    let user_message = match consume_pending_restart().await {
-        Some(message) => message,
-        None => session_start_message(cli::setup_state(project_root).await),
-    };
+    let user_message = session_start_message(cli::setup_state(project_root).await);
     if !user_message.is_empty() {
         response["systemMessage"] = Value::String(user_message);
     }
@@ -646,28 +643,6 @@ fn read_cached_health(marker_path: &Path) -> Option<bool> {
 
 fn write_cached_health(marker_path: &Path, healthy: bool) {
     let _ = fs::write(marker_path, if healthy { "1" } else { "0" });
-}
-
-async fn consume_pending_restart() -> Option<String> {
-    let data_dir = pending_restart_path()?;
-    let content = tokio::fs::read_to_string(&data_dir).await.ok()?;
-    let version = content.trim();
-    if version.is_empty() {
-        return None;
-    }
-    let msg = format!("claudix updated to v{version} — restart Claude Code to activate");
-    let _ = tokio::fs::remove_file(&data_dir).await;
-    Some(msg)
-}
-
-fn pending_restart_path() -> Option<std::path::PathBuf> {
-    let base = std::env::var_os("CLAUDIX_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_DATA_HOME").map(|p| std::path::PathBuf::from(p).join("claudix"))
-        })
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("share").join("claudix")))?;
-    Some(base.join("pending-restart"))
 }
 
 fn session_start_response(

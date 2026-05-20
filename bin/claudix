@@ -1,12 +1,32 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# bootstrap shim — resolves the native claudix binary via the cache,
+# downloading it on first use, then execs it with the caller's args
+set -uo pipefail
 
-CARGO_BIN="${CARGO_HOME:-${HOME}/.cargo}/bin/claudix"
-if [[ -x "$CARGO_BIN" ]]; then
-  exec "$CARGO_BIN" "$@"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+default_plugin_root="$(cd -- "${script_dir}/.." && pwd)"
+
+if [[ -z "${CLAUDE_PLUGIN_ROOT:-}" || ! -x "${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh" ]]; then
+  export CLAUDE_PLUGIN_ROOT="$default_plugin_root"
 fi
-if command -v claudix >/dev/null 2>&1; then
-  exec claudix "$@"
+
+ensure_script="${CLAUDE_PLUGIN_ROOT}/scripts/ensure-binary.sh"
+
+# fast path: binary already cached
+if binary="$(bash "$ensure_script" --check-only 2>/dev/null)"; then
+  exec "$binary" "$@"
 fi
-printf 'claudix: binary not found; run install.sh to install\n' >&2
+
+# cache miss: spawn install detached and fail-fast.
+# blocking would either burn the mcp startup timeout or stall a hook;
+# the user gets one degraded session and the binary is ready next time.
+nohup bash "$ensure_script" --install >/dev/null 2>&1 &
+disown 2>/dev/null || true
+
+if [[ "${1:-}" == "mcp" ]]; then
+  printf 'claudix: native binary not yet cached — downloading in background, restart Claude Code once it completes\n' >&2
+  exit 1
+fi
+
+printf 'claudix: binary installing in background; hooks activate on next session start\n' >&2
 exit 0
