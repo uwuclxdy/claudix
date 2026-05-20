@@ -45,13 +45,6 @@ pub(super) async fn handle_post_tool_use(
         .and_then(|cfg| check_index_ready(project_root, cfg, "PostToolUse")))
 }
 
-pub(super) async fn handle_user_prompt_submit(project_root: &Path) -> Result<Option<Value>> {
-    let config = config::load(project_root).ok();
-    Ok(config
-        .as_ref()
-        .and_then(|cfg| check_index_ready(project_root, cfg, "UserPromptSubmit")))
-}
-
 pub(super) fn watcher_alive(project_root: &Path, config: &Config) -> bool {
     let Ok(store) = Store::new(project_root, config) else {
         return false;
