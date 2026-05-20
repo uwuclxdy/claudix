@@ -73,9 +73,14 @@ pub(super) fn watcher_alive(project_root: &Path, config: &Config) -> bool {
 fn reindex_target_is_watchable(project_root: &Path, file_path: &str) -> bool {
     let raw = Path::new(file_path);
     let relative = if raw.is_absolute() {
-        let canonical = raw.canonicalize();
-        let absolute = canonical.as_deref().unwrap_or(raw);
-        match absolute.strip_prefix(project_root) {
+        // Canonicalise both sides so a project root on a symlinked prefix
+        // (macOS `/tmp` → `/private/tmp`) still strip-prefix-matches the
+        // canonical raw path Claude Code hands us.
+        let raw_canonical = raw.canonicalize();
+        let raw_absolute = raw_canonical.as_deref().unwrap_or(raw);
+        let root_canonical = project_root.canonicalize();
+        let root_absolute = root_canonical.as_deref().unwrap_or(project_root);
+        match raw_absolute.strip_prefix(root_absolute) {
             Ok(relative) => relative.to_path_buf(),
             Err(_) => return false,
         }
