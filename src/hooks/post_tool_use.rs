@@ -8,10 +8,10 @@ use crate::enumeration::WatchFilter;
 use crate::error::Result;
 use crate::store::Store;
 
-use super::WATCH_MARKER_STALE_SECS;
 use super::payload::{HookPayload, is_write_tool};
 use super::ready_check::check_index_ready;
 use super::spawn::spawn_background_reindex_file;
+use crate::store::marker::WATCH_MARKER_STALE_SECS;
 
 pub(super) async fn handle_post_tool_use(
     project_root: &Path,

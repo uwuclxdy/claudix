@@ -5,9 +5,9 @@ use std::time::{Duration, SystemTime};
 
 use crate::config::Config;
 use crate::store::Store;
+use crate::store::marker::WATCH_MARKER_STALE_SECS;
 use crate::util::{now_rfc3339, parse_rfc3339};
 
-use super::WATCH_MARKER_STALE_SECS;
 use super::ready_check::PENDING_INDEX_FAILURE_GRACE_SECS;
 
 pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bool {

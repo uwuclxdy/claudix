@@ -13,8 +13,6 @@ mod ready_check;
 mod session_start;
 mod spawn;
 
-pub(super) const WATCH_MARKER_STALE_SECS: u64 = 120;
-
 use payload::HookPayload;
 use ready_check::check_index_ready;
 

@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
+/// How long an unparseable or otherwise-pending marker stays "young" before
+/// the next claimant is allowed to overwrite it. Matches the watcher's
+/// heartbeat cadence so a stalled watch process can't outlive a session.
+pub(crate) const WATCH_MARKER_STALE_SECS: u64 = 120;
+
 #[cfg(unix)]
 pub(crate) fn process_running(pid: u32) -> bool {
     // `kill -0 0` targets the current process group, so an explicit guard
@@ -130,8 +135,9 @@ impl PidMarker {
             fs::create_dir_all(parent).map_err(|_| ClaimError::Setup)?;
         }
         // PidMarker's contract is "we are the live owner" — bound the
-        // stale window to ~2 minutes which matches the watch heartbeat.
-        match try_claim(&path, Duration::from_secs(120)) {
+        // stale window to the shared WATCH_MARKER_STALE_SECS so callers
+        // and the marker's own claim path agree on what "stale" means.
+        match try_claim(&path, Duration::from_secs(WATCH_MARKER_STALE_SECS)) {
             MarkerClaim::Acquired => Ok(Self { path }),
             MarkerClaim::HeldBy(_) | MarkerClaim::PendingClaim => Err(ClaimError::AlreadyHeld),
         }
