@@ -92,11 +92,7 @@ async fn run() -> Result<()> {
             if force {
                 cli::run_clear_index(&project_root).await?;
             }
-            let output = if progress {
-                cli::run_index_with_progress(&project_root).await?
-            } else {
-                cli::run_index(&project_root).await?
-            };
+            let output = cli::run_index(&project_root, progress).await?;
             println!(
                 "indexed {} files into {} chunks",
                 output.file_count, output.chunk_count

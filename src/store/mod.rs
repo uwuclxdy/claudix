@@ -1,92 +1,40 @@
+//! Persistence layer: LanceDB table + JSON manifest + cross-process lock.
+//!
+//! Submodules carry the heavy details — Arrow plumbing in `arrow`, lock
+//! state machines in `lock`, pid markers in `marker`, the on-disk
+//! manifest in `manifest`, and the in-memory row shape in `chunk_row`.
+//! `mod.rs` keeps the `Store` aggregate and the high-level read/write
+//! API the rest of the crate depends on.
+
+mod arrow;
+mod chunk_row;
+pub mod lock;
+pub mod manifest;
+pub mod marker;
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
-use std::io::Write;
-use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
 
-use arrow_array::types::Float32Type;
-use arrow_array::{
-    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, Float32Array, RecordBatch,
-    RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array, UInt64Array,
-};
-use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use futures::TryStreamExt;
-use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table};
 
 use crate::config::Config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
-use crate::types::{Dimension, EmbeddedChunk, RelativePath};
+use crate::types::{Dimension, EmbeddedChunk, RelativePath, reject_path_escape};
 use crate::util::now_rfc3339;
 use crate::{IndexFileStatus, IndexProgress};
 
-pub const SCHEMA_VERSION: u32 = 1;
-const MANIFEST_FILE_NAME: &str = "manifest.json";
-const LOCK_FILE_NAME: &str = "index.lock";
-// Long enough to outlast a full index on a large repo; the per-file reindex
-// is a background subprocess, so a generous deadline is preferable to giving
-// up and silently losing the user's edit.
-const REINDEX_LOCK_WAIT_MS: u64 = 1_800_000;
-const REINDEX_LOCK_POLL_MS: u64 = 50;
-const LOCK_TERMINATION_GRACE_MS: u64 = 2_000;
-const LOCK_TERMINATION_POLL_MS: u64 = 100;
+use arrow::{chunk_schema, read_all_rows, record_batch_from_rows};
+
+pub use chunk_row::StoredChunk;
+pub(crate) use chunk_row::stored_chunks_from_embedded;
+pub use lock::IndexLockGuard;
+pub use manifest::{Manifest, SCHEMA_VERSION};
+pub(crate) use marker::process_running;
+
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 const GITIGNORE_CONTENTS: &str = "*\n";
 const CHUNKS_TABLE_NAME: &str = "chunks";
-
-const FIELD_CHUNK_ID: &str = "chunk_id";
-const FIELD_FILE_PATH: &str = "file_path";
-const FIELD_LANGUAGE: &str = "language";
-const FIELD_KIND: &str = "kind";
-const FIELD_NAME: &str = "name";
-const FIELD_LINE_START: &str = "line_start";
-const FIELD_LINE_END: &str = "line_end";
-const FIELD_BYTE_START: &str = "byte_start";
-const FIELD_BYTE_END: &str = "byte_end";
-const FIELD_FILE_HASH: &str = "file_hash";
-const FIELD_CONTENT: &str = "content";
-const FIELD_VECTOR: &str = "vector";
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Manifest {
-    pub schema_version: u32,
-    pub embedding_model: String,
-    pub dimensions: u16,
-    pub last_full_index_at: Option<String>,
-    pub last_incremental_at: Option<String>,
-    pub chunk_count: u64,
-    pub file_count: u64,
-    #[serde(default)]
-    pub file_hashes: BTreeMap<String, [u8; 16]>,
-}
-
-impl Manifest {
-    pub fn new(embedding_model: impl Into<String>, dimensions: u16) -> Self {
-        Self {
-            schema_version: SCHEMA_VERSION,
-            embedding_model: embedding_model.into(),
-            dimensions,
-            last_full_index_at: None,
-            last_incremental_at: None,
-            chunk_count: 0,
-            file_count: 0,
-            file_hashes: BTreeMap::new(),
-        }
-    }
-}
-
-pub struct IndexLockGuard {
-    path: PathBuf,
-}
-
-impl Drop for IndexLockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorePaths {
@@ -100,22 +48,6 @@ pub struct StorePaths {
 pub struct StoreStats {
     pub chunk_count: usize,
     pub file_count: usize,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct StoredChunk {
-    pub chunk_id: u64,
-    pub file_path: String,
-    pub language: String,
-    pub kind: String,
-    pub name: Option<String>,
-    pub line_start: u32,
-    pub line_end: u32,
-    pub byte_start: u32,
-    pub byte_end: u32,
-    pub file_hash: [u8; 16],
-    pub content: String,
-    pub vector: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +66,7 @@ impl Store {
             .to_path_buf();
 
         let paths = StorePaths {
-            manifest_path: state_dir.join(MANIFEST_FILE_NAME),
+            manifest_path: state_dir.join(manifest::MANIFEST_FILE_NAME),
             gitignore_path: state_dir.join(GITIGNORE_FILE_NAME),
             state_dir,
             index_dir,
@@ -150,111 +82,16 @@ impl Store {
         &self.project_root
     }
 
-    pub fn pending_index_marker_path(&self) -> std::path::PathBuf {
+    pub fn pending_index_marker_path(&self) -> PathBuf {
         self.paths.state_dir.join("indexing-pending")
     }
 
-    pub fn watch_marker_path(&self) -> std::path::PathBuf {
+    pub fn watch_marker_path(&self) -> PathBuf {
         self.paths.state_dir.join("watch.pid")
     }
 
     pub fn state_dir_path(&self) -> &Path {
         &self.paths.state_dir
-    }
-
-    /// Block until the shared chunk-writer lock is available, then claim it.
-    ///
-    /// Shares [`LOCK_FILE_NAME`] with [`Self::acquire_index_lock`] so a full
-    /// index and a per-file reindex can never rewrite the chunk table at the
-    /// same time. The deadline is long enough to outlast a full index on a
-    /// large repo; if the holder dies or never wrote its PID, the dead-lock
-    /// recovery branch reclaims it on the next poll.
-    pub fn acquire_reindex_lock(&self) -> Result<IndexLockGuard> {
-        fs::create_dir_all(&self.paths.state_dir)?;
-        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
-        let deadline = std::time::Instant::now() + Duration::from_millis(REINDEX_LOCK_WAIT_MS);
-
-        loop {
-            if let Ok(mut file) = fs::File::create_new(&lock_path) {
-                let _ = writeln!(file, "{}", std::process::id());
-                return Ok(IndexLockGuard { path: lock_path });
-            }
-            if let Some(pid) = read_lock_pid(&lock_path)
-                && !process_running(pid)
-            {
-                let _ = fs::remove_file(&lock_path);
-                continue;
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(ClaudixError::Store(
-                    "reindex lock contention: another reindex job is in progress".to_owned(),
-                ));
-            }
-            thread::sleep(Duration::from_millis(REINDEX_LOCK_POLL_MS));
-        }
-    }
-
-    pub fn acquire_index_lock(&self) -> Option<IndexLockGuard> {
-        fs::create_dir_all(&self.paths.state_dir).ok()?;
-        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
-
-        if let Ok(mut file) = fs::File::create_new(&lock_path) {
-            writeln!(file, "{}", std::process::id()).ok()?;
-            return Some(IndexLockGuard { path: lock_path });
-        }
-
-        if self.full_index_running() {
-            return None;
-        }
-        let _ = fs::remove_file(&lock_path);
-        if let Ok(mut file) = fs::File::create_new(&lock_path) {
-            writeln!(file, "{}", std::process::id()).ok()?;
-            return Some(IndexLockGuard { path: lock_path });
-        }
-        None
-    }
-
-    pub fn full_index_running(&self) -> bool {
-        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
-        let Ok(content) = fs::read_to_string(&lock_path) else {
-            return false;
-        };
-        match content.trim().parse::<u32>() {
-            // Lock has a parseable PID — defer to the OS.
-            Ok(pid) => process_running(pid),
-            // Lock exists but has no PID yet. This is the small window between
-            // `create_new` and `writeln!` in `acquire_index_lock`; the writer
-            // is racing to fill it in. Anything older than this window is
-            // corrupt and should not block recovery.
-            Err(_) if content.trim().is_empty() => fs::metadata(&lock_path)
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
-                .is_some_and(|age| age < Duration::from_secs(5)),
-            // Lock has non-empty unparseable contents — almost certainly a
-            // crash mid-write or unrelated debris. Treat as dead so the next
-            // acquire can replace it instead of waiting hours.
-            Err(_) => false,
-        }
-    }
-
-    pub fn stop_index_lock_holder(&self) {
-        let lock_path = self.paths.state_dir.join(LOCK_FILE_NAME);
-        let Some(pid) = read_lock_pid(&lock_path) else {
-            let _ = fs::remove_file(lock_path);
-            return;
-        };
-
-        if pid == std::process::id() {
-            return;
-        }
-
-        terminate_process(pid);
-        wait_for_process_exit(pid, Duration::from_millis(LOCK_TERMINATION_GRACE_MS));
-        if process_running(pid) {
-            kill_process(pid);
-        }
-        let _ = fs::remove_file(lock_path);
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
@@ -290,7 +127,11 @@ impl Store {
     ) -> Result<Option<Manifest>> {
         self.read_manifest()?
             .map(|manifest| {
-                validate_manifest_compatibility(manifest, expected_model, expected_dimensions)
+                manifest::validate_manifest_compatibility(
+                    manifest,
+                    expected_model,
+                    expected_dimensions,
+                )
             })
             .transpose()
     }
@@ -303,11 +144,6 @@ impl Store {
         let mut rows = read_all_rows(&table).await?;
         sort_rows(&mut rows);
         Ok(rows)
-    }
-
-    pub async fn chunk_stats(&self) -> Result<StoreStats> {
-        let rows = self.read_chunks().await?;
-        Ok(stats_from_rows(&rows))
     }
 
     pub async fn stored_file_hash_and_stats(
@@ -324,15 +160,7 @@ impl Store {
     pub async fn incremental_file_state(
         &self,
         current_files: &[(String, [u8; 16])],
-    ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
-        self.incremental_file_state_with_progress(current_files, None)
-            .await
-    }
-
-    pub async fn incremental_file_state_with_progress(
-        &self,
-        current_files: &[(String, [u8; 16])],
-        mut progress: Option<&mut dyn IndexProgress>,
+        progress: &mut dyn IndexProgress,
     ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
         let stored_rows = self.read_chunks().await?;
         let stored_file_hashes = self.stored_file_hashes(&stored_rows)?;
@@ -343,16 +171,11 @@ impl Store {
         for (path, hash) in current_files {
             match stored_file_hashes.get(path.as_str()) {
                 Some(stored_hash) if stored_hash == hash => {
-                    if let Some(progress) = progress.as_deref_mut() {
-                        progress
-                            .file(&RelativePath::new(path.as_str()), IndexFileStatus::Verified)?;
-                    }
+                    progress.file(&RelativePath::new(path.as_str()), IndexFileStatus::Verified)?;
                 }
                 _ => {
                     changed_paths.insert(path.clone());
-                    if !stored_path_set.contains(path.as_str())
-                        && let Some(progress) = progress.as_deref_mut()
-                    {
+                    if !stored_path_set.contains(path.as_str()) {
                         progress.file(
                             &RelativePath::new(path.as_str()),
                             IndexFileStatus::Skipped("not present in index"),
@@ -433,11 +256,12 @@ impl Store {
         let stats = stats_from_rows(&merged_rows);
         let file_hashes = current_files.iter().cloned().collect();
         self.persist_rows(merged_rows, dimension).await?;
-        self.sync_manifest(config, &stats, file_hashes)?;
+        self.sync_manifest_with_timestamp(config, &stats, file_hashes, true)?;
         Ok(stats)
     }
 
-    pub async fn replace_chunks(
+    #[cfg(test)]
+    pub(crate) async fn replace_chunks(
         &self,
         chunks: &[EmbeddedChunk],
         config: &Config,
@@ -447,7 +271,7 @@ impl Store {
         let stats = stats_from_rows(&rows);
         let file_hashes = file_hashes_from_rows(&rows);
         self.persist_rows(rows, dimension).await?;
-        self.sync_manifest(config, &stats, file_hashes)?;
+        self.sync_manifest_with_timestamp(config, &stats, file_hashes, true)?;
         Ok(stats)
     }
 
@@ -521,7 +345,7 @@ impl Store {
     ) -> Result<()> {
         let mut manifest = self
             .read_manifest()?
-            .unwrap_or_else(|| Manifest::new(&config.embedding.model, config.embedding.dimensions));
+            .unwrap_or_else(|| Manifest::for_config(config));
         manifest.file_hashes.insert(path.as_str().to_owned(), hash);
         self.write_manifest(&manifest)
     }
@@ -535,11 +359,13 @@ impl Store {
             connection.drop_table(CHUNKS_TABLE_NAME, &[]).await?;
         }
 
-        let manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        let manifest = Manifest::for_config(config);
         self.write_manifest(&manifest)
     }
 
     async fn persist_rows(&self, rows: Vec<StoredChunk>, dimension: Dimension) -> Result<()> {
+        use arrow_array::{RecordBatchIterator, RecordBatchReader};
+
         self.ensure_layout()?;
         let connection = self.open_connection().await?;
 
@@ -591,15 +417,6 @@ impl Store {
         Ok(table_names.iter().any(|name| name == CHUNKS_TABLE_NAME))
     }
 
-    fn sync_manifest(
-        &self,
-        config: &Config,
-        stats: &StoreStats,
-        file_hashes: BTreeMap<String, [u8; 16]>,
-    ) -> Result<()> {
-        self.sync_manifest_with_timestamp(config, stats, file_hashes, true)
-    }
-
     fn sync_manifest_with_timestamp(
         &self,
         config: &Config,
@@ -609,7 +426,7 @@ impl Store {
     ) -> Result<()> {
         let mut manifest = self
             .read_manifest()?
-            .unwrap_or_else(|| Manifest::new(&config.embedding.model, config.embedding.dimensions));
+            .unwrap_or_else(|| Manifest::for_config(config));
         let timestamp = now_rfc3339();
         manifest.embedding_model = config.embedding.model.clone();
         manifest.dimensions = config.embedding.dimensions;
@@ -639,131 +456,9 @@ impl Store {
     }
 }
 
-fn read_lock_pid(lock_path: &Path) -> Option<u32> {
-    fs::read_to_string(lock_path).ok()?.trim().parse().ok()
-}
-
-fn wait_for_process_exit(pid: u32, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if !process_running(pid) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(LOCK_TERMINATION_POLL_MS));
-    }
-}
-
-#[cfg(unix)]
-pub(crate) fn process_running(pid: u32) -> bool {
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-#[cfg(unix)]
-fn terminate_process(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(unix)]
-fn kill_process(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status();
-}
-
-#[cfg(windows)]
-pub(crate) fn process_running(pid: u32) -> bool {
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
-        })
-}
-
-#[cfg(windows)]
-fn terminate_process(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string()])
-        .status();
-}
-
-#[cfg(windows)]
-fn kill_process(pid: u32) {
-    let _ = Command::new("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
-        .status();
-}
-
-impl StoredChunk {
-    fn from_embedded_chunk(chunk: &EmbeddedChunk, dimension: Dimension) -> Result<Self> {
-        validate_vector(&chunk.vector, dimension)?;
-
-        Ok(Self {
-            chunk_id: chunk.chunk.id.0,
-            file_path: chunk.chunk.file_path.as_str().to_owned(),
-            language: chunk.chunk.language.to_string(),
-            kind: chunk.chunk.kind.to_string(),
-            name: chunk.chunk.name.clone(),
-            line_start: chunk.chunk.line_range.start,
-            line_end: chunk.chunk.line_range.end,
-            byte_start: chunk.chunk.byte_range.start,
-            byte_end: chunk.chunk.byte_range.end,
-            file_hash: chunk.chunk.file_hash.0,
-            content: chunk.chunk.content.clone(),
-            vector: chunk.vector.clone(),
-        })
-    }
-}
-
-fn validate_manifest_compatibility(
-    manifest: Manifest,
-    expected_model: &str,
-    expected_dimensions: u16,
-) -> Result<Manifest> {
-    if manifest.schema_version != SCHEMA_VERSION {
-        return Err(ClaudixError::SchemaMismatch {
-            store: manifest.schema_version,
-            binary: SCHEMA_VERSION,
-            recovery: RecoveryHint(
-                "Reindex the project to rebuild the store with the current schema version",
-            ),
-        });
-    }
-
-    if manifest.embedding_model != expected_model {
-        return Err(ClaudixError::EmbeddingModelMismatch {
-            store_model: manifest.embedding_model,
-            active_model: expected_model.to_owned(),
-            recovery: RecoveryHint(
-                "Reindex the project after changing the configured embedding model",
-            ),
-        });
-    }
-
-    if manifest.dimensions != expected_dimensions {
-        return Err(ClaudixError::DimensionMismatch {
-            store_dim: manifest.dimensions,
-            model_dim: expected_dimensions,
-            recovery: RecoveryHint(
-                "Reindex the project after changing the configured embedding dimensions",
-            ),
-        });
-    }
-
-    Ok(manifest)
-}
-
 fn resolve_project_path(project_root: &Path, relative_path: &Path) -> Result<PathBuf> {
-    reject_path_escape(relative_path)?;
+    const RECOVERY: &str = "Only use store paths inside $CLAUDE_PROJECT_DIR";
+    reject_path_escape(relative_path, RECOVERY)?;
 
     let resolved = project_root.join(relative_path);
     if resolved.starts_with(project_root) {
@@ -772,297 +467,8 @@ fn resolve_project_path(project_root: &Path, relative_path: &Path) -> Result<Pat
 
     Err(ClaudixError::PathTraversal {
         path: resolved,
-        recovery: RecoveryHint("Only use store paths inside $CLAUDE_PROJECT_DIR"),
+        recovery: RecoveryHint(RECOVERY),
     })
-}
-
-fn reject_path_escape(path: &Path) -> Result<()> {
-    if path.is_absolute() {
-        return Err(ClaudixError::PathTraversal {
-            path: path.to_path_buf(),
-            recovery: RecoveryHint("Only use store paths inside $CLAUDE_PROJECT_DIR"),
-        });
-    }
-
-    for component in path.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(ClaudixError::PathTraversal {
-                path: path.to_path_buf(),
-                recovery: RecoveryHint("Only use store paths inside $CLAUDE_PROJECT_DIR"),
-            });
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_vector(vector: &[f32], dimension: Dimension) -> Result<()> {
-    if vector.len() != usize::from(dimension.0) {
-        return Err(ClaudixError::DimensionMismatch {
-            store_dim: dimension.0,
-            model_dim: u16::try_from(vector.len()).unwrap_or(u16::MAX),
-            recovery: RecoveryHint(
-                "Reindex the project after aligning embedding dimensions with the active model",
-            ),
-        });
-    }
-
-    if vector.iter().any(|value| !value.is_finite()) {
-        return Err(ClaudixError::Store(
-            "embedding vector contains non-finite values".to_owned(),
-        ));
-    }
-
-    Ok(())
-}
-
-pub(crate) fn stored_chunks_from_embedded(
-    chunks: &[EmbeddedChunk],
-    dimension: Dimension,
-) -> Result<Vec<StoredChunk>> {
-    chunks
-        .iter()
-        .map(|chunk| StoredChunk::from_embedded_chunk(chunk, dimension))
-        .collect()
-}
-
-fn chunk_schema(dimension: Dimension) -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new(FIELD_CHUNK_ID, DataType::UInt64, false),
-        Field::new(FIELD_FILE_PATH, DataType::Utf8, false),
-        Field::new(FIELD_LANGUAGE, DataType::Utf8, false),
-        Field::new(FIELD_KIND, DataType::Utf8, false),
-        Field::new(FIELD_NAME, DataType::Utf8, true),
-        Field::new(FIELD_LINE_START, DataType::UInt32, false),
-        Field::new(FIELD_LINE_END, DataType::UInt32, false),
-        Field::new(FIELD_BYTE_START, DataType::UInt32, false),
-        Field::new(FIELD_BYTE_END, DataType::UInt32, false),
-        Field::new(FIELD_FILE_HASH, DataType::FixedSizeBinary(16), false),
-        Field::new(FIELD_CONTENT, DataType::Utf8, false),
-        Field::new(
-            FIELD_VECTOR,
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                i32::from(dimension.0),
-            ),
-            true,
-        ),
-    ]))
-}
-
-fn record_batch_from_rows(rows: &[StoredChunk], dimension: Dimension) -> Result<RecordBatch> {
-    for row in rows {
-        validate_vector(&row.vector, dimension)?;
-    }
-
-    record_batch_from_rows_unchecked(rows, dimension)
-}
-
-fn record_batch_from_rows_unchecked(
-    rows: &[StoredChunk],
-    dimension: Dimension,
-) -> Result<RecordBatch> {
-    let names: Vec<Option<String>> = rows.iter().map(|row| row.name.clone()).collect();
-    let hash_refs: Vec<&[u8; 16]> = rows.iter().map(|row| &row.file_hash).collect();
-    let vectors = rows
-        .iter()
-        .map(|row| Some(row.vector.iter().copied().map(Some).collect::<Vec<_>>()));
-
-    RecordBatch::try_new(
-        chunk_schema(dimension),
-        vec![
-            Arc::new(UInt64Array::from(
-                rows.iter().map(|row| row.chunk_id).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.file_path.clone())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.language.clone())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(StringArray::from(
-                rows.iter().map(|row| row.kind.clone()).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(StringArray::from(names)) as ArrayRef,
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|row| row.line_start).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|row| row.line_end).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|row| row.byte_start).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(UInt32Array::from(
-                rows.iter().map(|row| row.byte_end).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(
-                FixedSizeBinaryArray::try_from_iter(hash_refs.into_iter())
-                    .map_err(|error| ClaudixError::Store(error.to_string()))?,
-            ) as ArrayRef,
-            Arc::new(StringArray::from(
-                rows.iter()
-                    .map(|row| row.content.clone())
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            Arc::new(
-                FixedSizeListArray::from_iter_primitive::<Float32Type, _, _>(
-                    vectors,
-                    i32::from(dimension.0),
-                ),
-            ) as ArrayRef,
-        ],
-    )
-    .map_err(|error| ClaudixError::Store(error.to_string()))
-}
-
-async fn read_all_rows(table: &Table) -> Result<Vec<StoredChunk>> {
-    let batches = table
-        .query()
-        .limit(i64::MAX as usize)
-        .execute()
-        .await?
-        .try_collect::<Vec<_>>()
-        .await?;
-    batches_to_rows(batches)
-}
-
-fn batches_to_rows(batches: Vec<RecordBatch>) -> Result<Vec<StoredChunk>> {
-    let mut rows = Vec::new();
-
-    for batch in batches {
-        let dimension = vector_dimension(&batch)?;
-        for row_index in 0..batch.num_rows() {
-            let vector = read_vector(&batch, row_index)?;
-            validate_vector(&vector, dimension)?;
-            rows.push(StoredChunk {
-                chunk_id: read_u64(&batch, FIELD_CHUNK_ID, row_index)?,
-                file_path: read_string(&batch, FIELD_FILE_PATH, row_index)?,
-                language: read_string(&batch, FIELD_LANGUAGE, row_index)?,
-                kind: read_string(&batch, FIELD_KIND, row_index)?,
-                name: read_optional_string(&batch, FIELD_NAME, row_index)?,
-                line_start: read_u32(&batch, FIELD_LINE_START, row_index)?,
-                line_end: read_u32(&batch, FIELD_LINE_END, row_index)?,
-                byte_start: read_u32(&batch, FIELD_BYTE_START, row_index)?,
-                byte_end: read_u32(&batch, FIELD_BYTE_END, row_index)?,
-                file_hash: read_file_hash(&batch, row_index)?,
-                content: read_string(&batch, FIELD_CONTENT, row_index)?,
-                vector,
-            });
-        }
-    }
-
-    Ok(rows)
-}
-
-fn read_string(batch: &RecordBatch, column: &str, row: usize) -> Result<String> {
-    let array = batch
-        .column_by_name(column)
-        .ok_or_else(|| ClaudixError::Store(format!("missing column {column}")))?;
-    let array = array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ClaudixError::Store(format!("column {column} was not utf8")))?;
-    Ok(array.value(row).to_owned())
-}
-
-fn read_optional_string(batch: &RecordBatch, column: &str, row: usize) -> Result<Option<String>> {
-    let array = batch
-        .column_by_name(column)
-        .ok_or_else(|| ClaudixError::Store(format!("missing column {column}")))?;
-    let array = array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| ClaudixError::Store(format!("column {column} was not utf8")))?;
-
-    if array.is_null(row) {
-        return Ok(None);
-    }
-
-    Ok(Some(array.value(row).to_owned()))
-}
-
-fn read_u32(batch: &RecordBatch, column: &str, row: usize) -> Result<u32> {
-    let array = batch
-        .column_by_name(column)
-        .ok_or_else(|| ClaudixError::Store(format!("missing column {column}")))?;
-    let array = array
-        .as_any()
-        .downcast_ref::<UInt32Array>()
-        .ok_or_else(|| ClaudixError::Store(format!("column {column} was not u32")))?;
-    Ok(array.value(row))
-}
-
-fn read_u64(batch: &RecordBatch, column: &str, row: usize) -> Result<u64> {
-    let array = batch
-        .column_by_name(column)
-        .ok_or_else(|| ClaudixError::Store(format!("missing column {column}")))?;
-    let array = array
-        .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| ClaudixError::Store(format!("column {column} was not u64")))?;
-    Ok(array.value(row))
-}
-
-fn read_file_hash(batch: &RecordBatch, row: usize) -> Result<[u8; 16]> {
-    let array = batch
-        .column_by_name(FIELD_FILE_HASH)
-        .ok_or_else(|| ClaudixError::Store(format!("missing column {FIELD_FILE_HASH}")))?;
-    let array = array
-        .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .ok_or_else(|| {
-            ClaudixError::Store("file_hash column was not fixed-size binary".to_owned())
-        })?;
-
-    <[u8; 16]>::try_from(array.value(row))
-        .map_err(|_| ClaudixError::Store("file_hash value was not 16 bytes".to_owned()))
-}
-
-fn vector_dimension(batch: &RecordBatch) -> Result<Dimension> {
-    let array = batch
-        .column_by_name(FIELD_VECTOR)
-        .ok_or_else(|| ClaudixError::Store(format!("missing column {FIELD_VECTOR}")))?;
-    let array = array
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
-        .ok_or_else(|| ClaudixError::Store("vector column was not fixed-size list".to_owned()))?;
-    u16::try_from(array.value_length())
-        .map(Dimension)
-        .map_err(|_| ClaudixError::Store("vector dimension overflowed u16".to_owned()))
-}
-
-fn read_vector(batch: &RecordBatch, row: usize) -> Result<Vec<f32>> {
-    let array = batch
-        .column_by_name(FIELD_VECTOR)
-        .ok_or_else(|| ClaudixError::Store(format!("missing column {FIELD_VECTOR}")))?;
-    let array = array
-        .as_any()
-        .downcast_ref::<FixedSizeListArray>()
-        .ok_or_else(|| ClaudixError::Store("vector column was not fixed-size list".to_owned()))?;
-    if array.is_null(row) {
-        return Err(ClaudixError::Store("vector value was null".to_owned()));
-    }
-
-    let values = array.value(row);
-    let values = values
-        .as_any()
-        .downcast_ref::<Float32Array>()
-        .ok_or_else(|| ClaudixError::Store("vector values were not float32".to_owned()))?;
-    if values.null_count() > 0 {
-        return Err(ClaudixError::Store(
-            "vector values contained nulls".to_owned(),
-        ));
-    }
-
-    Ok((0..values.len()).map(|index| values.value(index)).collect())
 }
 
 fn distinct_file_paths(rows: &[StoredChunk]) -> BTreeSet<String> {
@@ -1090,13 +496,21 @@ fn sort_rows(rows: &mut [StoredChunk]) {
             .then(left.chunk_id.cmp(&right.chunk_id))
     });
 }
-
 #[cfg(test)]
 mod tests {
+    use super::arrow::{batches_to_rows, chunk_schema, record_batch_from_rows_unchecked};
+    use super::lock::LOCK_FILE_NAME;
+    use super::marker::read_pid;
     use super::*;
     use crate::types::{
         ByteRange, Chunk, ChunkId, ChunkKind, FileHash, Language, LineRange, RelativePath,
     };
+    use ::arrow_array::types::Float32Type;
+    use ::arrow_array::{
+        ArrayRef, FixedSizeBinaryArray, FixedSizeListArray, RecordBatch, StringArray, UInt32Array,
+        UInt64Array,
+    };
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     fn manifest_with_schema(
@@ -1676,7 +1090,7 @@ mod tests {
         assert!(lock.is_some());
 
         let lock_path = store.paths.state_dir.join(LOCK_FILE_NAME);
-        assert_eq!(read_lock_pid(&lock_path), Some(std::process::id()));
+        assert_eq!(read_pid(&lock_path), Some(std::process::id()));
     }
 
     #[tokio::test]
@@ -1785,7 +1199,9 @@ mod tests {
             ("src/b.rs".to_owned(), [9u8; 16]),
         ];
 
-        let (changed_paths, unchanged_rows) = store.incremental_file_state(&current_files).await?;
+        let (changed_paths, unchanged_rows) = store
+            .incremental_file_state(&current_files, &mut ())
+            .await?;
 
         assert!(
             !changed_paths.contains("src/a.rs"),
@@ -1806,7 +1222,7 @@ mod tests {
         let config = Config::default();
         let store = Store::new(project_root.path(), &config)?;
 
-        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        let mut manifest = Manifest::for_config(&config);
         manifest.file_count = 1;
         manifest
             .file_hashes
@@ -1814,7 +1230,9 @@ mod tests {
         store.write_manifest(&manifest)?;
 
         let current_files = vec![("src/empty.rs".to_owned(), [7u8; 16])];
-        let (changed_paths, unchanged_rows) = store.incremental_file_state(&current_files).await?;
+        let (changed_paths, unchanged_rows) = store
+            .incremental_file_state(&current_files, &mut ())
+            .await?;
 
         assert!(changed_paths.is_empty());
         assert!(unchanged_rows.is_empty());
@@ -1836,7 +1254,9 @@ mod tests {
         // b.rs is not present in current_files (deleted)
         let current_files = vec![("src/a.rs".to_owned(), [1u8; 16])];
 
-        let (changed_paths, unchanged_rows) = store.incremental_file_state(&current_files).await?;
+        let (changed_paths, unchanged_rows) = store
+            .incremental_file_state(&current_files, &mut ())
+            .await?;
 
         assert!(changed_paths.is_empty());
         assert_eq!(unchanged_rows.len(), 1);
@@ -1851,7 +1271,7 @@ mod tests {
         let store = Store::new(project_root.path(), &config)?;
 
         // Record a no-chunk file hash directly in the manifest.
-        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        let mut manifest = Manifest::for_config(&config);
         manifest
             .file_hashes
             .insert("src/empty.rs".to_owned(), [7u8; 16]);
@@ -1883,7 +1303,7 @@ mod tests {
         let config = Config::default();
         let store = Store::new(project_root.path(), &config)?;
 
-        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        let mut manifest = Manifest::for_config(&config);
         manifest
             .file_hashes
             .insert("src/empty.rs".to_owned(), [7u8; 16]);

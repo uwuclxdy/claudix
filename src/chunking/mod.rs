@@ -1,19 +1,14 @@
+pub mod go;
+pub mod python;
+pub mod rust;
+pub mod typescript;
+
 use tree_sitter::{Node, Parser};
 
 use crate::error::{ClaudixError, Result};
 use crate::types::{
     ByteRange, Chunk, ChunkId, ChunkKind, FileHash, Language, LineRange, RelativePath,
 };
-
-pub trait Chunker {
-    fn chunk(
-        &self,
-        path: &RelativePath,
-        language: Language,
-        file_hash: FileHash,
-        content: &str,
-    ) -> Result<Vec<Chunk>>;
-}
 
 pub(crate) const DEFAULT_CHUNK_LINES: usize = 60;
 const DEFAULT_OVERLAP_LINES: usize = 5;
@@ -34,19 +29,13 @@ impl Default for MultiLanguageChunker {
 }
 
 impl MultiLanguageChunker {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     pub fn with_fallback_params(chunk_lines: usize, overlap_lines: usize) -> Self {
         Self {
             fallback_chunk_lines: chunk_lines,
             fallback_overlap_lines: overlap_lines,
         }
     }
-}
 
-impl MultiLanguageChunker {
     pub fn chunk_as_text(
         &self,
         path: &RelativePath,
@@ -63,10 +52,8 @@ impl MultiLanguageChunker {
             self.fallback_overlap_lines,
         )
     }
-}
 
-impl Chunker for MultiLanguageChunker {
-    fn chunk(
+    pub fn chunk(
         &self,
         path: &RelativePath,
         language: Language,
@@ -74,12 +61,12 @@ impl Chunker for MultiLanguageChunker {
         content: &str,
     ) -> Result<Vec<Chunk>> {
         match language {
-            Language::Rust => chunk_rust(path, file_hash, content),
-            Language::Python => chunk_python(path, file_hash, content),
+            Language::Rust => rust::chunk(path, file_hash, content),
+            Language::Python => python::chunk(path, file_hash, content),
             Language::TypeScript | Language::JavaScript => {
-                chunk_typescript(path, language, file_hash, content)
+                typescript::chunk(path, language, file_hash, content)
             }
-            Language::Go => chunk_go(path, file_hash, content),
+            Language::Go => go::chunk(path, file_hash, content),
             Language::Java | Language::C | Language::Cpp => chunk_fallback(
                 path,
                 language,
@@ -93,147 +80,26 @@ impl Chunker for MultiLanguageChunker {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Rust chunker
-// ---------------------------------------------------------------------------
-
-fn chunk_rust(path: &RelativePath, file_hash: FileHash, content: &str) -> Result<Vec<Chunk>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .map_err(|error| ClaudixError::TreeSitter(error.to_string()))?;
-
-    let tree = parser
-        .parse(content, None)
-        .ok_or_else(|| ClaudixError::TreeSitter("failed to parse Rust source".to_owned()))?;
-
-    let mut chunks = Vec::new();
-    collect_chunks(
-        tree.root_node(),
-        path,
-        Language::Rust,
-        file_hash,
-        content,
-        &mut chunks,
-        rust_chunk_kind,
-    )?;
-    chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
-    Ok(chunks)
-}
-
-fn rust_chunk_kind(node: Node<'_>) -> Option<ChunkKind> {
-    match node.kind() {
-        "function_item" => Some(function_kind(node)),
-        "function_signature_item" => Some(ChunkKind::Method),
-        "struct_item" => Some(ChunkKind::Struct),
-        "enum_item" => Some(ChunkKind::Enum),
-        "trait_item" => Some(ChunkKind::Trait),
-        "impl_item" => Some(ChunkKind::Impl),
-        "mod_item" => {
-            // `mod foo;` has no body — only index inline `mod foo { ... }` blocks.
-            let has_body = node
-                .named_children(&mut node.walk())
-                .any(|child| child.kind() == "declaration_list");
-            if has_body {
-                Some(ChunkKind::Module)
-            } else {
-                None
-            }
-        }
-        "macro_definition" => Some(ChunkKind::Macro),
-        _ => None,
-    }
-}
-
-fn function_kind(node: Node<'_>) -> ChunkKind {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if parent.kind() == "impl_item" {
-            return ChunkKind::Method;
-        }
-        current = parent.parent();
-    }
-
-    ChunkKind::Function
-}
-
-// ---------------------------------------------------------------------------
-// Python chunker
-// ---------------------------------------------------------------------------
-
-fn chunk_python(path: &RelativePath, file_hash: FileHash, content: &str) -> Result<Vec<Chunk>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_python::LANGUAGE.into())
-        .map_err(|error| ClaudixError::TreeSitter(error.to_string()))?;
-
-    let tree = parser
-        .parse(content, None)
-        .ok_or_else(|| ClaudixError::TreeSitter("failed to parse Python source".to_owned()))?;
-
-    let mut chunks = Vec::new();
-    collect_chunks(
-        tree.root_node(),
-        path,
-        Language::Python,
-        file_hash,
-        content,
-        &mut chunks,
-        python_chunk_kind,
-    )?;
-    chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
-    Ok(chunks)
-}
-
-fn python_chunk_kind(node: Node<'_>) -> Option<ChunkKind> {
-    match node.kind() {
-        "function_definition" => Some(ChunkKind::Function),
-        "decorated_definition" => {
-            // Only emit for decorated functions; decorated classes are handled
-            // when recursion reaches the inner `class_definition`.
-            let has_function = node
-                .named_children(&mut node.walk())
-                .any(|child| child.kind() == "function_definition");
-            if has_function {
-                Some(ChunkKind::Function)
-            } else {
-                None
-            }
-        }
-        "class_definition" => {
-            // Skip if the parent is already a decorated_definition we emitted.
-            let parent_is_decorated = node
-                .parent()
-                .map(|p| p.kind() == "decorated_definition")
-                .unwrap_or(false);
-            if parent_is_decorated {
-                None
-            } else {
-                Some(ChunkKind::Class)
-            }
-        }
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TypeScript / JavaScript chunker
-// ---------------------------------------------------------------------------
-
-fn chunk_typescript(
+/// Generic tree-sitter chunker shell. Per-language modules call this with
+/// their grammar and kind classifier; the parse-and-walk machinery is
+/// identical across grammars so it lives here in one place.
+pub(super) fn chunk_with_grammar(
+    grammar: tree_sitter::Language,
+    grammar_name: &'static str,
     path: &RelativePath,
     language: Language,
     file_hash: FileHash,
     content: &str,
+    kind_fn: fn(Node<'_>) -> Option<ChunkKind>,
 ) -> Result<Vec<Chunk>> {
     let mut parser = Parser::new();
     parser
-        .set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into())
+        .set_language(&grammar)
         .map_err(|error| ClaudixError::TreeSitter(error.to_string()))?;
 
-    let tree = parser
-        .parse(content, None)
-        .ok_or_else(|| ClaudixError::TreeSitter("failed to parse TypeScript source".to_owned()))?;
+    let tree = parser.parse(content, None).ok_or_else(|| {
+        ClaudixError::TreeSitter(format!("failed to parse {grammar_name} source"))
+    })?;
 
     let mut chunks = Vec::new();
     collect_chunks(
@@ -243,101 +109,18 @@ fn chunk_typescript(
         file_hash,
         content,
         &mut chunks,
-        typescript_chunk_kind,
+        kind_fn,
     )?;
     chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
     Ok(chunks)
 }
 
-fn typescript_chunk_kind(node: Node<'_>) -> Option<ChunkKind> {
-    match node.kind() {
-        "function_declaration" | "function_expression" => Some(ChunkKind::Function),
-        "arrow_function" => {
-            // Emit only when directly inside a variable_declarator so we don't
-            // produce a chunk for every inline arrow.
-            let parent_is_declarator = node
-                .parent()
-                .map(|p| p.kind() == "variable_declarator")
-                .unwrap_or(false);
-            if parent_is_declarator {
-                Some(ChunkKind::Function)
-            } else {
-                None
-            }
-        }
-        "method_definition" => Some(ChunkKind::Method),
-        "class_declaration" | "class_expression" => Some(ChunkKind::Class),
-        "interface_declaration" => Some(ChunkKind::Interface),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Go chunker
-// ---------------------------------------------------------------------------
-
-fn chunk_go(path: &RelativePath, file_hash: FileHash, content: &str) -> Result<Vec<Chunk>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&tree_sitter_go::LANGUAGE.into())
-        .map_err(|error| ClaudixError::TreeSitter(error.to_string()))?;
-
-    let tree = parser
-        .parse(content, None)
-        .ok_or_else(|| ClaudixError::TreeSitter("failed to parse Go source".to_owned()))?;
-
-    let mut chunks = Vec::new();
-    collect_chunks(
-        tree.root_node(),
-        path,
-        Language::Go,
-        file_hash,
-        content,
-        &mut chunks,
-        go_chunk_kind,
-    )?;
-    chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
-    Ok(chunks)
-}
-
-fn go_chunk_kind(node: Node<'_>) -> Option<ChunkKind> {
-    match node.kind() {
-        "function_declaration" => Some(ChunkKind::Function),
-        "method_declaration" => Some(ChunkKind::Method),
-        "type_declaration" => {
-            let has_struct = node.named_children(&mut node.walk()).any(|child| {
-                child.kind() == "type_spec" && type_spec_contains(child, "struct_type")
-            });
-            let has_interface = node.named_children(&mut node.walk()).any(|child| {
-                child.kind() == "type_spec" && type_spec_contains(child, "interface_type")
-            });
-
-            if has_struct {
-                Some(ChunkKind::Struct)
-            } else if has_interface {
-                Some(ChunkKind::Interface)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn type_spec_contains(type_spec: Node<'_>, target_kind: &str) -> bool {
-    type_spec
-        .named_children(&mut type_spec.walk())
-        .any(|child| child.kind() == target_kind)
-}
-
-// ---------------------------------------------------------------------------
-// Fallback sliding-window chunker (unknown languages)
-// ---------------------------------------------------------------------------
-
-/// Split `content` into overlapping line-based chunks.
+/// Split `content` into overlapping line-based chunks. Used for languages
+/// without a tree-sitter grammar and for `chunk_as_text` (force-included
+/// files).
 ///
-/// `chunk_size` — number of lines per chunk (default 50).
-/// `overlap`    — lines shared between adjacent chunks (default 0).
+/// `chunk_size` — number of lines per chunk.
+/// `overlap`    — lines shared between adjacent chunks.
 pub fn chunk_fallback(
     path: &RelativePath,
     language: Language,
@@ -421,10 +204,6 @@ pub fn chunk_fallback(
     Ok(chunks)
 }
 
-// ---------------------------------------------------------------------------
-// Shared tree-sitter helpers
-// ---------------------------------------------------------------------------
-
 fn collect_chunks(
     node: Node<'_>,
     path: &RelativePath,
@@ -454,8 +233,11 @@ fn build_chunk(
     node: Node<'_>,
     kind: ChunkKind,
 ) -> Result<Chunk> {
+    // Rust doc-comments above a function/struct aren't inside the node, so
+    // extend the start byte upward to capture them. Other grammars place
+    // docstrings inside the body — no extension needed.
     let start = if language == Language::Rust {
-        extend_start_for_rust_docs(content, node.start_byte())
+        rust::extend_start_for_rust_docs(content, node.start_byte())
     } else {
         node.start_byte()
     };
@@ -507,34 +289,7 @@ fn chunk_id(file_hash: FileHash, byte_range: ByteRange) -> ChunkId {
     ChunkId(xxhash_rust::xxh3::xxh3_64(&payload))
 }
 
-fn extend_start_for_rust_docs(content: &str, node_start: usize) -> usize {
-    let mut start = node_start;
-
-    loop {
-        let current_line_start = line_start(content, start);
-        if current_line_start == 0 {
-            return start;
-        }
-
-        let previous_line_end = current_line_start.saturating_sub(1);
-        let previous_line_start = line_start(content, previous_line_end);
-        let previous_line = &content[previous_line_start..line_end(content, previous_line_start)];
-
-        if is_rust_doc_comment(previous_line) {
-            start = previous_line_start;
-            continue;
-        }
-
-        return start;
-    }
-}
-
-fn is_rust_doc_comment(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    trimmed.starts_with("///") || trimmed.starts_with("//!")
-}
-
-fn line_start(content: &str, byte_index: usize) -> usize {
+pub(super) fn line_start(content: &str, byte_index: usize) -> usize {
     content.as_bytes()[..byte_index]
         .iter()
         .rposition(|&b| b == b'\n')
@@ -542,7 +297,7 @@ fn line_start(content: &str, byte_index: usize) -> usize {
         .unwrap_or(0)
 }
 
-fn line_end(content: &str, line_start: usize) -> usize {
+pub(super) fn line_end(content: &str, line_start: usize) -> usize {
     content.as_bytes()[line_start..]
         .iter()
         .position(|&b| b == b'\n')
@@ -584,7 +339,7 @@ mod tests {
         // `mod error;` is a pointer declaration with no body — indexing it
         // produces useless 1-token chunks that outscore the real content.
         let source = "mod error;\nmod tests;\n\npub mod inline {\n    pub fn helper() {}\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -611,7 +366,7 @@ mod tests {
     #[test]
     fn rust_chunker_extracts_named_top_level_items() {
         let source = "/// Greets a user.\npub fn greet(name: &str) -> String {\n    format!(\"hello {name}\")\n}\n\npub struct Greeter;\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker.chunk(
             &RelativePath::new("src/lib.rs"),
@@ -634,7 +389,7 @@ mod tests {
     #[test]
     fn rust_chunker_marks_impl_functions_as_methods() {
         let source = "pub struct Counter;\n\nimpl Counter {\n    pub fn new() -> Self {\n        Self\n    }\n\n    pub fn increment(&mut self) {}\n}\n\nimpl Default for Counter {\n    fn default() -> Self {\n        Self::new()\n    }\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker.chunk(
             &RelativePath::new("src/counter.rs"),
@@ -668,7 +423,7 @@ mod tests {
         // sits after the last byte (0xA9), and end_byte - 1 = 0xA9 which is a
         // continuation byte. line_number_for_byte must not slice the str there.
         let source = "pub fn café() -> &'static str {\n    \"espresso\"\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
         let result = chunker.chunk(
             &RelativePath::new("src/lib.rs"),
             Language::Rust,
@@ -687,7 +442,7 @@ mod tests {
     #[test]
     fn chunk_ids_are_deterministic_for_same_input() {
         let source = "pub fn greet() {}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let first = chunker.chunk(
             &RelativePath::new("src/lib.rs"),
@@ -718,7 +473,7 @@ mod tests {
 
     #[test]
     fn python_chunker_empty_returns_empty() {
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
         let chunks = chunker
             .chunk(
                 &RelativePath::new("app.py"),
@@ -734,7 +489,7 @@ mod tests {
     #[test]
     fn python_chunker_extracts_function() {
         let source = "def greet(name):\n    return f'hello {name}'\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -754,7 +509,7 @@ mod tests {
     #[test]
     fn python_chunker_extracts_class() {
         let source = "class Dog:\n    def bark(self):\n        print('woof')\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -775,7 +530,7 @@ mod tests {
     #[test]
     fn python_chunker_extracts_decorated_function() {
         let source = "@staticmethod\ndef helper():\n    pass\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -798,7 +553,7 @@ mod tests {
 
     #[test]
     fn typescript_chunker_empty_returns_empty() {
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
         let chunks = chunker
             .chunk(
                 &RelativePath::new("app.ts"),
@@ -814,7 +569,7 @@ mod tests {
     #[test]
     fn typescript_chunker_extracts_function_declaration() {
         let source = "function greet(name: string): string {\n  return `hello ${name}`;\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -834,7 +589,7 @@ mod tests {
     #[test]
     fn typescript_chunker_extracts_class() {
         let source = "class Animal {\n  name: string;\n  constructor(name: string) { this.name = name; }\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -855,7 +610,7 @@ mod tests {
     #[test]
     fn typescript_chunker_extracts_interface() {
         let source = "interface Shape {\n  area(): number;\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -878,7 +633,7 @@ mod tests {
 
     #[test]
     fn go_chunker_empty_returns_empty() {
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
         let chunks = chunker
             .chunk(
                 &RelativePath::new("main.go"),
@@ -895,7 +650,7 @@ mod tests {
     fn go_chunker_extracts_function() {
         let source =
             "package main\n\nfunc Greet(name string) string {\n\treturn \"hello \" + name\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -916,7 +671,7 @@ mod tests {
     #[test]
     fn go_chunker_extracts_struct_type() {
         let source = "package main\n\ntype Dog struct {\n\tName string\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -935,7 +690,7 @@ mod tests {
     #[test]
     fn go_chunker_extracts_interface_type() {
         let source = "package main\n\ntype Animal interface {\n\tSpeak() string\n}\n";
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
 
         let chunks = chunker
             .chunk(
@@ -1038,7 +793,7 @@ mod tests {
 
     #[test]
     fn python_chunker_returns_function_chunk() {
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
         let source = "def greet(name):\n    return f'hello {name}'\n";
 
         let chunks = chunker
@@ -1057,7 +812,7 @@ mod tests {
 
     #[test]
     fn unknown_language_returns_empty() {
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
         let source = "some text\n";
 
         let chunks = chunker
@@ -1078,7 +833,7 @@ mod tests {
 
     #[test]
     fn java_language_falls_back_to_sliding_window() {
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
         let source = "public class Hello {\n    public static void main(String[] args) {\n        System.out.println(\"Hello\");\n    }\n}\n";
 
         let chunks = chunker
@@ -1100,7 +855,7 @@ mod tests {
 
     #[test]
     fn c_language_falls_back_to_sliding_window() {
-        let chunker = MultiLanguageChunker::new();
+        let chunker = MultiLanguageChunker::default();
         let source = "int add(int a, int b) { return a + b; }\n";
 
         let chunks = chunker

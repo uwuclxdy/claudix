@@ -1,0 +1,130 @@
+use std::path::Path;
+
+use crate::config::validate_project_relative_path;
+use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::types::{Language, RelativePath};
+
+pub(super) fn validate_search_query(query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "search query cannot be empty".into(),
+            recovery: RecoveryHint("Pass a non-empty search query"),
+        });
+    }
+    Ok(())
+}
+
+pub(super) fn validate_search_top_k(top_k: usize) -> Result<()> {
+    if top_k == 0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "top_k must be > 0".into(),
+            recovery: RecoveryHint("Pass a positive top_k value"),
+        });
+    }
+
+    Ok(())
+}
+
+pub(super) fn parse_language_filter(
+    language_filter: Option<Vec<String>>,
+) -> Result<Option<Vec<Language>>> {
+    let Some(language_filter) = language_filter else {
+        return Ok(None);
+    };
+    if language_filter.is_empty() {
+        return Ok(None);
+    }
+
+    let mut parsed = Vec::with_capacity(language_filter.len());
+    for language in language_filter {
+        parsed.push(parse_language(&language)?);
+    }
+
+    Ok(Some(parsed))
+}
+
+pub(super) fn parse_path_prefix(path_prefix: Option<String>) -> Result<Option<RelativePath>> {
+    let Some(prefix) = path_prefix else {
+        return Ok(None);
+    };
+    let trimmed = prefix.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    validate_project_relative_path(Path::new(trimmed), "search.path_prefix")?;
+    Ok(Some(RelativePath::new(trimmed.to_owned())))
+}
+
+fn parse_language(value: &str) -> Result<Language> {
+    Language::from_filter_input(value).ok_or_else(|| ClaudixError::ConfigInvalid {
+        message: format!("unsupported language filter: {}", value.trim()),
+        recovery: RecoveryHint(
+            "Use one of: rust, python, javascript, typescript, go, java, c, cpp, unknown",
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_search_query_rejects_empty_and_whitespace() {
+        for query in ["", "   ", "\t", "\n"] {
+            let result = validate_search_query(query);
+            assert!(matches!(result, Err(ClaudixError::ConfigInvalid { .. })));
+        }
+    }
+
+    #[test]
+    fn validate_search_top_k_rejects_zero() {
+        let result = validate_search_top_k(0);
+
+        assert!(matches!(result, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
+    fn parse_language_filter_accepts_aliases() {
+        let parsed = parse_language_filter(Some(vec!["rs".to_owned(), "ts".to_owned()]));
+        assert!(parsed.is_err());
+
+        let parsed = parse_language_filter(Some(vec![" rust ".to_owned(), "ts".to_owned()]));
+        assert!(matches!(
+            parsed,
+            Ok(Some(ref languages)) if languages == &vec![Language::Rust, Language::TypeScript]
+        ));
+    }
+
+    #[test]
+    fn parse_language_filter_treats_empty_list_as_no_filter() {
+        let parsed = parse_language_filter(Some(Vec::new()));
+
+        assert!(matches!(parsed, Ok(None)));
+    }
+
+    #[test]
+    fn parse_path_prefix_treats_blank_values_as_no_filter() {
+        assert!(matches!(parse_path_prefix(None), Ok(None)));
+        assert!(matches!(
+            parse_path_prefix(Some("   ".to_owned())),
+            Ok(None)
+        ));
+        assert_eq!(
+            parse_path_prefix(Some(" src/math ".to_owned()))
+                .ok()
+                .flatten()
+                .as_ref()
+                .map(RelativePath::as_str),
+            Some("src/math")
+        );
+    }
+
+    #[test]
+    fn parse_path_prefix_rejects_paths_outside_project() {
+        for path_prefix in ["../src", "/tmp/src"] {
+            let parsed = parse_path_prefix(Some(path_prefix.to_owned()));
+            assert!(matches!(parsed, Err(ClaudixError::ConfigInvalid { .. })));
+        }
+    }
+}

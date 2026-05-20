@@ -205,7 +205,7 @@ async fn reindex(project_root: &Path, arguments: Value) -> Result<Value> {
     if request.force {
         cli::run_clear_index(project_root).await?;
     }
-    let output = cli::run_index(project_root).await?;
+    let output = cli::run_index(project_root, false).await?;
     to_value(output)
 }
 

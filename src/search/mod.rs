@@ -1,6 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::{fs, task};
@@ -65,7 +65,7 @@ impl Searcher {
         Ok(results)
     }
 
-    pub async fn search_all(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
+    async fn search_all(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
         if query.query.trim().is_empty() {
             return Ok(Vec::new());
         }
@@ -215,20 +215,8 @@ async fn result_is_stale(project_root: &Path, chunk: &Chunk) -> Result<bool> {
 }
 
 fn resolve_chunk_path(project_root: &Path, relative_path: &RelativePath) -> Result<PathBuf> {
-    let path = relative_path.to_path_buf();
-    for component in path.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(ClaudixError::PathTraversal {
-                path,
-                recovery: RecoveryHint("Only read search result files inside $CLAUDE_PROJECT_DIR"),
-            });
-        }
-    }
-
-    Ok(project_root.join(path))
+    relative_path.reject_escape("Only read search result files inside $CLAUDE_PROJECT_DIR")?;
+    Ok(project_root.join(relative_path.to_path_buf()))
 }
 
 fn validate_query_vector(vector: &[f32], dimensions: Dimension) -> Result<()> {
@@ -236,7 +224,7 @@ fn validate_query_vector(vector: &[f32], dimensions: Dimension) -> Result<()> {
         return Err(ClaudixError::DimensionMismatch {
             store_dim: dimensions.0,
             model_dim: u16::try_from(vector.len()).unwrap_or(u16::MAX),
-            recovery: crate::error::RecoveryHint(
+            recovery: RecoveryHint(
                 "Rebuild the index with the configured embedding dimensions or fix the endpoint model",
             ),
         });
@@ -489,8 +477,8 @@ fn stored_chunk_to_chunk(row: StoredChunk) -> Chunk {
     Chunk {
         id: ChunkId(chunk_id),
         file_path: RelativePath::new(file_path),
-        language: stored_language(&language),
-        kind: stored_chunk_kind(&kind),
+        language: Language::from_storage(&language),
+        kind: ChunkKind::from_storage(&kind),
         name,
         line_range: LineRange {
             start: line_start,
@@ -502,36 +490,6 @@ fn stored_chunk_to_chunk(row: StoredChunk) -> Chunk {
         },
         file_hash: FileHash(file_hash),
         content,
-    }
-}
-
-fn stored_language(language: &str) -> Language {
-    match language {
-        "rust" => Language::Rust,
-        "python" => Language::Python,
-        "javascript" => Language::JavaScript,
-        "typescript" => Language::TypeScript,
-        "go" => Language::Go,
-        "java" => Language::Java,
-        "c" => Language::C,
-        "cpp" => Language::Cpp,
-        _ => Language::Unknown,
-    }
-}
-
-fn stored_chunk_kind(kind: &str) -> ChunkKind {
-    match kind {
-        "function" => ChunkKind::Function,
-        "method" => ChunkKind::Method,
-        "struct" => ChunkKind::Struct,
-        "class" => ChunkKind::Class,
-        "enum" => ChunkKind::Enum,
-        "trait" => ChunkKind::Trait,
-        "interface" => ChunkKind::Interface,
-        "module" => ChunkKind::Module,
-        "impl" => ChunkKind::Impl,
-        "macro" => ChunkKind::Macro,
-        _ => ChunkKind::Other,
     }
 }
 

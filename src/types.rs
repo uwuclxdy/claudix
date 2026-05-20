@@ -1,5 +1,7 @@
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+use crate::error::{ClaudixError, RecoveryHint, Result};
 
 /// Deterministic chunk identifier derived from (file_hash, byte_range).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -46,7 +48,38 @@ pub(crate) fn path_prefix_matches(path: &str, prefix: &str) -> bool {
             .is_some_and(|extension| !extension.contains(['/', '.']))
 }
 
+/// Reject absolute paths and parent-dir / root-dir / drive-prefix components.
+///
+/// Used wherever a project-relative path crosses a trust boundary (config
+/// keys, hook payloads, search results) to prevent operations outside
+/// `$CLAUDE_PROJECT_DIR`. `recovery` is the hint surfaced to the user when
+/// rejection fires.
+pub(crate) fn reject_path_escape(path: &Path, recovery: &'static str) -> Result<()> {
+    if path.is_absolute() {
+        return Err(ClaudixError::PathTraversal {
+            path: path.to_path_buf(),
+            recovery: RecoveryHint(recovery),
+        });
+    }
+    for component in path.components() {
+        if matches!(
+            component,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        ) {
+            return Err(ClaudixError::PathTraversal {
+                path: path.to_path_buf(),
+                recovery: RecoveryHint(recovery),
+            });
+        }
+    }
+    Ok(())
+}
+
 impl RelativePath {
+    pub(crate) fn reject_escape(&self, recovery: &'static str) -> Result<()> {
+        reject_path_escape(&self.to_path_buf(), recovery)
+    }
+
     pub fn new(s: impl Into<String>) -> Self {
         let raw = s.into();
         let normalized = raw.replace('\\', "/");
@@ -120,6 +153,39 @@ impl Language {
         }
     }
 
+    /// Parse the canonical form used in storage / serialized chunks. Unknown
+    /// strings round-trip to `Unknown` so corrupt data doesn't propagate.
+    pub fn from_storage(value: &str) -> Self {
+        match value {
+            "rust" => Self::Rust,
+            "python" => Self::Python,
+            "javascript" => Self::JavaScript,
+            "typescript" => Self::TypeScript,
+            "go" => Self::Go,
+            "java" => Self::Java,
+            "c" => Self::C,
+            "cpp" => Self::Cpp,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Parse a user-supplied language filter (CLI / MCP input). Accepts
+    /// short aliases the storage form doesn't carry.
+    pub fn from_filter_input(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "rust" => Some(Self::Rust),
+            "python" => Some(Self::Python),
+            "javascript" | "js" => Some(Self::JavaScript),
+            "typescript" | "ts" => Some(Self::TypeScript),
+            "go" => Some(Self::Go),
+            "java" => Some(Self::Java),
+            "c" => Some(Self::C),
+            "cpp" | "c++" => Some(Self::Cpp),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rust => "rust",
@@ -172,6 +238,24 @@ impl ChunkKind {
             Self::Impl => "impl",
             Self::Macro => "macro",
             Self::Other => "other",
+        }
+    }
+
+    /// Parse the canonical form used in storage. Unknown strings map to
+    /// `Other` so legacy or corrupt rows don't break read paths.
+    pub fn from_storage(value: &str) -> Self {
+        match value {
+            "function" => Self::Function,
+            "method" => Self::Method,
+            "struct" => Self::Struct,
+            "class" => Self::Class,
+            "enum" => Self::Enum,
+            "trait" => Self::Trait,
+            "interface" => Self::Interface,
+            "module" => Self::Module,
+            "impl" => Self::Impl,
+            "macro" => Self::Macro,
+            _ => Self::Other,
         }
     }
 }

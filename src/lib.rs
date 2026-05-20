@@ -17,11 +17,11 @@ pub use types::{
     RelativePath,
 };
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chunking::{Chunker, MultiLanguageChunker};
+use chunking::MultiLanguageChunker;
 use config::{Config, EmbeddingProvider};
 #[cfg(any(test, feature = "test-stub"))]
 use embedding::StubProvider;
@@ -32,6 +32,7 @@ use error::RecoveryHint;
 use search::{SearchQuery, SearchResult, Searcher};
 use store::{Store, stored_chunks_from_embedded};
 use tokio::{fs, task};
+use types::reject_path_escape;
 
 pub struct Claudix {
     config: Arc<Config>,
@@ -56,9 +57,9 @@ pub trait IndexProgress {
     fn file(&mut self, path: &RelativePath, status: IndexFileStatus) -> Result<()>;
 }
 
-pub struct NoopIndexProgress;
-
-impl IndexProgress for NoopIndexProgress {
+/// Unit implements `IndexProgress` as a no-op, so callers that don't care
+/// about per-file events can pass `&mut ()` instead of a wrapper struct.
+impl IndexProgress for () {
     fn file(&mut self, _path: &RelativePath, _status: IndexFileStatus) -> Result<()> {
         Ok(())
     }
@@ -101,17 +102,10 @@ impl Claudix {
         &self.project_root
     }
 
-    pub async fn index_full(&self) -> Result<IndexStats> {
-        let mut progress = NoopIndexProgress;
-        self.index_full_with_progress(&mut progress).await
-    }
-
-    pub async fn index_full_with_progress(
-        &self,
-        progress: &mut dyn IndexProgress,
-    ) -> Result<IndexStats> {
-        let files = FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?
-            .enumerate_with_progress(Some(progress))?;
+    pub async fn index_full(&self, progress: &mut dyn IndexProgress) -> Result<IndexStats> {
+        let enumerator =
+            FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?;
+        let files = enumerator.enumerate(&mut *progress)?;
 
         let current_files: Vec<(String, [u8; 16])> = files
             .iter()
@@ -120,7 +114,7 @@ impl Claudix {
 
         let (changed_paths, unchanged_rows) = self
             .store
-            .incremental_file_state_with_progress(&current_files, Some(progress))
+            .incremental_file_state(&current_files, &mut *progress)
             .await?;
 
         if changed_paths.is_empty()
@@ -357,18 +351,19 @@ impl Claudix {
     }
 
     fn relative_path_from_input(&self, path: &Path) -> Result<RelativePath> {
+        const RECOVERY: &str = "Only reindex files inside $CLAUDE_PROJECT_DIR";
         if path.is_absolute() {
             let relative =
                 path.strip_prefix(&self.project_root)
                     .map_err(|_| ClaudixError::PathTraversal {
                         path: path.to_path_buf(),
-                        recovery: RecoveryHint("Only reindex files inside $CLAUDE_PROJECT_DIR"),
+                        recovery: RecoveryHint(RECOVERY),
                     })?;
-            reject_relative_escape(relative)?;
+            reject_path_escape(relative, RECOVERY)?;
             return Ok(RelativePath::from_path(relative));
         }
 
-        reject_relative_escape(path)?;
+        reject_path_escape(path, RECOVERY)?;
         Ok(RelativePath::from_path(path))
     }
 }
@@ -406,22 +401,6 @@ async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
             }
         }
     }
-}
-
-fn reject_relative_escape(path: &Path) -> Result<()> {
-    for component in path.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(ClaudixError::PathTraversal {
-                path: path.to_path_buf(),
-                recovery: RecoveryHint("Only reindex files inside $CLAUDE_PROJECT_DIR"),
-            });
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -521,7 +500,7 @@ mod tests {
         assert!(claudix.is_ok());
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-        let stats = claudix.index_full().await;
+        let stats = claudix.index_full(&mut ()).await;
         assert!(stats.is_ok());
         assert_eq!(
             stats.ok().unwrap_or_else(|| unreachable!()),
@@ -565,7 +544,7 @@ mod tests {
         assert!(claudix.is_ok());
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-        assert!(claudix.index_full().await.is_ok());
+        assert!(claudix.index_full(&mut ()).await.is_ok());
         assert!(
             fs::write(
                 fixture.root().join("src/lib.rs"),
@@ -575,7 +554,7 @@ mod tests {
             .is_ok()
         );
 
-        let stats = claudix.index_full().await;
+        let stats = claudix.index_full(&mut ()).await;
         assert!(stats.is_ok());
         assert_eq!(
             stats.ok().unwrap_or_else(|| unreachable!()),
@@ -608,7 +587,7 @@ mod tests {
         assert!(claudix.is_ok());
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-        assert!(claudix.index_full().await.is_ok());
+        assert!(claudix.index_full(&mut ()).await.is_ok());
         assert!(
             fs::write(
                 fixture.root().join("src/math.rs"),
@@ -652,7 +631,7 @@ mod tests {
         assert!(claudix.is_ok());
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-        assert!(claudix.index_full().await.is_ok());
+        assert!(claudix.index_full(&mut ()).await.is_ok());
 
         // Reindex the same file without modifying it — hash matches stored hash, must skip.
         let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
@@ -670,7 +649,7 @@ mod tests {
         let config = stub_config();
         let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
 
-        claudix.index_full().await?;
+        claudix.index_full(&mut ()).await?;
 
         // After index_full the binary file's hash is recorded.
         let (hash_before, _) = claudix
@@ -723,10 +702,10 @@ mod tests {
         });
         let claudix = test_claudix_with_embedder(fixture.root().to_path_buf(), config, embedder)?;
 
-        claudix.index_full().await?;
+        claudix.index_full(&mut ()).await?;
         let first_call_count = calls.load(Ordering::Relaxed);
 
-        claudix.index_full().await?;
+        claudix.index_full(&mut ()).await?;
 
         assert_eq!(calls.load(Ordering::Relaxed), first_call_count);
         Ok(())
@@ -738,7 +717,7 @@ mod tests {
         let config = stub_config();
         let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
 
-        claudix.index_full().await?;
+        claudix.index_full(&mut ()).await?;
 
         // Modify only src/lib.rs; src/math.rs is untouched.
         fs::write(
@@ -747,7 +726,7 @@ mod tests {
         )
         .await?;
 
-        claudix.index_full().await?;
+        claudix.index_full(&mut ()).await?;
 
         let rows = claudix.store.read_chunks().await?;
         let names: BTreeSet<_> = rows.iter().filter_map(|r| r.name.clone()).collect();
@@ -767,7 +746,7 @@ mod tests {
         let config = stub_config();
         let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
 
-        claudix.index_full().await?;
+        claudix.index_full(&mut ()).await?;
 
         let chunks_dir = claudix
             .store
@@ -780,7 +759,7 @@ mod tests {
             "first index_full should have written chunks.lance"
         );
 
-        claudix.index_full().await?;
+        claudix.index_full(&mut ()).await?;
 
         let after = snapshot_dir(&chunks_dir);
         assert_eq!(
@@ -835,7 +814,7 @@ mod tests {
         assert!(claudix.is_ok());
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-        let stats = claudix.index_full().await;
+        let stats = claudix.index_full(&mut ()).await;
         assert!(stats.is_ok());
         assert_eq!(
             stats.ok().unwrap_or_else(|| unreachable!()),
@@ -857,7 +836,7 @@ mod tests {
         assert!(claudix.is_ok());
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-        assert!(claudix.index_full().await.is_ok());
+        assert!(claudix.index_full(&mut ()).await.is_ok());
         assert!(
             fs::remove_file(fixture.root().join("src/math.rs"))
                 .await
@@ -891,7 +870,7 @@ mod tests {
         assert!(claudix.is_ok());
         let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-        assert!(claudix.index_full().await.is_ok());
+        assert!(claudix.index_full(&mut ()).await.is_ok());
         assert!(
             fs::write(fixture.root().join("src/math.rs"), b"")
                 .await
@@ -915,7 +894,7 @@ mod tests {
         let fixture = TestFixture::new("small_rust")?;
         let config = stub_config();
         let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
-        claudix.index_full().await?;
+        claudix.index_full(&mut ()).await?;
         let baseline = claudix.store.read_chunks().await?;
 
         // `.claudix/` is the index's own state dir — embedding files under it

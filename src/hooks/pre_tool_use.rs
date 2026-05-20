@@ -1,0 +1,542 @@
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use serde_json::{Value, json};
+
+use crate::Claudix;
+use crate::config;
+use crate::error::{ClaudixError, Result};
+use crate::search::SearchQuery;
+use crate::store::Store;
+
+use super::grep::{extract_search_command, should_passthrough};
+use super::payload::{HookPayload, grep_input_has_scoping_flag};
+
+const HEALTH_CACHE_FILE_NAME: &str = "embedder-health";
+const HEALTH_CACHE_HEALTHY_TTL_SECS: u64 = 60;
+const HEALTH_CACHE_UNHEALTHY_TTL_SECS: u64 = 30;
+const PRE_TOOL_USE_TIMEOUT_MS: u64 = 1_500;
+
+pub(super) async fn handle_pre_tool_use(
+    project_root: &Path,
+    payload: HookPayload,
+) -> Result<Option<Value>> {
+    // Hooks must fail open: a corrupt config or unreadable store yields a
+    // passthrough, not a propagated error that could break the session.
+    let Ok(config) = config::load(project_root) else {
+        return Ok(None);
+    };
+    if !config.hooks.intercept_grep {
+        return Ok(None);
+    }
+
+    let Some(tool_name) = payload.tool_name.as_deref() else {
+        return Ok(None);
+    };
+    let Some(tool_input) = payload.tool_input else {
+        return Ok(None);
+    };
+
+    let query = match tool_name {
+        "Grep" => {
+            if grep_input_has_scoping_flag(&tool_input) {
+                return Ok(None);
+            }
+            tool_input.pattern
+        }
+        "Bash" => extract_search_command(tool_input.command.as_deref()),
+        _ => None,
+    };
+
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    if should_passthrough(&query) {
+        return Ok(None);
+    }
+
+    let Ok(store) = Store::new(project_root, &config) else {
+        return Ok(None);
+    };
+    let Ok(Some(manifest)) = store.read_manifest() else {
+        return Ok(None);
+    };
+    if manifest.is_stale(&config) {
+        return Ok(None);
+    }
+    if manifest.chunk_count == 0 {
+        return Ok(None);
+    }
+
+    let health_cache_path = store.state_dir_path().join(HEALTH_CACHE_FILE_NAME);
+    if matches!(read_cached_health(&health_cache_path), Some(false)) {
+        return Ok(None);
+    }
+
+    let search_query = SearchQuery {
+        query: query.clone(),
+        top_k: config.search.top_k,
+        language_filter: None,
+        path_prefix: None,
+    };
+    let project_root = project_root.to_path_buf();
+    let config_arc = Arc::new(config.clone());
+    let work = async move {
+        let claudix = Claudix::new(project_root, config_arc).await?;
+        let results = claudix.search(search_query).await?;
+        Ok::<_, ClaudixError>(results)
+    };
+
+    match tokio::time::timeout(Duration::from_millis(PRE_TOOL_USE_TIMEOUT_MS), work).await {
+        Ok(Ok(results)) => {
+            write_cached_health(&health_cache_path, true);
+            if results.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(pre_tool_use_search_response(&query, results)))
+            }
+        }
+        Ok(Err(_)) => {
+            write_cached_health(&health_cache_path, false);
+            Ok(None)
+        }
+        // Timeout doesn't necessarily mean the embedder is unhealthy — bundled
+        // ONNX cold-loads can exceed the budget — so pass through without
+        // poisoning the cache.
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_cached_health(marker_path: &Path) -> Option<bool> {
+    let metadata = fs::metadata(marker_path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let age = SystemTime::now().duration_since(modified).ok()?;
+    let content = fs::read_to_string(marker_path).ok()?;
+    let healthy = match content.trim() {
+        "1" => true,
+        "0" => false,
+        _ => return None,
+    };
+    let ttl = if healthy {
+        HEALTH_CACHE_HEALTHY_TTL_SECS
+    } else {
+        HEALTH_CACHE_UNHEALTHY_TTL_SECS
+    };
+    (age < Duration::from_secs(ttl)).then_some(healthy)
+}
+
+fn write_cached_health(marker_path: &Path, healthy: bool) {
+    let _ = fs::write(marker_path, if healthy { "1" } else { "0" });
+}
+
+fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchResult>) -> Value {
+    let mut lines = vec![
+        format!("claudix search results for '{query}':"),
+        String::new(),
+    ];
+    for result in &results {
+        let chunk = &result.chunk;
+        let name_part = chunk
+            .name
+            .as_deref()
+            .map(|n| format!(" {n}"))
+            .unwrap_or_default();
+        let stale_warning = if result.stale {
+            " [STALE - file modified since index]"
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "{}:{}-{} [{}] {}{name_part} ({:.3}){}",
+            chunk.file_path,
+            chunk.line_range.start,
+            chunk.line_range.end,
+            chunk.language,
+            chunk.kind,
+            result.score,
+            stale_warning,
+        ));
+        if !chunk.content.is_empty() {
+            lines.push(truncate_snippet(&chunk.content, 20));
+        }
+        lines.push(String::new());
+    }
+    lines.push(
+        "Tip: call search_code MCP tool directly next time to skip this interception round-trip."
+            .to_owned(),
+    );
+    let context = lines.join("\n");
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!("claudix found {} semantic matches for '{query}' — see additionalContext.", results.len()),
+            "additionalContext": context,
+        }
+    })
+}
+
+fn truncate_snippet(content: &str, max_lines: usize) -> String {
+    let mut lines = content.lines();
+    let taken: Vec<&str> = lines.by_ref().take(max_lines).collect();
+    if lines.next().is_some() {
+        format!("{}\n…", taken.join("\n"))
+    } else {
+        taken.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+    use std::sync::Arc;
+
+    use crate::Claudix;
+    use crate::config::Config;
+    use crate::hooks::{HookEvent, run};
+
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fixture.rs"
+        ));
+    }
+
+    mod config_support {
+        use crate as claudix;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/config_support.rs"
+        ));
+    }
+
+    use config_support::stub_config;
+    use fixture::TestFixture;
+
+    fn write_config(project_root: &Path, config: &Config) {
+        let claude_dir = project_root.join(".claude");
+        assert!(fs::create_dir_all(&claude_dir).is_ok());
+        let config_text = toml::to_string(config);
+        assert!(config_text.is_ok());
+        assert!(
+            fs::write(
+                claude_dir.join("claudix.toml"),
+                config_text.ok().unwrap_or_default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_denies_conceptual_grep_when_index_ready() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full(&mut ())
+                .await
+                .is_ok()
+        );
+
+        let payload = json!({
+            "tool_name": "Grep",
+            "tool_input": {
+                "pattern": "where is config loaded"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        let response = response.ok().unwrap_or_else(|| unreachable!());
+        assert!(response.is_some());
+        let response = response.unwrap_or(Value::Null);
+        assert_eq!(
+            response["hookSpecificOutput"]["permissionDecision"],
+            Value::String("deny".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_regex_queries_through() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let payload = json!({
+            "tool_name": "Grep",
+            "tool_input": {
+                "pattern": "^pub fn"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(response.ok().unwrap_or_else(|| unreachable!()).is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_conceptual_bash_rg_when_search_returns_no_results() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full(&mut ())
+                .await
+                .is_ok()
+        );
+
+        // "where is the config loaded" is conceptual but the small_rust fixture has no config code;
+        // semantic search returns empty → must pass through, not block grep with no alternative.
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg \"where is the config loaded\""
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "must pass through when semantic search has no results to offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_bash_rg_with_path_arg_through_when_no_conceptual_pattern() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full(&mut ())
+                .await
+                .is_ok()
+        );
+
+        // Unquoted single-word pattern — extracted but token_count < 3 so passes through.
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg add src/"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "unquoted single-word rg command should pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_intercepts_unquoted_identifier_in_bash_rg() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full(&mut ())
+                .await
+                .is_ok()
+        );
+
+        // Unquoted identifier with enough tokens — should be intercepted just like a quoted query.
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg add_two_numbers"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        let response = response.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            response.is_some(),
+            "unquoted multi-token identifier should be intercepted"
+        );
+        let response = response.unwrap_or(Value::Null);
+        assert_eq!(
+            response["hookSpecificOutput"]["permissionDecision"],
+            Value::String("deny".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_bash_rg_with_regex_pattern_through() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full(&mut ())
+                .await
+                .is_ok()
+        );
+
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg \"^pub fn\" src/"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "regex pattern in rg command should pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_conceptual_bash_rg_with_path_arg_when_no_results() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full(&mut ())
+                .await
+                .is_ok()
+        );
+
+        // Conceptual query with a path arg: semantic search still finds nothing for "config loaded"
+        // in the small_rust fixture → must pass through.
+        let payload = json!({
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "rg \"where is the config loaded\" src/"
+            }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        assert!(
+            response.ok().unwrap_or_else(|| unreachable!()).is_none(),
+            "must pass through when semantic search has no results to offer"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_returns_search_results_in_context() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        write_config(fixture.root(), &stub_config());
+
+        let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+        assert!(claudix.is_ok());
+        assert!(
+            claudix
+                .ok()
+                .unwrap_or_else(|| unreachable!())
+                .index_full(&mut ())
+                .await
+                .is_ok()
+        );
+        assert!(
+            std::fs::write(
+                fixture.root().join("src/math.rs"),
+                "pub fn subtract(left: i32, right: i32) -> i32 { left - right }\n",
+            )
+            .is_ok()
+        );
+
+        let payload = json!({
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "add two numbers together" }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await;
+        assert!(response.is_ok());
+        let response = response.ok().unwrap_or_else(|| unreachable!());
+        assert!(response.is_some());
+        let response = response.unwrap_or(Value::Null);
+
+        assert_eq!(
+            response["hookSpecificOutput"]["permissionDecision"],
+            Value::String("deny".to_owned())
+        );
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("claudix search results"),
+            "hook must embed search results in context, got: {context}"
+        );
+        assert!(
+            context.contains("src/"),
+            "context must include file paths from search results"
+        );
+        assert!(
+            context.contains("[STALE - file modified since index]"),
+            "context must warn about stale hits, got: {context}"
+        );
+        assert!(
+            context.contains("search_code MCP tool"),
+            "context must include tip to use search_code directly, got: {context}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_passes_through_on_corrupt_config() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let claude_dir = fixture.root().join(".claude");
+        fs::create_dir_all(&claude_dir)?;
+        // Malformed TOML — config::load would error; the hook must fail open.
+        fs::write(
+            claude_dir.join("claudix.toml"),
+            "this is = not = valid toml [",
+        )?;
+
+        let payload = json!({
+            "tool_name": "Grep",
+            "tool_input": { "pattern": "where is config loaded" }
+        });
+        let response = run(fixture.root(), HookEvent::PreToolUse, &payload.to_string()).await?;
+        assert!(
+            response.is_none(),
+            "corrupt config must passthrough, not error"
+        );
+        Ok(())
+    }
+}

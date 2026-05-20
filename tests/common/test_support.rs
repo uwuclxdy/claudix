@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use claudix::chunking::{Chunker, MultiLanguageChunker};
+use claudix::chunking::MultiLanguageChunker;
 use claudix::config::Config;
 use claudix::embedding::Provider;
 use claudix::enumeration::FileEnumerator;
@@ -26,7 +26,7 @@ pub async fn index_fixture(
     config: &Config,
 ) -> claudix::Result<()> {
     let enumerator = FileEnumerator::new(project_root.to_path_buf(), config.clone())?;
-    let files = enumerator.enumerate()?;
+    let files = enumerator.enumerate(&mut ())?;
     let mut chunks = Vec::new();
 
     for file in files {
@@ -36,7 +36,7 @@ pub async fn index_fixture(
         let file_hash = file.file_hash;
 
         let file_chunks = tokio::task::spawn_blocking(move || {
-            MultiLanguageChunker::new().chunk(&path, language, file_hash, &content)
+            MultiLanguageChunker::default().chunk(&path, language, file_hash, &content)
         })
         .await
         .map_err(|error| ClaudixError::TreeSitter(error.to_string()))??;

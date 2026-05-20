@@ -2,7 +2,7 @@ mod filters;
 mod git;
 
 use std::fs;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
@@ -35,14 +35,7 @@ impl FileEnumerator {
         })
     }
 
-    pub fn enumerate(&self) -> Result<Vec<EnumeratedFile>> {
-        self.enumerate_with_progress(None)
-    }
-
-    pub fn enumerate_with_progress(
-        &self,
-        mut progress: Option<&mut dyn IndexProgress>,
-    ) -> Result<Vec<EnumeratedFile>> {
+    pub fn enumerate(&self, progress: &mut dyn IndexProgress) -> Result<Vec<EnumeratedFile>> {
         let repo = git::discover_repository(&self.project_root)?;
         let tracked_and_untracked = git::list_candidate_paths(&repo)?;
         let filters = PathFilters::load(&self.project_root)?;
@@ -50,12 +43,10 @@ impl FileEnumerator {
         let mut files = Vec::new();
         for relative_path in tracked_and_untracked {
             if !filters.is_included(&relative_path) {
-                if let Some(progress) = progress.as_deref_mut() {
-                    progress.file(
-                        &relative_path,
-                        IndexFileStatus::Skipped("excluded by index filters"),
-                    )?;
-                }
+                progress.file(
+                    &relative_path,
+                    IndexFileStatus::Skipped("excluded by index filters"),
+                )?;
                 continue;
             }
 
@@ -63,12 +54,10 @@ impl FileEnumerator {
             match self.enumerate_one(relative_path.clone(), force_indexed)? {
                 Some(file) => files.push(file),
                 None => {
-                    if let Some(progress) = progress.as_deref_mut() {
-                        progress.file(
-                            &relative_path,
-                            IndexFileStatus::Skipped("not an indexable file"),
-                        )?;
-                    }
+                    progress.file(
+                        &relative_path,
+                        IndexFileStatus::Skipped("not an indexable file"),
+                    )?;
                 }
             }
         }
@@ -134,7 +123,7 @@ impl FileEnumerator {
     }
 
     fn resolve_relative_path(&self, relative_path: &RelativePath) -> Result<PathBuf> {
-        reject_path_escape(relative_path)?;
+        relative_path.reject_escape("Only enumerate files inside $CLAUDE_PROJECT_DIR")?;
         let joined = self.project_root.join(relative_path.to_path_buf());
         ensure_within_root(&self.project_root, &joined)?;
         Ok(joined)
@@ -158,28 +147,20 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> FileHash {
     FileHash(digest.to_be_bytes())
 }
 
-fn reject_path_escape(relative_path: &RelativePath) -> Result<()> {
-    let path = relative_path.to_path_buf();
-    if path.is_absolute() {
-        return Err(ClaudixError::PathTraversal {
-            path,
-            recovery: RecoveryHint("Only enumerate files inside $CLAUDE_PROJECT_DIR"),
-        });
-    }
-
-    for component in path.components() {
-        if matches!(
-            component,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_)
-        ) {
-            return Err(ClaudixError::PathTraversal {
-                path: relative_path.to_path_buf(),
-                recovery: RecoveryHint("Only enumerate files inside $CLAUDE_PROJECT_DIR"),
-            });
+/// Walk up from `path` looking for a `.git` directory; return `true` if any
+/// ancestor contains one. Cheaper than constructing a `gix::Repository`, so
+/// hot paths (hooks, status checks) call this instead of `discover_repository`.
+pub fn is_git_repo(path: &Path) -> bool {
+    let mut current = path;
+    loop {
+        if current.join(".git").exists() {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => return false,
         }
     }
-
-    Ok(())
 }
 
 fn ensure_within_root(root: &Path, path: &Path) -> Result<()> {
@@ -233,7 +214,7 @@ mod tests {
         assert!(enumerator.is_ok());
         let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
 
-        let files = enumerator.enumerate();
+        let files = enumerator.enumerate(&mut ());
         assert!(files.is_ok());
         let files = files.ok().unwrap_or_else(|| unreachable!());
 
@@ -256,7 +237,7 @@ mod tests {
         assert!(enumerator.is_ok());
         let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
 
-        let files = enumerator.enumerate();
+        let files = enumerator.enumerate(&mut ());
         assert!(files.is_ok());
         let files = files.ok().unwrap_or_else(|| unreachable!());
 
@@ -284,7 +265,7 @@ mod tests {
         assert!(enumerator.is_ok());
         let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
 
-        let files = enumerator.enumerate();
+        let files = enumerator.enumerate(&mut ());
         assert!(files.is_ok());
         let files = files.ok().unwrap_or_else(|| unreachable!());
 
@@ -337,7 +318,7 @@ mod tests {
         assert!(enumerator.is_ok());
         let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
 
-        let files = enumerator.enumerate();
+        let files = enumerator.enumerate(&mut ());
         assert!(files.is_ok());
         let files = files.ok().unwrap_or_else(|| unreachable!());
         let paths: BTreeSet<_> = files
@@ -368,7 +349,7 @@ mod tests {
         assert!(enumerator.is_ok());
         let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
 
-        let files = enumerator.enumerate();
+        let files = enumerator.enumerate(&mut ());
         assert!(files.is_ok());
         let files = files.ok().unwrap_or_else(|| unreachable!());
         let paths: BTreeSet<_> = files
@@ -414,7 +395,7 @@ mod tests {
         assert!(enumerator.is_ok());
         let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
 
-        let files = enumerator.enumerate();
+        let files = enumerator.enumerate(&mut ());
         assert!(files.is_ok());
         let files = files.ok().unwrap_or_else(|| unreachable!());
 

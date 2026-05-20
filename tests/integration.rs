@@ -36,7 +36,7 @@ async fn full_index_enumerates_and_persists_chunks() {
     assert!(claudix.is_ok(), "Claudix::new failed");
     let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-    let stats = claudix.index_full().await;
+    let stats = claudix.index_full(&mut ()).await;
     assert!(stats.is_ok(), "index_full failed: {stats:?}");
     let stats = stats.ok().unwrap_or_else(|| unreachable!());
 
@@ -62,7 +62,7 @@ async fn full_reindex_after_file_edit_reflects_changes() {
     assert!(claudix.is_ok(), "Claudix::new failed");
     let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-    let first = claudix.index_full().await;
+    let first = claudix.index_full(&mut ()).await;
     assert!(first.is_ok(), "initial index_full failed: {first:?}");
 
     let write = std::fs::write(
@@ -71,7 +71,7 @@ async fn full_reindex_after_file_edit_reflects_changes() {
     );
     assert!(write.is_ok(), "write math.rs failed");
 
-    let second = claudix.index_full().await;
+    let second = claudix.index_full(&mut ()).await;
     assert!(second.is_ok(), "reindex failed: {second:?}");
 
     let results = claudix
@@ -106,7 +106,7 @@ async fn reindex_file_updates_target_preserves_others() {
     assert!(claudix.is_ok(), "Claudix::new failed");
     let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-    let first = claudix.index_full().await;
+    let first = claudix.index_full(&mut ()).await;
     assert!(first.is_ok(), "initial index_full failed: {first:?}");
 
     let write = std::fs::write(
@@ -171,7 +171,7 @@ async fn search_language_filter_excludes_other_languages() {
     assert!(claudix.is_ok(), "Claudix::new failed");
     let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-    let index = claudix.index_full().await;
+    let index = claudix.index_full(&mut ()).await;
     assert!(index.is_ok(), "index_full failed: {index:?}");
 
     let results = claudix
@@ -210,7 +210,7 @@ async fn search_path_prefix_restricts_results() {
     assert!(claudix.is_ok(), "Claudix::new failed");
     let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-    let index = claudix.index_full().await;
+    let index = claudix.index_full(&mut ()).await;
     assert!(index.is_ok(), "index_full failed: {index:?}");
 
     let results = claudix
@@ -251,7 +251,7 @@ async fn indexignore_excludes_skip_indexinclude_reinstates_reinclude() {
     assert!(claudix.is_ok(), "Claudix::new failed");
     let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
 
-    let stats = claudix.index_full().await;
+    let stats = claudix.index_full(&mut ()).await;
     assert!(stats.is_ok(), "index_full failed: {stats:?}");
     let stats = stats.ok().unwrap_or_else(|| unreachable!());
 
@@ -293,7 +293,7 @@ async fn schema_model_mismatch_errors_on_open() {
     assert!(claudix_v1.is_ok(), "Claudix::new (v1) failed");
     let claudix_v1 = claudix_v1.ok().unwrap_or_else(|| unreachable!());
 
-    let index = claudix_v1.index_full().await;
+    let index = claudix_v1.index_full(&mut ()).await;
     assert!(index.is_ok(), "index_full failed: {index:?}");
 
     drop(claudix_v1);
