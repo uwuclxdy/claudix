@@ -8,7 +8,7 @@ use crate::enumeration::WatchFilter;
 use crate::error::Result;
 use crate::store::Store;
 
-use super::payload::{HookPayload, is_write_tool};
+use super::payload::HookPayload;
 use super::ready_check::check_index_ready;
 use super::spawn::spawn_background_reindex_file;
 use crate::store::marker::WATCH_MARKER_STALE_SECS;
@@ -29,7 +29,7 @@ pub(super) async fn handle_post_tool_use(
     // Also skip ignored paths (.claudix/, .git/, gitignored) — spawning a
     // reindex for `.claudix/manifest.json` would round-trip the index's own
     // metadata back through the embedder.
-    if is_write_tool(tool_name)
+    if matches!(tool_name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
         && !watcher_alive(project_root, cfg)

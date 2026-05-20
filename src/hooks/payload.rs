@@ -41,7 +41,3 @@ pub(super) fn grep_input_has_scoping_flag(input: &ToolInput) -> bool {
         || input.context_lines.is_some()
         || input.multiline.is_some()
 }
-
-pub(super) fn is_write_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
-}
