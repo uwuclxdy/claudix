@@ -28,7 +28,11 @@ fn strip_command_wrappers(tokens: &[String]) -> usize {
             "time" | "nice" => idx += 1,
             "stdbuf" => {
                 idx += 1;
-                if idx < tokens.len() {
+                // stdbuf's flags are -iL/-oL/-eL or --input=L style — all start
+                // with `-`. Consume any number of them so `stdbuf -oL -eL rg foo`
+                // still resolves to `rg`, but bail on a non-flag token so a
+                // malformed `stdbuf rg foo` doesn't swallow the actual tool.
+                while idx < tokens.len() && tokens[idx].starts_with('-') {
                     idx += 1;
                 }
             }
@@ -298,6 +302,15 @@ mod tests {
         assert_eq!(
             extract_search_command(Some("env FOO=1 BAR=2 rg target_pattern")),
             Some("target_pattern".to_owned())
+        );
+        assert_eq!(
+            extract_search_command(Some("stdbuf -oL rg target_pattern")),
+            Some("target_pattern".to_owned())
+        );
+        assert_eq!(
+            extract_search_command(Some("stdbuf -oL -eL rg target_pattern")),
+            Some("target_pattern".to_owned()),
+            "stdbuf with chained flags must still resolve the real tool"
         );
         assert_eq!(
             extract_search_command(Some("ack pattern")),
