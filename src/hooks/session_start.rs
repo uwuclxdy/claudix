@@ -55,12 +55,17 @@ pub(super) async fn handle_session_start(
         _ => false,
     };
 
+    let log_hint = indexing_in_flight
+        .then(|| config.as_ref())
+        .flatten()
+        .map(|c| c.paths.log_dir.join("index.log").to_string_lossy().into_owned());
     let mut response = session_start_response(
         indexed_file_count,
         indexed_chunk_count,
         index_stale,
         model_mismatch,
         indexing_in_flight,
+        log_hint.as_deref(),
     );
     let user_message = session_start_message(cli::setup_state(project_root).await);
     if !user_message.is_empty() {
@@ -85,18 +90,25 @@ fn session_start_response(
     stale: bool,
     model_mismatch: bool,
     indexing_in_flight: bool,
+    log_hint: Option<&str>,
 ) -> Value {
+    let progress_suffix = log_hint
+        .map(|p| format!(" Tail `{p}` to follow progress."))
+        .unwrap_or_default();
     let additional_context = if model_mismatch {
         "claudix semantic search unavailable — embedding model mismatch. Run `claudix clear && claudix index` to rebuild.".to_owned()
     } else if chunk_count == 0 && indexing_in_flight {
-        "claudix is building its first index in the background — search_code will report when ready. Use Grep or Read in the meantime.".to_owned()
+        format!(
+            "claudix is building its first index in the background — search_code will report when ready. \
+             Use Grep or Read in the meantime.{progress_suffix}"
+        )
     } else if chunk_count == 0 {
         "claudix is installed but the index is empty. Run /claudix:index to build it; until then use Grep or Read for code discovery.".to_owned()
     } else if indexing_in_flight {
         format!(
             "claudix semantic search ready — {file_count} files, {chunk_count} chunks (reindexing in background; you'll be notified when complete). \
              Use search_code for fast semantic search: conceptual queries, identifier lookups, cross-file discovery. \
-             Use Grep for exact literals, regexes, or path-filtered scans."
+             Use Grep for exact literals, regexes, or path-filtered scans.{progress_suffix}"
         )
     } else if stale {
         format!(
@@ -214,7 +226,7 @@ mod tests {
 
     #[test]
     fn session_start_context_guides_tool_choice() {
-        let response = session_start_response(42, 683, false, false, false);
+        let response = session_start_response(42, 683, false, false, false, None);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();

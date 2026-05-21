@@ -2,6 +2,7 @@ mod input;
 mod install;
 mod watch;
 
+use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -60,6 +61,33 @@ impl IndexProgress for StderrIndexProgress {
             }
         }
         stderr.flush()?;
+        Ok(())
+    }
+}
+
+struct FileIndexProgress {
+    writer: io::BufWriter<fs::File>,
+}
+
+impl FileIndexProgress {
+    fn try_open(log_dir: &Path) -> Option<Self> {
+        fs::create_dir_all(log_dir).ok()?;
+        fs::File::create(log_dir.join("index.log"))
+            .ok()
+            .map(|f| Self { writer: io::BufWriter::new(f) })
+    }
+}
+
+impl IndexProgress for FileIndexProgress {
+    fn file(&mut self, path: &RelativePath, status: IndexFileStatus) -> Result<()> {
+        match status {
+            IndexFileStatus::Indexed => writeln!(self.writer, "indexed {}", path.as_str())?,
+            IndexFileStatus::Verified => writeln!(self.writer, "verified {}", path.as_str())?,
+            IndexFileStatus::Skipped(reason) => {
+                writeln!(self.writer, "skipped {}: {reason}", path.as_str())?
+            }
+        }
+        self.writer.flush()?;
         Ok(())
     }
 }
@@ -130,9 +158,18 @@ pub async fn run_search(
 
 pub async fn run_index(project_root: impl AsRef<Path>, progress: bool) -> Result<IndexOutput> {
     let session = IndexSession::new(project_root).await?;
+    let log_dir = session
+        .claudix
+        .project_root()
+        .join(&session.claudix.config().paths.log_dir);
     let mut stderr_progress = StderrIndexProgress;
+    let mut file_progress = (!progress)
+        .then(|| FileIndexProgress::try_open(&log_dir))
+        .flatten();
     let progress: &mut dyn IndexProgress = if progress {
         &mut stderr_progress
+    } else if let Some(ref mut fp) = file_progress {
+        fp
     } else {
         &mut ()
     };
