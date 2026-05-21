@@ -74,7 +74,9 @@ impl FileIndexProgress {
         fs::create_dir_all(log_dir).ok()?;
         fs::File::create(log_dir.join("index.log"))
             .ok()
-            .map(|f| Self { writer: io::BufWriter::new(f) })
+            .map(|f| Self {
+                writer: io::BufWriter::new(f),
+            })
     }
 }
 

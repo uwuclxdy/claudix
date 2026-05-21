@@ -56,9 +56,15 @@ pub(super) async fn handle_session_start(
     };
 
     let log_hint = indexing_in_flight
-        .then(|| config.as_ref())
+        .then_some(config.as_ref())
         .flatten()
-        .map(|c| c.paths.log_dir.join("index.log").to_string_lossy().into_owned());
+        .map(|c| {
+            c.paths
+                .log_dir
+                .join("index.log")
+                .to_string_lossy()
+                .into_owned()
+        });
     let mut response = session_start_response(
         indexed_file_count,
         indexed_chunk_count,
