@@ -202,8 +202,12 @@ async fn run() -> Result<()> {
                      Fix: run `claudix clear && claudix index` to rebuild with the active model."
                 );
             } else if !output.embedding_healthy {
+                match &output.embedding_error {
+                    Some(reason) => eprintln!("\nembedding check failed: {reason}"),
+                    None => eprintln!("\nembedding endpoint unavailable."),
+                }
                 eprintln!(
-                    "\nembedding server not reachable — start LM Studio / Ollama,\n\
+                    "Fix: start LM Studio / Ollama (or fix the [embedding].endpoint),\n\
                      or run `claudix install` to switch to the bundled model."
                 );
             }

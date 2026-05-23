@@ -121,6 +121,9 @@ pub struct DoctorOutput {
     pub dimensions: Option<u16>,
     pub embedding_provider: String,
     pub embedding_healthy: bool,
+    /// Why the embedding check failed, when `embedding_healthy` is false and the
+    /// cause is not a model mismatch — auth, timeout, unreachable, HTTP status.
+    pub embedding_error: Option<String>,
     /// True when the stored index model differs from the active config model.
     /// Distinct from `embedding_healthy = false` caused by the server being unreachable.
     pub embedding_model_mismatch: bool,
@@ -248,10 +251,13 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
     let status = status_from_store(&store, &config).await?;
 
     let claudix = Claudix::new(project_root.clone(), Arc::new(config.clone())).await;
-    let (embedding_healthy, embedding_model_mismatch) = match claudix {
-        Ok(claudix) => (claudix.embedder_health_check().await.is_ok(), false),
-        Err(ClaudixError::EmbeddingModelMismatch { .. }) => (false, true),
-        Err(_) => (false, false),
+    let (embedding_healthy, embedding_model_mismatch, embedding_error) = match claudix {
+        Ok(claudix) => match claudix.embedder_health_check().await {
+            Ok(()) => (true, false, None),
+            Err(error) => (false, false, Some(error.to_string())),
+        },
+        Err(ClaudixError::EmbeddingModelMismatch { .. }) => (false, true, None),
+        Err(error) => (false, false, Some(error.to_string())),
     };
 
     Ok(DoctorOutput {
@@ -266,6 +272,7 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
             config::EmbeddingProvider::Http => "http".to_owned(),
         },
         embedding_healthy,
+        embedding_error,
         embedding_model_mismatch,
     })
 }
@@ -614,5 +621,44 @@ mod tests {
         assert_eq!(output.model.as_deref(), Some("stub-v1"));
         assert_eq!(output.embedding_provider, "bundled");
         assert!(output.embedding_healthy);
+    }
+
+    #[tokio::test]
+    async fn run_doctor_surfaces_specific_embedding_failure() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        // Point at a dead port with a non-bundled model so no fallback masks the
+        // failure; doctor must report the actual reason, not a flat "unreachable".
+        let mut config = stub_config();
+        config.embedding.provider = config::EmbeddingProvider::Http;
+        config.embedding.endpoint = "http://127.0.0.1:1".to_owned();
+        config.embedding.model = "no-fallback-model".to_owned();
+        config.embedding.timeout_ms = 100;
+
+        let claude_dir = fixture.root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        let config_text = toml::to_string(&config);
+        assert!(config_text.is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                config_text.ok().unwrap_or_default(),
+            )
+            .is_ok()
+        );
+
+        let output = run_doctor(fixture.root()).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(!output.embedding_healthy);
+        assert!(!output.embedding_model_mismatch);
+        assert!(
+            output
+                .embedding_error
+                .is_some_and(|reason| reason.contains("http://127.0.0.1:1"))
+        );
     }
 }
