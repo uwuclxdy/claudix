@@ -26,6 +26,27 @@ pub enum ClaudixError {
         recovery: RecoveryHint,
     },
 
+    #[error("embedding endpoint timed out after {timeout_ms}ms: {endpoint}")]
+    EmbeddingTimedOut {
+        endpoint: String,
+        timeout_ms: u64,
+        recovery: RecoveryHint,
+    },
+
+    #[error("embedding endpoint requires auth (HTTP {status}): {endpoint}")]
+    EmbeddingAuthRejected {
+        endpoint: String,
+        status: u16,
+        recovery: RecoveryHint,
+    },
+
+    #[error("embedding endpoint returned HTTP {status}: {endpoint}")]
+    EmbeddingHttpStatus {
+        endpoint: String,
+        status: u16,
+        recovery: RecoveryHint,
+    },
+
     #[error("schema version mismatch: store={store}, binary={binary}")]
     SchemaMismatch {
         store: u32,
@@ -98,6 +119,9 @@ impl ClaudixError {
         match self {
             Self::ConfigInvalid { recovery, .. } => Some(recovery.0),
             Self::EmbeddingUnreachable { recovery, .. } => Some(recovery.0),
+            Self::EmbeddingTimedOut { recovery, .. } => Some(recovery.0),
+            Self::EmbeddingAuthRejected { recovery, .. } => Some(recovery.0),
+            Self::EmbeddingHttpStatus { recovery, .. } => Some(recovery.0),
             Self::SchemaMismatch { recovery, .. } => Some(recovery.0),
             Self::DimensionMismatch { recovery, .. } => Some(recovery.0),
             Self::EmbeddingModelMismatch { recovery, .. } => Some(recovery.0),
@@ -106,6 +130,19 @@ impl ClaudixError {
             Self::BundledAssetsMissing { recovery, .. } => Some(recovery.0),
             _ => None,
         }
+    }
+
+    /// True when the HTTP embedding endpoint is unusable this session — offline,
+    /// too slow, rejecting auth, or erroring — so a fallback provider should take
+    /// over rather than aborting.
+    pub fn is_endpoint_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::EmbeddingUnreachable { .. }
+                | Self::EmbeddingTimedOut { .. }
+                | Self::EmbeddingAuthRejected { .. }
+                | Self::EmbeddingHttpStatus { .. }
+        )
     }
 }
 

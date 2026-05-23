@@ -13,6 +13,7 @@ pub struct HttpProvider {
     endpoint: String,
     model_id: String,
     dimensions: Dimension,
+    timeout: Duration,
     client: reqwest::Client,
 }
 
@@ -31,12 +32,44 @@ impl HttpProvider {
             endpoint,
             model_id: model_id.into(),
             dimensions,
+            timeout,
             client,
         })
     }
 
     fn embeddings_url(&self) -> String {
         format!("{}/v1/embeddings", self.endpoint)
+    }
+
+    fn transport_error(&self, source: reqwest::Error) -> ClaudixError {
+        if source.is_timeout() {
+            return ClaudixError::EmbeddingTimedOut {
+                endpoint: self.endpoint.clone(),
+                timeout_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
+                recovery: RecoveryHint(TIMEOUT_HINT),
+            };
+        }
+        ClaudixError::EmbeddingUnreachable {
+            endpoint: self.endpoint.clone(),
+            source,
+            recovery: RecoveryHint(DOCTOR_HINT),
+        }
+    }
+
+    fn status_error(&self, source: reqwest::Error) -> ClaudixError {
+        match source.status().map(|status| status.as_u16()) {
+            Some(status @ (401 | 403)) => ClaudixError::EmbeddingAuthRejected {
+                endpoint: self.endpoint.clone(),
+                status,
+                recovery: RecoveryHint(AUTH_HINT),
+            },
+            Some(status) => ClaudixError::EmbeddingHttpStatus {
+                endpoint: self.endpoint.clone(),
+                status,
+                recovery: RecoveryHint(DOCTOR_HINT),
+            },
+            None => self.transport_error(source),
+        }
     }
 }
 
@@ -80,27 +113,13 @@ impl Provider for HttpProvider {
                     delay = (delay * 2).min(RETRY_MAX_DELAY);
                     continue;
                 }
-                Err(source) => {
-                    return Err(ClaudixError::EmbeddingUnreachable {
-                        endpoint: self.endpoint.clone(),
-                        source,
-                        recovery: RecoveryHint(
-                            "Run /claudix:doctor to check the embedding endpoint or switch to the bundled provider",
-                        ),
-                    });
-                }
+                Err(source) => return Err(self.transport_error(source)),
             }
         };
 
-        let response = response.error_for_status().map_err(|source| {
-            ClaudixError::EmbeddingUnreachable {
-                endpoint: self.endpoint.clone(),
-                source,
-                recovery: RecoveryHint(
-                    "Run /claudix:doctor to check the embedding endpoint or switch to the bundled provider",
-                ),
-            }
-        })?;
+        let response = response
+            .error_for_status()
+            .map_err(|source| self.status_error(source))?;
 
         let payload: EmbeddingResponse = response.json().await?;
         if payload.data.len() != batch.len() {
@@ -178,6 +197,11 @@ fn build_client(timeout: Duration, bearer_token: Option<&str>) -> Result<reqwest
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+
+const DOCTOR_HINT: &str =
+    "Run /claudix:doctor to check the embedding endpoint or switch to the bundled provider";
+const AUTH_HINT: &str = "The embedding endpoint requires auth; disable auth on the server or switch to the bundled provider";
+const TIMEOUT_HINT: &str = "The model may still be loading; raise [embedding].timeout_ms or switch to the bundled provider";
 
 fn is_retryable_transport(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
@@ -470,6 +494,69 @@ mod tests {
         assert!(matches!(
             error,
             Err(ClaudixError::EmbeddingUnreachable { endpoint: reported, .. }) if reported == endpoint
+        ));
+    }
+
+    #[tokio::test]
+    async fn http_provider_reports_auth_rejection() {
+        let server =
+            TestServer::spawn("HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".to_owned())
+                .await;
+
+        let provider = HttpProvider::new(
+            server.endpoint(),
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
+
+        let error = provider.embed(&["alpha"]).await;
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingAuthRejected { status: 401, .. })
+        ));
+        let _ = server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn http_provider_reports_timeout_when_response_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await;
+        assert!(listener.is_ok());
+        let listener = listener.ok().unwrap_or_else(|| unreachable!());
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().ok().unwrap_or_else(|| unreachable!())
+        );
+
+        // Accept connections and read the request, but never write a response,
+        // forcing the client's request timeout to fire.
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buffer = vec![0_u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let provider = HttpProvider::new(
+            endpoint.clone(),
+            "test-model",
+            Dimension(2),
+            Duration::from_millis(50),
+            None,
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
+
+        let error = provider.embed(&["alpha"]).await;
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingTimedOut { endpoint: reported, .. }) if reported == endpoint
         ));
     }
 

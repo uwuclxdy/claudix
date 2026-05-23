@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
-use crate::error::{ClaudixError, Result};
+use crate::error::Result;
 use crate::types::Dimension;
 
 pub use bundled::BundledProvider;
@@ -58,7 +58,7 @@ impl Provider for FallbackProvider {
     async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
         match self.primary.embed(batch).await {
             Ok(vectors) => Ok(vectors),
-            Err(error @ ClaudixError::EmbeddingUnreachable { .. }) => {
+            Err(error) if error.is_endpoint_unavailable() => {
                 if !self.warned.swap(true, Ordering::Relaxed) {
                     eprintln!(
                         "claudix warning: {error}; falling back to bundled embeddings for this session"
@@ -71,19 +71,20 @@ impl Provider for FallbackProvider {
     }
 
     async fn health_check(&self) -> Result<()> {
-        self.primary
-            .health_check()
-            .await
-            .or_else(|error| match error {
-                ClaudixError::EmbeddingUnreachable { .. } => Ok(()),
-                error => Err(error),
-            })
+        self.primary.health_check().await.or_else(|error| {
+            if error.is_endpoint_unavailable() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::ClaudixError;
     use std::time::Duration;
 
     use tokio::net::TcpListener;
