@@ -1,5 +1,5 @@
 ---
-description: Show a structural map of indexed files grouped by directory.
+description: Map the repo by directory with file/chunk counts, languages, and top identifiers. Use when orienting in an unfamiliar codebase or deciding where to start a task.
 allowed-tools: Bash(claudix:*)
 ---
 

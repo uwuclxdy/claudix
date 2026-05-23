@@ -1,5 +1,5 @@
 ---
-description: Find near-duplicate or copy-pasted code chunks within the active repo or across indexed repos.
+description: Find near-duplicate code chunks. Use before adding new logic to check if equivalent code already exists, or to audit for copy-paste across repos.
 allowed-tools: Bash(claudix:*)
 ---
 

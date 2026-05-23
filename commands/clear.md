@@ -1,5 +1,5 @@
 ---
-description: Clear the claudix search index.
+description: Delete all indexed chunks for the active project. Use before switching embedding models or resetting a corrupted index.
 allowed-tools: Bash(claudix:*)
 ---
 

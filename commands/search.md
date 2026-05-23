@@ -1,5 +1,5 @@
 ---
-description: Search code semantically with claudix.
+description: Semantic code search by meaning or identifier. Use before implementing to check if logic already exists, or when Grep won't find it.
 argument-hint: <query words...> [--top-k N] [--language rust --language python] [--path-prefix src/] [--repo /abs/path]
 allowed-tools: Bash(claudix:*)
 ---

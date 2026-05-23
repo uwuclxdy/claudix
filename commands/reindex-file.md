@@ -1,5 +1,5 @@
 ---
-description: Re-embed one file in the claudix index.
+description: Re-embed a single file immediately. Use after editing one file when you want search to reflect the change without a full reindex.
 argument-hint: <path>
 allowed-tools: Bash(claudix:*)
 ---

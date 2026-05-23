@@ -322,7 +322,7 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "search_code",
-            "description": "Semantic search over indexed source code. Use for conceptual queries ('where is auth handled', 'how does config load'), identifier lookups ('SessionStart', 'handle_post_tool_use'), and cross-file questions. Returns results grouped by directory (ordered by best hit score), each group containing the repo path, file paths, line ranges, and code snippets. Can span additional already-indexed repos read-only via `repos`; the active project is always included. Prefer this over grep for anything that isn't a literal string match or regex.",
+            "description": "Semantic code search over the active project (plus optional cross-repos). Use when: looking for code by meaning ('where is auth handled?', 'how does config load?'), looking up an identifier ('handle_session_start'), exploring an unfamiliar area, or checking whether logic ALREADY EXISTS before implementing something new. Prefer over Grep for anything that isn't a literal string or regex match. Args: query (required), optional top_k, language_filter, path_prefix, repos (absolute paths to additional indexed repos; the active project is always included and these are added to it). Returns: hits grouped by directory ordered by best-hit score, each with repo, file path, line range, kind, name, snippet, and score; cross-repo runs also include repo_errors for unindexed or model-mismatched repos.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -345,7 +345,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "get_index_status",
-            "description": "Return current chunk counts, file counts, model, and stale flag for the active index. Check stale: true before running reindex.",
+            "description": "Report current chunk count, file count, embedding model, and staleness for the active index. Use when: checking whether the index is fresh before relying on search results, diagnosing why search returns nothing, or confirming a reindex completed. Returns: file_count, chunk_count, model, stale (true means files changed since last index), and index_present.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -353,7 +353,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "reindex",
-            "description": "Rebuild the project index using the active embedding provider. Use when the index is stale or after major codebase changes.",
+            "description": "Rebuild the active project index by scanning all files and re-embedding changed chunks. Use when: get_index_status reports stale, after large file additions or deletions, or when search results look wrong. Pass force: true to wipe the existing index first; this is required after changing the embedding model. Don't use for: a single changed file (use reindex_file instead). Returns: file_count and chunk_count.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -363,7 +363,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "clear_index",
-            "description": "Delete all indexed chunks for the active project",
+            "description": "Delete all stored chunks and the manifest for the active project. Use when: the index is corrupted, switching embedding models (clear then reindex with force: true via reindex), or resetting a test environment. Does not delete source files. After clearing, call reindex to rebuild.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -371,7 +371,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "reindex_file",
-            "description": "Re-embed a single file inside the active project",
+            "description": "Re-embed one file in the active project without touching other chunks. Use when: you just edited a file and want search to reflect the change immediately, without waiting for a full reindex. Don't use for: bulk updates (use reindex) or files outside the active project root. Args: path (project-relative or absolute path inside the project root). Returns: chunks written for that file.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -382,7 +382,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "overview",
-            "description": "Return a structural map of the indexed repo: for each directory, how many files and chunks it holds, which languages appear, and its most prominent identifiers. Use this tool to orient before exploring an unfamiliar repo or area — it answers 'what lives where' at a glance. Call it at the start of a task when you need to understand the directory structure, before diving into search_code. Optionally narrow to a subtree with path_prefix.",
+            "description": "Map of the indexed repo: for each directory, file count, chunk count, languages, and the top identifiers by frequency. Use when: orienting in an unfamiliar codebase, deciding where to start a task, getting a structural sense of what lives where before diving into search_code. Optional path_prefix narrows the map to a subtree. Returns: per-directory rollups (directory path, file_count, chunk_count, languages, top_identifiers) sorted by path, plus repo-wide totals.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -392,7 +392,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "find_duplicates",
-            "description": "Find near-duplicate or copy-pasted code chunks. Before implementing something, check whether equivalent logic already exists. Scans the active repo or an explicit list of already-indexed repos (read-only). Returns pairs sorted by similarity, highest first. Raise min_similarity toward 1.0 for exact copies; lower it to find looser structural similarities.",
+            "description": "Find near-identical code chunks across files using stored embeddings. Use when: BEFORE adding new logic, checking whether equivalent code already exists; auditing for copy-paste within this repo or across an explicit list of already-indexed repos. Args: optional min_similarity (0-1, default 0.85; raise toward 1.0 for exact copies, lower for looser matches), limit (default 50), repos (absolute paths; when set, ONLY these repos are scanned and the active project is NOT auto-added, unlike search_code which always includes it). Returns: pairs sorted by similarity descending, each with repo, file path, line range, and name for both sides; plus repo_errors for any listed repo that is unindexed or model-mismatched.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -410,7 +410,7 @@ fn tool_definitions() -> Vec<Value> {
                     "repos": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Absolute paths to other already-indexed repos to include. When specified, ONLY these paths are scanned — the active project is not auto-added."
+                        "description": "Absolute paths to other already-indexed repos to include. When specified, ONLY these paths are scanned; the active project is not auto-added."
                     }
                 }
             }

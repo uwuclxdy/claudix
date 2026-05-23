@@ -1,5 +1,5 @@
 ---
-description: Show claudix index status.
+description: Show index chunk count, file count, model, and staleness. Use when checking whether the index is fresh before relying on search.
 allowed-tools: Bash(claudix:*)
 ---
 
