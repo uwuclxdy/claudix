@@ -59,6 +59,14 @@ enum Command {
     Doctor,
     #[command(about = "Bootstrap plugin files and download the bundled embedding model")]
     Install,
+    #[command(about = "Show a structural map of indexed files grouped by directory")]
+    Overview {
+        #[arg(
+            long,
+            help = "Restrict output to files under this project-relative path prefix"
+        )]
+        path_prefix: Option<String>,
+    },
     #[command(about = "Run as an MCP server over stdio (invoked by Claude Code)")]
     Mcp,
 }
@@ -213,6 +221,25 @@ async fn run() -> Result<()> {
             }
             if !output.index_present {
                 eprintln!("\nindex not built — run `claudix index` to index the repository.");
+            }
+        }
+        Command::Overview { path_prefix } => {
+            let output = cli::run_overview(&project_root, path_prefix).await?;
+            println!("files: {}", output.file_count);
+            println!("chunks: {}", output.chunk_count);
+            println!("directories: {}", output.directories.len());
+            for dir in &output.directories {
+                let langs: Vec<&str> = dir.languages.iter().map(|l| l.language.as_str()).collect();
+                println!(
+                    "  {} — {} files, {} chunks [{}]",
+                    dir.path,
+                    dir.file_count,
+                    dir.chunk_count,
+                    langs.join(", ")
+                );
+                if !dir.top_identifiers.is_empty() {
+                    println!("    identifiers: {}", dir.top_identifiers.join(", "));
+                }
             }
         }
         Command::Install => {

@@ -2,6 +2,7 @@ mod input;
 mod install;
 mod watch;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -14,12 +15,15 @@ use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::hooks::HookEvent;
 use crate::search::SearchQuery;
 use crate::store::{IndexLockGuard, Store};
-use crate::types::RelativePath;
+use crate::types::{RelativePath, path_prefix_matches};
 use crate::{Claudix, IndexFileStatus, IndexProgress};
 
 use input::{
     parse_language_filter, parse_path_prefix, validate_search_query, validate_search_top_k,
 };
+
+/// Maximum number of top identifiers surfaced per directory in `OverviewOutput`.
+const TOP_IDENTIFIERS_CAP: usize = 8;
 
 pub use install::{run_install, setup_state};
 pub use watch::run_watch;
@@ -142,6 +146,164 @@ pub struct InstallOutput {
 pub enum SetupState {
     Ready,
     Missing(Vec<&'static str>),
+}
+
+/// Per-language chunk count within a directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LanguageCount {
+    pub language: String,
+    pub chunk_count: usize,
+}
+
+/// Aggregated stats for one immediate parent directory in the index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DirectoryRollup {
+    /// Repo-relative directory path, or `"."` for root-level files.
+    pub path: String,
+    pub file_count: usize,
+    pub chunk_count: usize,
+    /// Languages present in this directory, sorted by chunk count desc then name asc.
+    pub languages: Vec<LanguageCount>,
+    /// Most frequent non-empty chunk names, capped at [`TOP_IDENTIFIERS_CAP`], sorted by
+    /// frequency desc then name asc.
+    pub top_identifiers: Vec<String>,
+}
+
+/// Structural map of the indexed repo, grouped by immediate parent directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverviewOutput {
+    /// One entry per directory, sorted by path ascending.
+    pub directories: Vec<DirectoryRollup>,
+    /// Distinct files in the filtered view.
+    pub file_count: usize,
+    /// Total chunks in the filtered view.
+    pub chunk_count: usize,
+}
+
+pub async fn run_overview(
+    project_root: impl AsRef<Path>,
+    path_prefix: Option<String>,
+) -> Result<OverviewOutput> {
+    let project_root = canonical_project_root(project_root.as_ref())?;
+    let config = config::load(&project_root)?;
+    let store = Store::new(&project_root, &config)?;
+
+    // Validate and normalize the path prefix the same way search does.
+    let prefix: Option<RelativePath> = parse_path_prefix(path_prefix)?;
+
+    let chunks = store.read_chunks().await?;
+
+    // Group chunks by the immediate parent directory of their file_path.
+    // Splitting on `/` is sound because file_path comes from RelativePath,
+    // which forward-slash-normalizes on construction on every platform.
+    // Aggregation is light counting over an already-loaded Vec — no spawn_blocking needed.
+    let mut dir_files: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut dir_chunks: HashMap<String, usize> = HashMap::new();
+    let mut dir_languages: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    let mut dir_names: HashMap<String, HashMap<String, usize>> = HashMap::new();
+
+    for chunk in &chunks {
+        // Apply path-prefix filter, consistent with `apply_filters` in search.
+        if let Some(ref prefix) = prefix
+            && !path_prefix_matches(&chunk.file_path, prefix.as_str())
+        {
+            continue;
+        }
+
+        let dir = immediate_parent_dir(&chunk.file_path);
+        dir_files
+            .entry(dir.clone())
+            .or_default()
+            .insert(chunk.file_path.clone());
+        *dir_chunks.entry(dir.clone()).or_insert(0) += 1;
+        *dir_languages
+            .entry(dir.clone())
+            .or_default()
+            .entry(chunk.language.clone())
+            .or_insert(0) += 1;
+        if let Some(ref name) = chunk.name
+            && !name.is_empty()
+        {
+            *dir_names
+                .entry(dir.clone())
+                .or_default()
+                .entry(name.clone())
+                .or_insert(0) += 1;
+        }
+    }
+
+    let mut directories: Vec<DirectoryRollup> = dir_files
+        .keys()
+        .map(|dir| {
+            let file_count = dir_files[dir].len();
+            let chunk_count = dir_chunks[dir];
+
+            let mut languages: Vec<LanguageCount> = dir_languages
+                .get(dir)
+                .map(|lang_map| {
+                    lang_map
+                        .iter()
+                        .map(|(lang, count)| LanguageCount {
+                            language: lang.clone(),
+                            chunk_count: *count,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Sort by chunk count desc, then language name asc for determinism.
+            languages.sort_by(|a, b| {
+                b.chunk_count
+                    .cmp(&a.chunk_count)
+                    .then_with(|| a.language.cmp(&b.language))
+            });
+
+            let top_identifiers: Vec<String> = dir_names
+                .get(dir)
+                .map(|name_map| {
+                    let mut pairs: Vec<(&String, usize)> =
+                        name_map.iter().map(|(n, c)| (n, *c)).collect();
+                    // Frequency desc, then name asc for determinism, then cap.
+                    pairs.sort_by(|(a_name, a_count), (b_name, b_count)| {
+                        b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+                    });
+                    pairs.truncate(TOP_IDENTIFIERS_CAP);
+                    pairs.into_iter().map(|(name, _)| name.clone()).collect()
+                })
+                .unwrap_or_default();
+
+            DirectoryRollup {
+                path: dir.clone(),
+                file_count,
+                chunk_count,
+                languages,
+                top_identifiers,
+            }
+        })
+        .collect();
+
+    // Sort directories by path ascending for deterministic, navigable output.
+    directories.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let file_count: usize = directories.iter().map(|d| d.file_count).sum();
+    let chunk_count: usize = directories.iter().map(|d| d.chunk_count).sum();
+
+    Ok(OverviewOutput {
+        directories,
+        file_count,
+        chunk_count,
+    })
+}
+
+/// Returns the immediate parent directory of a repo-relative file path,
+/// normalized to forward slashes. Root-level files (no `/`) return `"."`.
+///
+/// Used by `run_overview` for directory grouping. Feature 5 can reuse this
+/// for grouping search results.
+pub(crate) fn immediate_parent_dir(file_path: &str) -> String {
+    match file_path.rfind('/') {
+        Some(pos) => file_path[..pos].to_owned(),
+        None => ".".to_owned(),
+    }
 }
 
 pub async fn run_search(
@@ -621,6 +783,115 @@ mod tests {
         assert_eq!(output.model.as_deref(), Some("stub-v1"));
         assert_eq!(output.embedding_provider, "bundled");
         assert!(output.embedding_healthy);
+    }
+
+    #[tokio::test]
+    async fn run_overview_returns_src_directory_rollup() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let output = run_overview(harness.claudix.project_root(), None).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        // The small_rust fixture has files under src/ only.
+        let src = output.directories.iter().find(|d| d.path == "src");
+        assert!(src.is_some(), "expected a 'src' directory in the rollup");
+        let src = src.unwrap_or_else(|| unreachable!());
+
+        // src/ has src/math.rs and src/lib.rs — 2 files, 3 chunks total.
+        assert_eq!(src.file_count, 2);
+        assert_eq!(src.chunk_count, 3);
+
+        // The fixture is Rust source — rust must appear in languages.
+        assert!(
+            src.languages.iter().any(|l| l.language == "rust"),
+            "expected 'rust' among languages in src/"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_overview_top_identifiers_include_known_fixture_name() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let output = run_overview(harness.claudix.project_root(), None).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        let src = output.directories.iter().find(|d| d.path == "src");
+        assert!(src.is_some());
+        let src = src.unwrap_or_else(|| unreachable!());
+
+        // src/math.rs defines `add` — it must appear in top identifiers.
+        assert!(
+            src.top_identifiers.iter().any(|name| name == "add"),
+            "expected 'add' in top_identifiers for src/; got: {:?}",
+            src.top_identifiers,
+        );
+    }
+
+    #[tokio::test]
+    async fn run_overview_path_prefix_narrows_to_subtree() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        // Prefix "src/math" should match only src/math.rs.
+        let output =
+            run_overview(harness.claudix.project_root(), Some("src/math".to_owned())).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        // Only chunks from src/math.rs pass the filter; src/lib.rs is excluded.
+        assert!(output.file_count < 2, "prefix should exclude src/lib.rs");
+        assert!(
+            output.chunk_count > 0,
+            "at least one chunk from src/math.rs"
+        );
+
+        // Every directory in the result must have files that match the prefix.
+        for dir in &output.directories {
+            assert!(
+                path_prefix_matches(&format!("{}/file.rs", dir.path), "src/math")
+                    || dir.path == "src",
+                "unexpected directory outside prefix: {}",
+                dir.path,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_overview_directories_sorted_ascending() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let output = run_overview(harness.claudix.project_root(), None).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        let paths: Vec<&str> = output.directories.iter().map(|d| d.path.as_str()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(
+            paths, sorted,
+            "directories must be sorted ascending by path"
+        );
+    }
+
+    #[test]
+    fn immediate_parent_dir_returns_dot_for_root_level_file() {
+        assert_eq!(immediate_parent_dir("Cargo.toml"), ".");
+        assert_eq!(immediate_parent_dir("lib.rs"), ".");
+    }
+
+    #[test]
+    fn immediate_parent_dir_extracts_parent_segment() {
+        assert_eq!(immediate_parent_dir("src/math.rs"), "src");
+        assert_eq!(immediate_parent_dir("src/hooks/mod.rs"), "src/hooks");
     }
 
     #[tokio::test]

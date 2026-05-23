@@ -28,6 +28,12 @@ struct ReindexRequest {
     force: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+struct OverviewRequest {
+    #[serde(default)]
+    path_prefix: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct ReindexFileRequest {
     path: String,
@@ -154,6 +160,10 @@ async fn handle_tools_call(project_root: &Path, id: Option<Value>, params: Value
             Ok(result) => tool_success_result(result)?,
             Err(error) => tool_error_result(error),
         },
+        "overview" => match overview(project_root, call.arguments).await {
+            Ok(result) => tool_success_result(result)?,
+            Err(error) => tool_error_result(error),
+        },
         _ => {
             return Ok(error_response(
                 id,
@@ -227,6 +237,13 @@ async fn reindex_file(project_root: &Path, arguments: Value) -> Result<Value> {
         });
     }
     let output = cli::run_reindex_file(project_root, Path::new(&request.path)).await?;
+    to_value(output)
+}
+
+async fn overview(project_root: &Path, arguments: Value) -> Result<Value> {
+    let request: OverviewRequest =
+        parse_tool_arguments(arguments, "overview", "Pass an optional path_prefix string")?;
+    let output = cli::run_overview(project_root, request.path_prefix).await?;
     to_value(output)
 }
 
@@ -323,6 +340,16 @@ fn tool_definitions() -> Vec<Value> {
                     "path": { "type": "string", "description": "Project-relative or absolute path within the project root" }
                 },
                 "required": ["path"]
+            }
+        }),
+        json!({
+            "name": "overview",
+            "description": "Return a structural map of the indexed repo: for each directory, how many files and chunks it holds, which languages appear, and its most prominent identifiers. Use this tool to orient before exploring an unfamiliar repo or area — it answers 'what lives where' at a glance. Call it at the start of a task when you need to understand the directory structure, before diving into search_code. Optionally narrow to a subtree with path_prefix.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path_prefix": { "type": "string", "description": "Restrict output to files under this project-relative path prefix, e.g. \"src/hooks\"" }
+                }
             }
         }),
     ]
@@ -426,6 +453,7 @@ mod tests {
                 "reindex",
                 "clear_index",
                 "reindex_file",
+                "overview",
             ]
         );
     }
