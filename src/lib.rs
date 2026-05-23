@@ -30,7 +30,7 @@ use embedding::{BundledProvider, FallbackProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator, WatchFilter};
 use error::RecoveryHint;
 use search::neighbors::neighbors;
-use search::{SearchQuery, SearchResult, Searcher};
+use search::{SearchQuery, SearchResults, Searcher};
 use store::marker::change_neighbors::{
     ChangeNeighborsMarker, NeighborEntry, write as write_neighbors_marker,
 };
@@ -301,7 +301,7 @@ impl Claudix {
         );
     }
 
-    pub async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, query: SearchQuery) -> Result<SearchResults> {
         let searcher = Searcher::new(
             self.project_root.clone(),
             self.store.clone(),

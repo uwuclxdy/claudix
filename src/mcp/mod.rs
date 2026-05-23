@@ -20,6 +20,8 @@ pub struct SearchCodeRequest {
     pub language_filter: Option<Vec<String>>,
     #[serde(default)]
     pub path_prefix: Option<String>,
+    #[serde(default)]
+    pub repos: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
@@ -199,7 +201,7 @@ async fn search_code(project_root: &Path, arguments: Value) -> Result<Value> {
     let request: SearchCodeRequest = parse_tool_arguments(
         arguments,
         "search_code",
-        "Pass query plus optional top_k, language_filter, and path_prefix",
+        "Pass query plus optional top_k, language_filter, path_prefix, and repos",
     )?;
     if request.query.trim().is_empty() {
         return Err(ClaudixError::ConfigInvalid {
@@ -213,6 +215,7 @@ async fn search_code(project_root: &Path, arguments: Value) -> Result<Value> {
         request.top_k.map(|value| value as usize),
         request.language_filter,
         request.path_prefix,
+        request.repos,
     )
     .await?;
     to_value(output)
@@ -319,7 +322,7 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "search_code",
-            "description": "Semantic search over indexed source code. Use for conceptual queries ('where is auth handled', 'how does config load'), identifier lookups ('SessionStart', 'handle_post_tool_use'), and cross-file questions. Returns results grouped by directory (ordered by best hit score), each group containing file paths, line ranges, and code snippets. Prefer this over grep for anything that isn't a literal string match or regex.",
+            "description": "Semantic search over indexed source code. Use for conceptual queries ('where is auth handled', 'how does config load'), identifier lookups ('SessionStart', 'handle_post_tool_use'), and cross-file questions. Returns results grouped by directory (ordered by best hit score), each group containing the repo path, file paths, line ranges, and code snippets. Can span additional already-indexed repos read-only via `repos`; the active project is always included. Prefer this over grep for anything that isn't a literal string match or regex.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -330,7 +333,12 @@ fn tool_definitions() -> Vec<Value> {
                         "items": { "type": "string" },
                         "description": "Restrict to specific languages, e.g. [\"rust\"], [\"python\", \"javascript\"]"
                     },
-                    "path_prefix": { "type": "string", "description": "Restrict to files under this project-relative path prefix, e.g. \"src/hooks\"" }
+                    "path_prefix": { "type": "string", "description": "Restrict to files under this project-relative path prefix, e.g. \"src/hooks\"" },
+                    "repos": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Absolute paths to other already-indexed repos to search read-only. The active project is always included; these are added to it. Repos that are unindexed or use a different model surface in repo_errors."
+                    }
                 },
                 "required": ["query"]
             }

@@ -125,6 +125,18 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    if config
+        .search
+        .cross_repos
+        .iter()
+        .any(|repo| repo.trim().is_empty())
+    {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "search.cross_repos entries must be non-empty paths".into(),
+            recovery: RecoveryHint("Remove empty strings from [search].cross_repos"),
+        });
+    }
+
     if !config.search.identifier_boost.is_finite() || config.search.identifier_boost <= 0.0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "search.identifier_boost must be a finite positive number".into(),

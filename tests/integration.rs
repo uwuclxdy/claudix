@@ -80,10 +80,11 @@ async fn full_reindex_after_file_edit_reflects_changes() {
             top_k: 10,
             language_filter: None,
             path_prefix: None,
+            repos: Vec::new(),
         })
         .await;
     assert!(results.is_ok(), "search failed: {results:?}");
-    let results = results.ok().unwrap_or_else(|| unreachable!());
+    let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
     let found = results
         .iter()
@@ -126,13 +127,14 @@ async fn reindex_file_updates_target_preserves_others() {
             top_k: 10,
             language_filter: None,
             path_prefix: None,
+            repos: Vec::new(),
         })
         .await;
     assert!(
         greet_results.is_ok(),
         "search(greet) failed: {greet_results:?}"
     );
-    let greet_results = greet_results.ok().unwrap_or_else(|| unreachable!());
+    let greet_results = greet_results.ok().unwrap_or_else(|| unreachable!()).results;
     assert!(
         !greet_results.is_empty(),
         "expected greet to still be found after reindex_file"
@@ -144,13 +146,17 @@ async fn reindex_file_updates_target_preserves_others() {
             top_k: 10,
             language_filter: None,
             path_prefix: None,
+            repos: Vec::new(),
         })
         .await;
     assert!(
         square_results.is_ok(),
         "search(square) failed: {square_results:?}"
     );
-    let square_results = square_results.ok().unwrap_or_else(|| unreachable!());
+    let square_results = square_results
+        .ok()
+        .unwrap_or_else(|| unreachable!())
+        .results;
     assert!(
         square_results
             .iter()
@@ -180,13 +186,14 @@ async fn search_language_filter_excludes_other_languages() {
             top_k: 10,
             language_filter: Some(vec![Language::Rust]),
             path_prefix: None,
+            repos: Vec::new(),
         })
         .await;
     assert!(
         results.is_ok(),
         "search with language filter failed: {results:?}"
     );
-    let results = results.ok().unwrap_or_else(|| unreachable!());
+    let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
     for result in &results {
         assert_eq!(
@@ -219,13 +226,14 @@ async fn search_path_prefix_restricts_results() {
             top_k: 10,
             language_filter: None,
             path_prefix: Some(RelativePath::new("src/math")),
+            repos: Vec::new(),
         })
         .await;
     assert!(
         results.is_ok(),
         "search with path prefix failed: {results:?}"
     );
-    let results = results.ok().unwrap_or_else(|| unreachable!());
+    let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
     for result in &results {
         assert!(
@@ -267,10 +275,11 @@ async fn indexignore_excludes_skip_indexinclude_reinstates_reinclude() {
             top_k: 10,
             language_filter: None,
             path_prefix: None,
+            repos: Vec::new(),
         })
         .await;
     assert!(results.is_ok(), "search(reinclude) failed: {results:?}");
-    let results = results.ok().unwrap_or_else(|| unreachable!());
+    let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
     let from_reinclude = results
         .iter()

@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tokio::{fs, task};
 
+use crate::cli::{RepoError, load_repo_chunks_readonly};
 use crate::config::SearchConfig;
 use crate::embedding::Provider;
 use crate::enumeration::hash_bytes;
@@ -24,6 +25,10 @@ pub struct SearchQuery {
     pub top_k: usize,
     pub language_filter: Option<Vec<Language>>,
     pub path_prefix: Option<RelativePath>,
+    /// Additional repos to search read-only alongside the active project.
+    /// The active project is always included; this set is union'd with it and
+    /// deduped by canonical path.
+    pub repos: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +36,17 @@ pub struct SearchResult {
     pub chunk: Chunk,
     pub score: f32,
     pub stale: bool,
+    /// Canonical path of the repo this hit came from. Staleness resolves the
+    /// chunk's file against this root.
+    pub repo: String,
+}
+
+/// Results plus the repos that could not contribute, for partial-success
+/// reporting. `repo_errors` is empty for a plain single-repo search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchResults {
+    pub results: Vec<SearchResult>,
+    pub repo_errors: Vec<RepoError>,
 }
 
 #[derive(Clone)]
@@ -56,28 +72,31 @@ impl Searcher {
         }
     }
 
-    pub async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, query: SearchQuery) -> Result<SearchResults> {
         let limit = effective_top_k(query.top_k, self.config.top_k);
         if limit == 0 || query.query.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchResults {
+                results: Vec::new(),
+                repo_errors: Vec::new(),
+            });
         }
 
-        let mut results = self.search_all(query).await?;
-        results = deduplicate_by_file_path(results);
-        results.truncate(limit);
-        Ok(results)
+        let mut found = self.search_all(query).await?;
+        found.results = deduplicate_by_file_path(found.results);
+        found.results.truncate(limit);
+        Ok(found)
     }
 
-    async fn search_all(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
+    async fn search_all(&self, query: SearchQuery) -> Result<SearchResults> {
         if query.query.trim().is_empty() {
-            return Ok(Vec::new());
+            return Ok(SearchResults {
+                results: Vec::new(),
+                repo_errors: Vec::new(),
+            });
         }
 
-        let rows = self.store.read_chunks().await?;
-        if rows.is_empty() {
-            return Ok(Vec::new());
-        }
-
+        // Embed the query once with the active embedder. Its model/dimensions
+        // are the reference identity every cross-repo's vectors must match.
         let vectors = self.embedder.embed(&[query.query.as_str()]).await?;
         if vectors.len() != 1 {
             return Err(ClaudixError::Embedding(format!(
@@ -85,18 +104,68 @@ impl Searcher {
                 vectors.len()
             )));
         }
-
         let query_vector = vectors.into_iter().next().unwrap_or_default();
         validate_query_vector(&query_vector, self.embedder.dimensions())?;
-        let config = self.config.clone();
-        let project_root = self.project_root.clone();
 
+        let (labeled_rows, repo_errors) = self.collect_labeled_rows(&query).await?;
+        if labeled_rows.is_empty() {
+            return Ok(SearchResults {
+                results: Vec::new(),
+                repo_errors,
+            });
+        }
+
+        let config = self.config.clone();
         let mut results =
-            task::spawn_blocking(move || rank_rows(query, rows, query_vector, config))
+            task::spawn_blocking(move || rank_rows(query, labeled_rows, query_vector, config))
                 .await
                 .map_err(|error| ClaudixError::Store(format!("search task failed: {error}")))??;
-        mark_stale_results(&project_root, &mut results).await?;
-        Ok(results)
+        mark_stale_results(&mut results).await?;
+        Ok(SearchResults {
+            results,
+            repo_errors,
+        })
+    }
+
+    /// Build the union corpus: active project (always included) plus the
+    /// resolved extra repos, each labeled with its canonical path. Errored
+    /// repos are collected separately so the rest still search (partial success).
+    async fn collect_labeled_rows(
+        &self,
+        query: &SearchQuery,
+    ) -> Result<(Vec<(String, StoredChunk)>, Vec<RepoError>)> {
+        let active_repo = self.project_root.display().to_string();
+        let active_rows = self.store.read_chunks().await?;
+
+        let mut labeled: Vec<(String, StoredChunk)> = active_rows
+            .into_iter()
+            .map(|row| (active_repo.clone(), row))
+            .collect();
+        let mut repo_errors = Vec::new();
+
+        if query.repos.is_empty() {
+            return Ok((labeled, repo_errors));
+        }
+
+        // Reference identity comes from the active manifest so the single query
+        // embedding is comparable to every repo's stored vectors.
+        let ref_model = self.embedder.model_id();
+        let ref_dims = self.embedder.dimensions().0;
+        let mut seen: HashSet<String> = HashSet::from([active_repo]);
+
+        for repo in &query.repos {
+            match load_repo_chunks_readonly(repo, ref_model, ref_dims).await {
+                Ok((canonical, rows)) => {
+                    if !seen.insert(canonical.clone()) {
+                        continue;
+                    }
+                    labeled.extend(rows.into_iter().map(|row| (canonical.clone(), row)));
+                }
+                Err(error) => repo_errors.push(error),
+            }
+        }
+
+        Ok((labeled, repo_errors))
     }
 }
 
@@ -125,7 +194,7 @@ impl DocumentStats {
 
 fn rank_rows(
     query: SearchQuery,
-    rows: Vec<StoredChunk>,
+    rows: Vec<(String, StoredChunk)>,
     query_vector: Vec<f32>,
     config: SearchConfig,
 ) -> Result<Vec<SearchResult>> {
@@ -137,11 +206,11 @@ fn rank_rows(
 
     let documents = filtered_rows
         .iter()
-        .map(|row| DocumentStats::from_content(&row.content))
+        .map(|(_, row)| DocumentStats::from_content(&row.content))
         .collect::<Vec<_>>();
     let dense_scores = filtered_rows
         .iter()
-        .map(|row| cosine_similarity(&query_vector, &row.vector).max(0.0))
+        .map(|(_, row)| cosine_similarity(&query_vector, &row.vector).max(0.0))
         .collect::<Vec<_>>();
     let bm25_scores = bm25_scores(&documents, &query_tokens);
     let dense_ranks = rank_positions(&dense_scores);
@@ -155,7 +224,7 @@ fn rank_rows(
     let mut results = filtered_rows
         .into_iter()
         .enumerate()
-        .filter_map(|(index, row)| {
+        .filter_map(|(index, (repo, row))| {
             let identifier_hit = row
                 .name
                 .as_deref()
@@ -184,6 +253,7 @@ fn rank_rows(
                 chunk: stored_chunk_to_chunk(row),
                 score: boosted_score,
                 stale: false,
+                repo,
             })
         })
         .collect::<Vec<_>>();
@@ -200,16 +270,17 @@ fn effective_top_k(requested: usize, default_top_k: usize) -> usize {
     }
 }
 
-async fn mark_stale_results(project_root: &Path, results: &mut [SearchResult]) -> Result<()> {
+async fn mark_stale_results(results: &mut [SearchResult]) -> Result<()> {
     for result in results {
-        result.stale = result_is_stale(project_root, &result.chunk).await?;
+        let repo_root = Path::new(&result.repo);
+        result.stale = result_is_stale(repo_root, &result.chunk).await?;
     }
 
     Ok(())
 }
 
-async fn result_is_stale(project_root: &Path, chunk: &Chunk) -> Result<bool> {
-    let path = resolve_chunk_path(project_root, &chunk.file_path)?;
+async fn result_is_stale(repo_root: &Path, chunk: &Chunk) -> Result<bool> {
+    let path = resolve_chunk_path(repo_root, &chunk.file_path)?;
     let Ok(contents) = fs::read(path).await else {
         return Ok(true);
     };
@@ -217,9 +288,9 @@ async fn result_is_stale(project_root: &Path, chunk: &Chunk) -> Result<bool> {
     Ok(hash_bytes(&contents) != chunk.file_hash)
 }
 
-fn resolve_chunk_path(project_root: &Path, relative_path: &RelativePath) -> Result<PathBuf> {
-    relative_path.reject_escape("Only read search result files inside $CLAUDE_PROJECT_DIR")?;
-    Ok(project_root.join(relative_path.to_path_buf()))
+fn resolve_chunk_path(repo_root: &Path, relative_path: &RelativePath) -> Result<PathBuf> {
+    relative_path.reject_escape("Only read search result files inside the declared repo roots")?;
+    Ok(repo_root.join(relative_path.to_path_buf()))
 }
 
 fn validate_query_vector(vector: &[f32], dimensions: Dimension) -> Result<()> {
@@ -242,7 +313,10 @@ fn validate_query_vector(vector: &[f32], dimensions: Dimension) -> Result<()> {
     Ok(())
 }
 
-fn apply_filters(rows: Vec<StoredChunk>, query: &SearchQuery) -> Vec<StoredChunk> {
+fn apply_filters(
+    rows: Vec<(String, StoredChunk)>,
+    query: &SearchQuery,
+) -> Vec<(String, StoredChunk)> {
     let language_filter = query.language_filter.as_ref().map(|languages| {
         languages
             .iter()
@@ -252,7 +326,7 @@ fn apply_filters(rows: Vec<StoredChunk>, query: &SearchQuery) -> Vec<StoredChunk
     let path_prefix = query.path_prefix.as_ref().map(RelativePath::as_str);
 
     rows.into_iter()
-        .filter(|row| {
+        .filter(|(_, row)| {
             if let Some(language_filter) = &language_filter
                 && !language_filter.contains(row.language.as_str())
             {
@@ -371,7 +445,8 @@ fn deduplicate_by_file_path(results: Vec<SearchResult>) -> Vec<SearchResult> {
     let mut deduplicated = Vec::new();
 
     for result in results {
-        if seen_paths.insert(result.chunk.file_path.clone()) {
+        // Key on (repo, file) so a same-named file in two repos keeps both.
+        if seen_paths.insert((result.repo.clone(), result.chunk.file_path.clone())) {
             deduplicated.push(result);
         }
     }
@@ -385,6 +460,7 @@ fn sort_results(results: &mut [SearchResult]) {
             .score
             .partial_cmp(&left.score)
             .unwrap_or(Ordering::Equal)
+            .then_with(|| left.repo.cmp(&right.repo))
             .then_with(|| {
                 left.chunk
                     .file_path
@@ -584,6 +660,15 @@ mod tests {
         assert_eq!(scores[1], 0.0, "with_fallback_params should not match");
     }
 
+    /// Wrap raw `StoredChunk`s with a fake repo label for `rank_rows` tests.
+    fn label_rows(
+        rows: Vec<crate::store::StoredChunk>,
+    ) -> Vec<(String, crate::store::StoredChunk)> {
+        rows.into_iter()
+            .map(|r| ("/test/repo".to_owned(), r))
+            .collect()
+    }
+
     #[test]
     fn rank_rows_handles_dominant_dense_with_bm25_hits() -> Result<()> {
         use crate::config::{HybridWeights, SearchConfig};
@@ -599,6 +684,7 @@ mod tests {
             identifier_boost: 1.4,
             similarity_threshold: 0.30,
             min_score: 0.0,
+            cross_repos: Vec::new(),
         };
 
         let make_row = |name: &str, content: &str, vec: Vec<f32>| StoredChunk {
@@ -637,9 +723,10 @@ mod tests {
             top_k: 10,
             language_filter: None,
             path_prefix: None,
+            repos: Vec::new(),
         };
 
-        let results = rank_rows(query, rows, query_vector, config)?;
+        let results = rank_rows(query, label_rows(rows), query_vector, config)?;
         assert_eq!(results.len(), 2, "both chunks should pass the filter");
         assert_eq!(
             results[0].chunk.name.as_deref(),
@@ -664,6 +751,7 @@ mod tests {
             identifier_boost: 1.0,
             similarity_threshold: 0.0,
             min_score: 0.50,
+            cross_repos: Vec::new(),
         };
         let row = |name: &str, vector: Vec<f32>| StoredChunk {
             chunk_id: 0,
@@ -688,9 +776,10 @@ mod tests {
             top_k: 10,
             language_filter: None,
             path_prefix: None,
+            repos: Vec::new(),
         };
 
-        let results = rank_rows(query, rows, vec![1.0, 0.0, 0.0, 0.0], config)?;
+        let results = rank_rows(query, label_rows(rows), vec![1.0, 0.0, 0.0, 0.0], config)?;
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.name.as_deref(), Some("strong_match"));
         Ok(())
@@ -711,6 +800,7 @@ mod tests {
             identifier_boost: 1.4,
             similarity_threshold: 0.30,
             min_score: 0.0,
+            cross_repos: Vec::new(),
         };
 
         let make_row = |name: &str, content: &str, sim: f32| {
@@ -755,9 +845,10 @@ mod tests {
             top_k: 10,
             language_filter: None,
             path_prefix: None,
+            repos: Vec::new(),
         };
 
-        let results = rank_rows(query, rows, query_vector, config)?;
+        let results = rank_rows(query, label_rows(rows), query_vector, config)?;
         assert!(
             results.len() >= 2,
             "BM25 should match handle_session_start and others: got {} results",
@@ -821,6 +912,7 @@ mod tests {
                 top_k: 10,
                 language_filter: None,
                 path_prefix: None,
+                repos: Vec::new(),
             })
             .await;
 
@@ -842,10 +934,11 @@ mod tests {
                 top_k: 10,
                 language_filter: None,
                 path_prefix: None,
+                repos: Vec::new(),
             })
             .await;
         assert!(results.is_ok());
-        let results = results.ok().unwrap_or_else(|| unreachable!());
+        let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
         assert!(!results.is_empty());
         assert_eq!(results[0].chunk.name.as_deref(), Some("add"));
@@ -874,10 +967,11 @@ mod tests {
                 top_k: 10,
                 language_filter: None,
                 path_prefix: None,
+                repos: Vec::new(),
             })
             .await;
         assert!(results.is_ok());
-        let results = results.ok().unwrap_or_else(|| unreachable!());
+        let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
         assert!(!results.is_empty());
         assert!(results[0].stale);
@@ -901,10 +995,11 @@ mod tests {
                 top_k: 10,
                 language_filter: None,
                 path_prefix: None,
+                repos: Vec::new(),
             })
             .await;
         assert!(results.is_ok());
-        let results = results.ok().unwrap_or_else(|| unreachable!());
+        let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
         assert!(!results.is_empty());
         assert!(results[0].stale);
@@ -923,10 +1018,11 @@ mod tests {
                 top_k: 10,
                 language_filter: Some(vec![Language::Python]),
                 path_prefix: None,
+                repos: Vec::new(),
             })
             .await;
         assert!(results.is_ok());
-        let results = results.ok().unwrap_or_else(|| unreachable!());
+        let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
         assert!(results.is_empty());
     }
@@ -944,10 +1040,11 @@ mod tests {
                 top_k: 10,
                 language_filter: Some(vec![Language::Rust]),
                 path_prefix: Some(RelativePath::new("src/math")),
+                repos: Vec::new(),
             })
             .await;
         assert!(results.is_ok());
-        let results = results.ok().unwrap_or_else(|| unreachable!());
+        let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].chunk.file_path.as_str(), "src/math.rs");
@@ -966,10 +1063,11 @@ mod tests {
                 top_k: 10,
                 language_filter: None,
                 path_prefix: None,
+                repos: Vec::new(),
             })
             .await;
         assert!(results.is_ok());
-        let results = results.ok().unwrap_or_else(|| unreachable!());
+        let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
         let unique_paths = results
             .iter()
@@ -992,10 +1090,11 @@ mod tests {
                 top_k: 10,
                 language_filter: None,
                 path_prefix: None,
+                repos: Vec::new(),
             })
             .await;
         assert!(results.is_ok());
-        let results = results.ok().unwrap_or_else(|| unreachable!());
+        let results = results.ok().unwrap_or_else(|| unreachable!()).results;
 
         let lib_matches = results
             .iter()

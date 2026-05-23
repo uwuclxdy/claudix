@@ -245,6 +245,7 @@ fn default_global_config() -> &'static str {
 
 [search]
 # top_k = 10                     # default result count for search_code
+# cross_repos = [\"/path/to/another/repo\"]  # extra already-indexed repos to search read-only
 "
 }
 

@@ -80,22 +80,25 @@ pub(super) async fn handle_pre_tool_use(
         top_k: config.search.top_k,
         language_filter: None,
         path_prefix: None,
+        // Interception is active-only; cross-repo search is opt-in at the
+        // tool boundary, not when redirecting a Grep that mentions nothing.
+        repos: Vec::new(),
     };
     let project_root = project_root.to_path_buf();
     let config_arc = Arc::new(config.clone());
     let work = async move {
         let claudix = Claudix::new(project_root, config_arc).await?;
-        let results = claudix.search(search_query).await?;
-        Ok::<_, ClaudixError>(results)
+        let found = claudix.search(search_query).await?;
+        Ok::<_, ClaudixError>(found)
     };
 
     match tokio::time::timeout(Duration::from_millis(PRE_TOOL_USE_TIMEOUT_MS), work).await {
-        Ok(Ok(results)) => {
+        Ok(Ok(found)) => {
             write_cached_health(&health_cache_path, true);
-            if results.is_empty() {
+            if found.results.is_empty() {
                 Ok(None)
             } else {
-                Ok(Some(pre_tool_use_search_response(&query, results)))
+                Ok(Some(pre_tool_use_search_response(&query, found.results)))
             }
         }
         Ok(Err(_)) => {

@@ -42,6 +42,10 @@ pub struct SearchConfig {
     pub identifier_boost: f32,
     pub similarity_threshold: f32,
     pub min_score: f32,
+    /// Additional already-indexed repos to query alongside the active project,
+    /// read-only. Paths are not required to exist at load time; a missing or
+    /// unindexed one surfaces as a `RepoError` at search time.
+    pub cross_repos: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,6 +115,7 @@ impl Default for Config {
                 identifier_boost: 1.4,
                 similarity_threshold: 0.30,
                 min_score: 0.05,
+                cross_repos: Vec::new(),
             },
             hooks: HooksConfig {
                 intercept_grep: true,
@@ -318,6 +323,10 @@ impl Config {
                     .search
                     .min_score
                     .unwrap_or(defaults.search.min_score),
+                cross_repos: partial
+                    .search
+                    .cross_repos
+                    .unwrap_or(defaults.search.cross_repos),
             },
             hooks: HooksConfig {
                 intercept_grep: partial
@@ -670,5 +679,42 @@ index_dir = ".claudix/custom-index"
         };
 
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn reject_empty_string_entry_in_cross_repos() {
+        let mut config = Config::default();
+        config.search.cross_repos = vec!["/ok/path".to_owned(), "   ".to_owned()];
+
+        let error = validate(&config);
+        assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
+    fn accept_cross_repos_with_paths_that_do_not_exist() {
+        // Validation does NOT require paths to exist; missing/unindexed repos
+        // surface as RepoError at search time, not config-load time.
+        let mut config = Config::default();
+        config.search.cross_repos = vec![
+            "/definitely/does/not/exist".to_owned(),
+            "/another/missing".to_owned(),
+        ];
+
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn cross_repos_parses_from_search_section_toml() {
+        let text = r#"
+[search]
+cross_repos = ["/path/one", "/path/two"]
+"#;
+        let parsed: std::result::Result<PartialConfig, toml::de::Error> = toml::from_str(text);
+        assert!(parsed.is_ok());
+        let parsed = parsed.ok().unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            parsed.search.cross_repos.as_deref(),
+            Some(["/path/one".to_owned(), "/path/two".to_owned()].as_slice())
+        );
     }
 }

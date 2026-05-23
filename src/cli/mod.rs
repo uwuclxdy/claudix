@@ -2,7 +2,7 @@ mod input;
 mod install;
 mod watch;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +37,8 @@ pub use watch::run_watch;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchHit {
+    /// Canonical path of the repo this hit came from.
+    pub repo: String,
     pub file_path: String,
     pub language: String,
     pub kind: String,
@@ -50,6 +52,9 @@ pub struct SearchHit {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DirectoryGroup {
+    /// Canonical repo path the directory belongs to. Same-named directories in
+    /// different repos do not merge — the group key is `(repo, directory)`.
+    pub repo: String,
     pub directory: String,
     pub hits: Vec<SearchHit>,
 }
@@ -57,6 +62,9 @@ pub struct DirectoryGroup {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchOutput {
     pub groups: Vec<DirectoryGroup>,
+    /// Repos that could not be searched (unindexed, mismatched, missing).
+    /// Empty for single-repo searches.
+    pub repo_errors: Vec<RepoError>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -517,15 +525,32 @@ pub async fn run_search(
     top_k: Option<usize>,
     language_filter: Option<Vec<String>>,
     path_prefix: Option<String>,
+    repos: Option<Vec<String>>,
 ) -> Result<SearchOutput> {
     validate_search_query(&query)?;
     let project_root = canonical_project_root(project_root.as_ref())?;
     let config = config::load(&project_root)?;
     let top_k = top_k.unwrap_or(config.search.top_k);
     validate_search_top_k(top_k)?;
+    // Active project is always in scope; union the config cross_repos with the
+    // per-call repos, deduped at search time by canonical path.
+    let repos = effective_cross_repos(&config.search.cross_repos, repos);
     let claudix = Claudix::new(project_root, Arc::new(config)).await?;
 
-    run_search_with_claudix(&claudix, query, top_k, language_filter, path_prefix).await
+    run_search_with_claudix(&claudix, query, top_k, language_filter, path_prefix, repos).await
+}
+
+/// Union the configured `cross_repos` with the per-call `repos`, preserving
+/// order and dropping exact-string duplicates. Canonical-path dedup happens
+/// later in the searcher (it needs to resolve each path through the store).
+fn effective_cross_repos(cross_repos: &[String], repos: Option<Vec<String>>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    cross_repos
+        .iter()
+        .cloned()
+        .chain(repos.into_iter().flatten())
+        .filter(|repo| seen.insert(repo.clone()))
+        .collect()
 }
 
 pub async fn run_index(project_root: impl AsRef<Path>, progress: bool) -> Result<IndexOutput> {
@@ -683,23 +708,29 @@ async fn run_search_with_claudix(
     top_k: usize,
     language_filter: Option<Vec<String>>,
     path_prefix: Option<String>,
+    repos: Vec<String>,
 ) -> Result<SearchOutput> {
     let query = SearchQuery {
         query,
         top_k,
         language_filter: parse_language_filter(language_filter)?,
         path_prefix: parse_path_prefix(path_prefix)?,
+        repos,
     };
-    let results = claudix.search(query).await?;
+    let found = claudix.search(query).await?;
 
     // Walk hits in score order (results is already score-desc from search).
-    // Bucket by directory preserving first-seen order so the first directory
+    // Bucket by (repo, directory) preserving first-seen order so the first key
     // encountered owns the top hit — groups naturally ordered by best score.
-    let mut dir_index: Vec<String> = Vec::new();
-    let mut dir_hits: HashMap<String, Vec<SearchHit>> = HashMap::new();
+    // Keying on repo too keeps same-named directories in different repos apart.
+    let mut group_index: Vec<(String, String)> = Vec::new();
+    let mut grouped: HashMap<(String, String), Vec<SearchHit>> = HashMap::new();
 
-    for result in results {
+    for result in found.results {
+        let dir = immediate_parent_dir(result.chunk.file_path.as_str());
+        let key = (result.repo.clone(), dir);
         let hit = SearchHit {
+            repo: result.repo,
             file_path: result.chunk.file_path.to_string(),
             language: result.chunk.language.to_string(),
             kind: result.chunk.kind.to_string(),
@@ -710,25 +741,29 @@ async fn run_search_with_claudix(
             stale: result.stale,
             snippet: result.chunk.content,
         };
-        let dir = immediate_parent_dir(&hit.file_path);
-        if !dir_hits.contains_key(&dir) {
-            dir_index.push(dir.clone());
+        if !grouped.contains_key(&key) {
+            group_index.push(key.clone());
         }
-        dir_hits.entry(dir).or_default().push(hit);
+        grouped.entry(key).or_default().push(hit);
     }
 
-    let groups = dir_index
+    let groups = group_index
         .into_iter()
-        .filter_map(|dir| {
-            let hits = dir_hits.remove(&dir)?;
+        .filter_map(|key| {
+            let hits = grouped.remove(&key)?;
+            let (repo, directory) = key;
             Some(DirectoryGroup {
-                directory: dir,
+                repo,
+                directory,
                 hits,
             })
         })
         .collect();
 
-    Ok(SearchOutput { groups })
+    Ok(SearchOutput {
+        groups,
+        repo_errors: found.repo_errors,
+    })
 }
 
 async fn status_from_store(store: &Store, config: &crate::config::Config) -> Result<StatusOutput> {
@@ -869,8 +904,15 @@ mod tests {
         assert!(harness.is_ok());
         let harness = harness.ok().unwrap_or_else(|| unreachable!());
 
-        let output =
-            run_search_with_claudix(&harness.claudix, "add".to_owned(), 5, None, None).await;
+        let output = run_search_with_claudix(
+            &harness.claudix,
+            "add".to_owned(),
+            5,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
         assert!(output.is_ok());
         let output = output.ok().unwrap_or_else(|| unreachable!());
 
@@ -892,6 +934,7 @@ mod tests {
             5,
             Some(vec!["rust".to_owned()]),
             Some(RelativePath::new("src/math").to_string()),
+            Vec::new(),
         )
         .await;
         assert!(output.is_ok());
@@ -1170,8 +1213,15 @@ mod tests {
         // "greet add" spans both src/lib.rs and src/math.rs — two directories
         // are both under "src", so we expect exactly one group named "src".
         // The small_rust fixture has all files under src/, so one group.
-        let output =
-            run_search_with_claudix(&harness.claudix, "add greet".to_owned(), 10, None, None).await;
+        let output = run_search_with_claudix(
+            &harness.claudix,
+            "add greet".to_owned(),
+            10,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
         assert!(output.is_ok());
         let output = output.ok().unwrap_or_else(|| unreachable!());
 
@@ -1208,8 +1258,15 @@ mod tests {
         assert!(harness.is_ok());
         let harness = harness.ok().unwrap_or_else(|| unreachable!());
 
-        let output =
-            run_search_with_claudix(&harness.claudix, "add".to_owned(), 5, None, None).await;
+        let output = run_search_with_claudix(
+            &harness.claudix,
+            "add".to_owned(),
+            5,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
         assert!(output.is_ok());
         let output = output.ok().unwrap_or_else(|| unreachable!());
 
@@ -1498,5 +1555,355 @@ mod tests {
             has_cross_repo,
             "at least one pair must span two different repos"
         );
+    }
+
+    // ── cross-repo search tests (Feature 6) ─────────────────────────────────
+
+    /// Write `.claude/claudix.toml` into a fixture so `config::load` doesn't
+    /// fall through to the user's global config (which on dev machines may
+    /// point at a real embedding model that doesn't match the stub index).
+    fn write_fixture_config(project_root: &Path, config: &Config) -> Result<()> {
+        let claude_dir = project_root.join(".claude");
+        fs::create_dir_all(&claude_dir).map_err(ClaudixError::from)?;
+        let text = toml::to_string(config)
+            .map_err(|e| ClaudixError::Store(format!("serialize stub config: {e}")))?;
+        fs::write(claude_dir.join("claudix.toml"), text).map_err(ClaudixError::from)?;
+        Ok(())
+    }
+
+    /// Set up two repos backed by the small_rust fixture and indexed with the
+    /// same stub model so their vectors are comparable. Returns the canonical
+    /// path of each. Caller passes one as `project_root`, the other as `repos`.
+    async fn dual_repo_harness() -> Result<(TestFixture, TestFixture, String, String)> {
+        let fixture_a = TestFixture::new("small_rust")?;
+        let fixture_b = TestFixture::new("small_rust")?;
+        let config = stub_config();
+
+        let claudix_a = test_claudix(fixture_a.root().to_path_buf(), config.clone())?;
+        index_fixture(
+            &claudix_a.store,
+            claudix_a.embedder.as_ref(),
+            claudix_a.project_root(),
+            &config,
+        )
+        .await?;
+        write_fixture_config(fixture_a.root(), &config)?;
+
+        let claudix_b = test_claudix(fixture_b.root().to_path_buf(), config.clone())?;
+        index_fixture(
+            &claudix_b.store,
+            claudix_b.embedder.as_ref(),
+            claudix_b.project_root(),
+            &config,
+        )
+        .await?;
+        write_fixture_config(fixture_b.root(), &config)?;
+
+        let repo_a = fixture_a.root().display().to_string();
+        let repo_b = fixture_b.root().display().to_string();
+        Ok((fixture_a, fixture_b, repo_a, repo_b))
+    }
+
+    #[tokio::test]
+    async fn search_spans_active_and_listed_repo_with_correct_labels() {
+        let setup = dual_repo_harness().await;
+        assert!(setup.is_ok());
+        let (fixture_a, _fixture_b, repo_a, repo_b) = setup.ok().unwrap_or_else(|| unreachable!());
+
+        let output = run_search(
+            fixture_a.root(),
+            "add".to_owned(),
+            Some(10),
+            None,
+            None,
+            Some(vec![repo_b.clone()]),
+        )
+        .await;
+        assert!(output.is_ok(), "cross-repo search failed: {output:?}");
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(output.repo_errors.is_empty(), "no errors expected");
+
+        // Hits surface from both repos, each correctly labeled.
+        let from_a = output
+            .groups
+            .iter()
+            .flat_map(|g| g.hits.iter())
+            .any(|h| h.repo == repo_a);
+        let from_b = output
+            .groups
+            .iter()
+            .flat_map(|g| g.hits.iter())
+            .any(|h| h.repo == repo_b);
+        assert!(
+            from_a,
+            "expected at least one hit from active repo {repo_a}"
+        );
+        assert!(from_b, "expected at least one hit from extra repo {repo_b}");
+
+        // Every hit's repo equals its group's repo.
+        for group in &output.groups {
+            for hit in &group.hits {
+                assert_eq!(
+                    hit.repo, group.repo,
+                    "hit/group repo mismatch in directory {}",
+                    group.directory
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn search_partial_success_on_unindexed_repo() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        let write = write_fixture_config(harness.claudix.project_root(), &stub_config());
+        assert!(write.is_ok());
+
+        let unindexed = "/tmp/nonexistent-claudix-cross-repo-search-9999".to_owned();
+        let output = run_search(
+            harness.claudix.project_root(),
+            "add".to_owned(),
+            Some(10),
+            None,
+            None,
+            Some(vec![unindexed.clone()]),
+        )
+        .await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        // Unindexed path surfaces as a RepoError; the active repo still returns hits.
+        assert!(
+            output.repo_errors.iter().any(|e| e.repo == unindexed
+                || e.error.contains("not indexed")
+                || e.error.contains("No such")),
+            "expected RepoError for unindexed path; got: {:?}",
+            output.repo_errors,
+        );
+        assert!(
+            !output.groups.is_empty(),
+            "active repo must still produce hits despite the error"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_partial_success_on_model_mismatch() {
+        let fixture_a = TestFixture::new("small_rust");
+        assert!(fixture_a.is_ok());
+        let fixture_a = fixture_a.ok().unwrap_or_else(|| unreachable!());
+        let fixture_b = TestFixture::new("small_rust");
+        assert!(fixture_b.is_ok());
+        let fixture_b = fixture_b.ok().unwrap_or_else(|| unreachable!());
+
+        // Active repo uses stub-v1; extra repo uses stub-v2 → mismatch.
+        let config_a = stub_config();
+        let config_b = {
+            let mut c = stub_config();
+            c.embedding.model = "stub-v2".to_owned();
+            c
+        };
+
+        let claudix_a = test_claudix(fixture_a.root().to_path_buf(), config_a.clone());
+        assert!(claudix_a.is_ok());
+        let claudix_a = claudix_a.ok().unwrap_or_else(|| unreachable!());
+        let _ = index_fixture(
+            &claudix_a.store,
+            claudix_a.embedder.as_ref(),
+            claudix_a.project_root(),
+            &config_a,
+        )
+        .await;
+        let write_a = write_fixture_config(fixture_a.root(), &config_a);
+        assert!(write_a.is_ok());
+
+        let claudix_b = test_claudix(fixture_b.root().to_path_buf(), config_b.clone());
+        assert!(claudix_b.is_ok());
+        let claudix_b = claudix_b.ok().unwrap_or_else(|| unreachable!());
+        let _ = index_fixture(
+            &claudix_b.store,
+            claudix_b.embedder.as_ref(),
+            claudix_b.project_root(),
+            &config_b,
+        )
+        .await;
+        let write_b = write_fixture_config(fixture_b.root(), &config_b);
+        assert!(write_b.is_ok());
+
+        let repo_b = fixture_b.root().display().to_string();
+        let output = run_search(
+            fixture_a.root(),
+            "add".to_owned(),
+            Some(10),
+            None,
+            None,
+            Some(vec![repo_b.clone()]),
+        )
+        .await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(
+            output
+                .repo_errors
+                .iter()
+                .any(|e| e.error.contains("mismatch")),
+            "expected mismatch error for extra repo; got: {:?}",
+            output.repo_errors,
+        );
+        // Active repo still returns hits.
+        assert!(
+            !output.groups.is_empty(),
+            "active repo hits must survive a sibling repo's mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_dedupes_active_when_listed_in_repos() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        let write = write_fixture_config(harness.claudix.project_root(), &stub_config());
+        assert!(write.is_ok());
+
+        // Baseline: no extra repos.
+        let baseline = run_search(
+            harness.claudix.project_root(),
+            "add".to_owned(),
+            Some(10),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(baseline.is_ok());
+        let baseline = baseline.ok().unwrap_or_else(|| unreachable!());
+        let baseline_hits: usize = baseline.groups.iter().map(|g| g.hits.len()).sum();
+
+        // List the active repo path explicitly — must not double-count.
+        let active_path = harness.claudix.project_root().display().to_string();
+        let echoed = run_search(
+            harness.claudix.project_root(),
+            "add".to_owned(),
+            Some(10),
+            None,
+            None,
+            Some(vec![active_path]),
+        )
+        .await;
+        assert!(echoed.is_ok());
+        let echoed = echoed.ok().unwrap_or_else(|| unreachable!());
+        let echoed_hits: usize = echoed.groups.iter().map(|g| g.hits.len()).sum();
+
+        assert_eq!(
+            baseline_hits, echoed_hits,
+            "listing active path must not duplicate hits"
+        );
+        assert!(echoed.repo_errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_groups_separate_same_named_dirs_per_repo() {
+        let setup = dual_repo_harness().await;
+        assert!(setup.is_ok());
+        let (fixture_a, _fixture_b, _repo_a, repo_b) = setup.ok().unwrap_or_else(|| unreachable!());
+
+        let output = run_search(
+            fixture_a.root(),
+            "add".to_owned(),
+            Some(20),
+            None,
+            None,
+            Some(vec![repo_b]),
+        )
+        .await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        // Both repos have a "src" directory; the grouping must keep them apart.
+        let src_groups: Vec<&DirectoryGroup> = output
+            .groups
+            .iter()
+            .filter(|g| g.directory == "src")
+            .collect();
+        assert!(
+            src_groups.len() >= 2,
+            "expected two distinct 'src' groups (one per repo), got {}",
+            src_groups.len(),
+        );
+        let repos: HashSet<&str> = src_groups.iter().map(|g| g.repo.as_str()).collect();
+        assert!(
+            repos.len() >= 2,
+            "src groups must come from distinct repos, got: {:?}",
+            repos,
+        );
+    }
+
+    #[tokio::test]
+    async fn search_does_not_write_into_extra_repo() {
+        let setup = dual_repo_harness().await;
+        assert!(setup.is_ok());
+        let (fixture_a, fixture_b, _repo_a, repo_b) = setup.ok().unwrap_or_else(|| unreachable!());
+
+        // Snapshot the extra repo's .claudix state-dir tree before the search.
+        let state_dir = fixture_b.root().join(".claudix");
+        let before = snapshot_paths(&state_dir);
+
+        let output = run_search(
+            fixture_a.root(),
+            "add".to_owned(),
+            Some(10),
+            None,
+            None,
+            Some(vec![repo_b]),
+        )
+        .await;
+        assert!(output.is_ok());
+
+        let after = snapshot_paths(&state_dir);
+        assert_eq!(
+            before, after,
+            "cross-repo search must not write into the extra repo's .claudix dir",
+        );
+    }
+
+    /// Snapshot every file path and its byte length under `dir` (recursive).
+    /// Used to assert read-only behavior: nothing in the snapshot changes.
+    fn snapshot_paths(dir: &Path) -> std::collections::BTreeSet<(PathBuf, u64)> {
+        fn walk(dir: &Path, into: &mut std::collections::BTreeSet<(PathBuf, u64)>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if metadata.is_dir() {
+                    walk(&path, into);
+                } else {
+                    into.insert((path, metadata.len()));
+                }
+            }
+        }
+        let mut set = std::collections::BTreeSet::new();
+        walk(dir, &mut set);
+        set
+    }
+
+    #[test]
+    fn effective_cross_repos_orders_config_then_call_args() {
+        let cfg = vec!["/cfg/a".to_owned(), "/cfg/b".to_owned()];
+        let call = Some(vec!["/cfg/b".to_owned(), "/call/c".to_owned()]);
+        let merged = effective_cross_repos(&cfg, call);
+        // Config first, call second, exact-string duplicates dropped.
+        assert_eq!(merged, vec!["/cfg/a", "/cfg/b", "/call/c"]);
+    }
+
+    #[test]
+    fn effective_cross_repos_empty_when_both_empty() {
+        let merged = effective_cross_repos(&[], None);
+        assert!(merged.is_empty());
     }
 }

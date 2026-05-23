@@ -38,6 +38,12 @@ enum Command {
         language_filter: Vec<String>,
         #[arg(long, help = "Restrict results to paths starting with this prefix")]
         path_prefix: Option<String>,
+        #[arg(
+            long = "repo",
+            help = "Additional already-indexed repo path to search read-only; repeatable. \
+                    The active project is always included."
+        )]
+        repos: Vec<String>,
     },
     #[command(about = "Show index status (chunk count, model, last indexed)")]
     Status,
@@ -127,6 +133,7 @@ async fn run() -> Result<()> {
             top_k,
             language_filter,
             path_prefix,
+            repos,
         } => {
             let output = cli::run_search(
                 &project_root,
@@ -138,11 +145,29 @@ async fn run() -> Result<()> {
                     Some(language_filter)
                 },
                 path_prefix,
+                if repos.is_empty() { None } else { Some(repos) },
             )
             .await?;
 
+            for err in &output.repo_errors {
+                eprintln!("warning: {} — {}", err.repo, err.error);
+            }
+
+            // Only label groups with their repo when results span more than one.
+            let multi_repo = output
+                .groups
+                .iter()
+                .map(|g| g.repo.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1;
+
             for group in output.groups {
-                println!("{}:", group.directory);
+                if multi_repo {
+                    println!("{} :: {}:", group.repo, group.directory);
+                } else {
+                    println!("{}:", group.directory);
+                }
                 for hit in group.hits {
                     let stale_warning = stale_warning(hit.stale);
                     match hit.name {
