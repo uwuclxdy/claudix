@@ -48,8 +48,7 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
                 take_change_neighbors_context(project_root, config.as_ref(), "UserPromptSubmit");
             Ok(combine_hook_responses(
                 "UserPromptSubmit",
-                index_ready,
-                neighbors,
+                [index_ready, neighbors],
             ))
         }
     }

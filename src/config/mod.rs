@@ -58,7 +58,9 @@ pub struct HooksConfig {
     pub auto_index_on_session_start: bool,
     /// Surface semantically related code after an edit. Set false to disable.
     pub surface_related_on_edit: bool,
-    /// Maximum number of related-code hits surfaced per edit.
+    /// Surface semantically related code after a ranged read. Opt-in, default false.
+    pub surface_related_on_read: bool,
+    /// Maximum number of related-code hits surfaced per edit or read.
     pub related_top_k: usize,
     /// Cosine similarity floor for related-code hits (0.0–1.0).
     pub related_min_similarity: f32,
@@ -115,6 +117,7 @@ impl Default for Config {
                 auto_reembed_on_edit: true,
                 auto_index_on_session_start: true,
                 surface_related_on_edit: true,
+                surface_related_on_read: false,
                 related_top_k: 5,
                 related_min_similarity: 0.65,
             },
@@ -333,6 +336,10 @@ impl Config {
                     .hooks
                     .surface_related_on_edit
                     .unwrap_or(defaults.hooks.surface_related_on_edit),
+                surface_related_on_read: partial
+                    .hooks
+                    .surface_related_on_read
+                    .unwrap_or(defaults.hooks.surface_related_on_read),
                 related_top_k: partial
                     .hooks
                     .related_top_k

@@ -83,6 +83,8 @@ pub struct PartialHooksConfig {
     #[serde(default)]
     pub surface_related_on_edit: Option<bool>,
     #[serde(default)]
+    pub surface_related_on_read: Option<bool>,
+    #[serde(default)]
     pub related_top_k: Option<usize>,
     #[serde(default)]
     pub related_min_similarity: Option<f32>,
@@ -167,6 +169,9 @@ impl PartialHooksConfig {
             surface_related_on_edit: other
                 .surface_related_on_edit
                 .or(self.surface_related_on_edit),
+            surface_related_on_read: other
+                .surface_related_on_read
+                .or(self.surface_related_on_read),
             related_top_k: other.related_top_k.or(self.related_top_k),
             related_min_similarity: other.related_min_similarity.or(self.related_min_similarity),
         }

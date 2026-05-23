@@ -11,6 +11,10 @@ pub(super) struct HookPayload {
 pub(super) struct ToolInput {
     pub file_path: Option<String>,
     pub notebook_path: Option<String>,
+    /// Read tool 1-based start line.
+    pub offset: Option<u32>,
+    /// Read tool line count starting at `offset`.
+    pub limit: Option<u32>,
     pub pattern: Option<String>,
     pub command: Option<String>,
     pub path: Option<String>,

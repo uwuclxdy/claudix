@@ -6,13 +6,17 @@ use serde_json::{Value, json};
 use crate::config::{self, Config};
 use crate::enumeration::WatchFilter;
 use crate::error::Result;
+use crate::search::neighbors::neighbors;
 use crate::store::Store;
 use crate::store::marker::change_neighbors;
+use crate::types::RelativePath;
 
-use super::payload::HookPayload;
+use super::payload::{HookPayload, ToolInput};
 use super::ready_check::check_index_ready;
 use super::spawn::spawn_background_reindex_file;
 use crate::store::marker::WATCH_MARKER_STALE_SECS;
+
+const READ_NEIGHBOR_RECOVERY: &str = "Read a path inside the project root";
 
 pub(super) async fn handle_post_tool_use(
     project_root: &Path,
@@ -20,37 +24,181 @@ pub(super) async fn handle_post_tool_use(
 ) -> Result<Option<Value>> {
     let config = config::load(project_root).ok();
 
+    // `Read` rides this hook too (see hooks.json matcher) purely for read-time
+    // surfacing — it must NEVER spawn a reindex. The edit tools below do.
+    let tool_name = payload.tool_name.as_deref();
+
     // Spawn a background reindex only when an edit tool fired on a real file.
     // The ready-check and neighbor-surfacing runs on every PostToolUse event
     // regardless of whether a spawn happened.
-    if let Some(tool_name) = payload.tool_name.as_deref()
-        && matches!(tool_name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
+    let read_input = if let Some(name) = tool_name
+        && matches!(name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
         && !watcher_alive(project_root, cfg)
-        && let Some(input) = payload.tool_input
-        && let Some(file_path) = input.file_path.or(input.notebook_path)
-        && reindex_target_is_watchable(project_root, &file_path)
+        && let Some(input) = payload.tool_input.as_ref()
+        && let Some(file_path) = input
+            .file_path
+            .as_deref()
+            .or(input.notebook_path.as_deref())
+        && reindex_target_is_watchable(project_root, file_path)
     {
-        spawn_background_reindex_file(project_root, &file_path);
-    }
+        spawn_background_reindex_file(project_root, file_path);
+        None
+    } else {
+        payload.tool_input
+    };
 
-    // Prefer not to drop either message: if both an index-ready notification
-    // and a neighbors notification are pending, combine them into a single
-    // additionalContext so the agent sees both in one hook response. The
-    // index-ready message goes first (more urgent); neighbors append after.
+    // Prefer not to drop any message: index-ready, change-neighbors, and
+    // read-neighbors are all surfaced together. Index-ready goes first (most
+    // urgent); the rest append in order.
     let index_ready = config
         .as_ref()
         .and_then(|cfg| check_index_ready(project_root, cfg, "PostToolUse"));
 
-    let neighbors_context =
+    let change_neighbors =
         take_change_neighbors_context(project_root, config.as_ref(), "PostToolUse");
+
+    let read_neighbors = read_surfacing_context(
+        project_root,
+        config.as_ref(),
+        tool_name,
+        read_input.as_ref(),
+        "PostToolUse",
+    )
+    .await;
 
     Ok(combine_hook_responses(
         "PostToolUse",
-        index_ready,
-        neighbors_context,
+        [index_ready, change_neighbors, read_neighbors],
     ))
+}
+
+/// Surface code semantically related to a ranged `Read`.
+///
+/// Fast flag-off path: when `surface_related_on_read` is false (the default),
+/// this returns before any store read or cosine scan — flag-off users pay only
+/// the process spawn + config load this hook costs.
+///
+/// Range semantics: `start = offset.unwrap_or(1)`; `end` is `offset + limit - 1`
+/// when `limit` is present, else open-ended (window runs to EOF). A chunk's
+/// `[line_start, line_end]` overlaps the window when it starts at or before
+/// `end` (if bounded) and ends at or after `start`. A full-file read (neither
+/// `offset` nor `limit`) is a deliberate noop — surfacing is tied to a focused
+/// region the agent narrowed to.
+///
+/// Reuses [`neighbors`] over the read file's stored vectors — no embedding call.
+/// Fail-open: any error behaves as a noop.
+async fn read_surfacing_context(
+    project_root: &Path,
+    config: Option<&Config>,
+    tool_name: Option<&str>,
+    tool_input: Option<&ToolInput>,
+    event_name: &str,
+) -> Option<Value> {
+    if tool_name != Some("Read") {
+        return None;
+    }
+    let cfg = config?;
+    if !cfg.hooks.surface_related_on_read {
+        return None;
+    }
+
+    let input = tool_input?;
+    let file_path = input.file_path.as_deref()?;
+    // Full-file read (no offset/limit) → noop.
+    if input.offset.is_none() && input.limit.is_none() {
+        return None;
+    }
+
+    // Claude Code typically sends absolute paths. Strip the project root to get
+    // a relative path so it matches what the store indexes. Reject anything that
+    // escapes the project root (absolute path outside the root, or `..` traversal).
+    let raw = Path::new(file_path);
+    let relative = if raw.is_absolute() {
+        let raw_canonical = raw.canonicalize();
+        let raw_absolute = raw_canonical.as_deref().unwrap_or(raw);
+        let root_canonical = project_root.canonicalize();
+        let root_absolute = root_canonical.as_deref().unwrap_or(project_root);
+        raw_absolute.strip_prefix(root_absolute).ok()?.to_path_buf()
+    } else {
+        raw.to_path_buf()
+    };
+    let read_path = RelativePath::from_path(&relative);
+    read_path.reject_escape(READ_NEIGHBOR_RECOVERY).ok()?;
+
+    let start = input.offset.unwrap_or(1);
+    let end = input.limit.map(|count| start + count.saturating_sub(1));
+
+    let store = Store::new(project_root, cfg).ok()?;
+    let all_rows = store.read_chunks().await.ok()?;
+
+    let query_vectors: Vec<Vec<f32>> = all_rows
+        .iter()
+        .filter(|row| row.file_path == read_path.as_str())
+        .filter(|row| chunk_overlaps_window(row.line_start, row.line_end, start, end))
+        .map(|row| row.vector.clone())
+        .collect();
+    if query_vectors.is_empty() {
+        return None;
+    }
+
+    let exclude = read_path.clone();
+    let top_k = cfg.hooks.related_top_k;
+    let min_similarity = cfg.hooks.related_min_similarity;
+    let hits = tokio::task::spawn_blocking(move || {
+        neighbors(&all_rows, &query_vectors, &exclude, top_k, min_similarity)
+    })
+    .await
+    .ok()?;
+    if hits.is_empty() {
+        return None;
+    }
+
+    let locations: Vec<String> = hits
+        .iter()
+        .map(|n| {
+            let name_part = n
+                .name
+                .as_deref()
+                .map(|name| format!(" `{name}`"))
+                .unwrap_or_default();
+            format!(
+                "{}:{}-{}{} ({:.2})",
+                n.file_path, n.line_start, n.line_end, name_part, n.score
+            )
+        })
+        .collect();
+
+    let region = match end {
+        Some(end) => format!("lines {start}-{end}"),
+        None => format!("lines {start}+"),
+    };
+    let context = format!(
+        "claudix: code related to {region} of `{}`: {}",
+        read_path.as_str(),
+        locations.join("; "),
+    );
+
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": event_name,
+            "additionalContext": context,
+        }
+    }))
+}
+
+/// Whether a chunk's inclusive `[chunk_start, chunk_end]` line span overlaps the
+/// read window `[window_start, window_end]`. `window_end == None` is open-ended
+/// (runs to EOF), so only the lower bound constrains the chunk.
+fn chunk_overlaps_window(
+    chunk_start: u32,
+    chunk_end: u32,
+    window_start: u32,
+    window_end: Option<u32>,
+) -> bool {
+    let starts_in_range = window_end.is_none_or(|end| chunk_start <= end);
+    starts_in_range && chunk_end >= window_start
 }
 
 /// Read and ack the change-neighbors marker, returning formatted additionalContext.
@@ -104,28 +252,29 @@ pub(super) fn take_change_neighbors_context(
     }))
 }
 
-/// Combine an index-ready response and a neighbors response into one.
+/// Merge several hook responses into one `additionalContext`.
 ///
-/// Both can be `None` → `None`. Both present → index-ready context is
-/// emitted first; neighbors appended in the same additionalContext field.
-/// Only one present → that one wins unchanged.
+/// Sources are joined in the order given, so callers pass the most urgent
+/// first (index-ready before neighbor surfacing). Absent sources are skipped;
+/// all-absent → `None`; a single present source is returned unchanged.
 pub(super) fn combine_hook_responses(
     event_name: &str,
-    index_ready: Option<Value>,
-    neighbors: Option<Value>,
+    sources: impl IntoIterator<Item = Option<Value>>,
 ) -> Option<Value> {
-    match (index_ready, neighbors) {
-        (None, None) => None,
-        (Some(ready), None) => Some(ready),
-        (None, Some(nbr)) => Some(nbr),
-        (Some(ready), Some(nbr)) => {
-            let ready_ctx = ready["hookSpecificOutput"]["additionalContext"]
-                .as_str()
-                .unwrap_or("");
-            let nbr_ctx = nbr["hookSpecificOutput"]["additionalContext"]
-                .as_str()
-                .unwrap_or("");
-            let combined = format!("{ready_ctx}\n{nbr_ctx}");
+    let present: Vec<Value> = sources.into_iter().flatten().collect();
+    match present.as_slice() {
+        [] => None,
+        [single] => Some(single.clone()),
+        many => {
+            let combined = many
+                .iter()
+                .map(|value| {
+                    value["hookSpecificOutput"]["additionalContext"]
+                        .as_str()
+                        .unwrap_or("")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             Some(json!({
                 "hookSpecificOutput": {
                     "hookEventName": event_name,
@@ -585,6 +734,362 @@ mod tests {
         assert!(
             context.contains("src/math.rs"),
             "combined context must include neighbor file, got: {context}"
+        );
+        Ok(())
+    }
+
+    // ── read-time surfacing ─────────────────────────────────────────────────
+
+    /// Seed the store directly with chunks at explicit line ranges and vectors,
+    /// bypassing embedding so cosine similarities are fully controlled.
+    async fn seed_rows(store: &Store, config: &Config, rows: &[(&str, &str, u32, u32, Vec<f32>)]) {
+        use crate::types::{
+            ByteRange, Chunk, ChunkId, ChunkKind, EmbeddedChunk, FileHash, Language, LineRange,
+            RelativePath,
+        };
+        let embedded: Vec<EmbeddedChunk> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (path, name, start, end, vector))| {
+                let chunk = Chunk {
+                    id: ChunkId(i as u64 + 1),
+                    file_path: RelativePath::new(*path),
+                    language: Language::Rust,
+                    kind: ChunkKind::Function,
+                    name: Some((*name).to_owned()),
+                    line_range: LineRange {
+                        start: *start,
+                        end: *end,
+                    },
+                    byte_range: ByteRange { start: 0, end: 50 },
+                    file_hash: FileHash([0u8; 16]),
+                    content: format!("pub fn {name}() {{}}"),
+                };
+                EmbeddedChunk {
+                    chunk,
+                    vector: vector.clone(),
+                }
+            })
+            .collect();
+        assert!(store.replace_chunks(&embedded, config).await.is_ok());
+    }
+
+    fn read_config_on() -> Config {
+        let mut config = stub_config();
+        config.hooks.surface_related_on_read = true;
+        config.hooks.related_top_k = 5;
+        config.hooks.related_min_similarity = 0.5;
+        config
+    }
+
+    #[test]
+    fn chunk_overlaps_window_respects_bounds() {
+        // Bounded window [10, 20].
+        assert!(
+            chunk_overlaps_window(8, 12, 10, Some(20)),
+            "straddles start"
+        );
+        assert!(chunk_overlaps_window(15, 18, 10, Some(20)), "inside window");
+        assert!(chunk_overlaps_window(18, 25, 10, Some(20)), "straddles end");
+        assert!(!chunk_overlaps_window(1, 9, 10, Some(20)), "ends before");
+        assert!(!chunk_overlaps_window(21, 30, 10, Some(20)), "starts after");
+        // Open-ended window [10, EOF]: only the lower bound constrains.
+        assert!(chunk_overlaps_window(50, 60, 10, None), "far below EOF");
+        assert!(!chunk_overlaps_window(1, 9, 10, None), "ends before start");
+    }
+
+    #[tokio::test]
+    async fn ranged_read_surfaces_related_neighbor_naming_region() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // The read file's chunk at lines 10-20 shares a near-duplicate vector
+        // with a chunk in another file; an unrelated chunk sits orthogonal.
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/other.rs",
+                    "unrelated",
+                    1,
+                    5,
+                    vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 12, "limit": 6 }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(
+            context.contains("src/bar.rs"),
+            "neighbor file must be surfaced, got: {context}"
+        );
+        assert!(
+            context.contains("lines 12-17"),
+            "context must name the read region, got: {context}"
+        );
+        assert!(
+            !context.contains("src/foo.rs:"),
+            "read file must not be listed as its own neighbor, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_read_absolute_path_surfaces_neighbor() -> Result<()> {
+        // Claude Code sends absolute paths in tool_input.file_path; verify they
+        // are resolved to relative before matching against the store.
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        // Use the absolute path as Claude Code would supply it.
+        let abs_path = fixture.root().join("src/foo.rs");
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": abs_path, "offset": 12, "limit": 6 }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(
+            context.contains("src/bar.rs"),
+            "absolute-path read must still surface the neighbor, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_file_read_is_noop() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        // No offset or limit → whole-file read → noop.
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs" }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(
+            response.is_none(),
+            "full-file read must not surface neighbors"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_read_with_nothing_related_is_noop() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // The read chunk's neighbor sits below the 0.5 floor (orthogonal vector).
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "stranger",
+                    40,
+                    58,
+                    vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 12, "limit": 6 }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(response.is_none(), "no neighbor clears the floor → noop");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn window_missing_chunk_span_yields_no_query_vectors() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Read file's only chunk spans 10-20; a near-duplicate exists elsewhere.
+        // The read window 1-5 misses the chunk entirely → no query vectors → noop,
+        // even though a strong neighbor exists.
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 1, "limit": 5 }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(
+            response.is_none(),
+            "window missing the chunk span must surface nothing"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_surfacing_disabled_by_default_skips_store() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        // Default config: surface_related_on_read = false.
+        let config = stub_config();
+        assert!(
+            !config.hooks.surface_related_on_read,
+            "read surfacing must default off"
+        );
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 12, "limit": 6 }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(
+            response.is_none(),
+            "flag off must surface nothing on a ranged read"
+        );
+        // The reindex invariant must hold regardless of the read flag: a Read
+        // never triggers a background reindex — no change-neighbors marker
+        // appears (that is only written by the reindex path).
+        assert!(
+            !store.change_neighbors_marker_path().exists(),
+            "Read must never trigger a reindex"
         );
         Ok(())
     }
