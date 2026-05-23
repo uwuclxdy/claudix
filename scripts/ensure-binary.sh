@@ -15,6 +15,9 @@ PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-${plugin_root_default}}"
 # prefer claude code's official per-plugin data dir; fall back for non-claude contexts
 CACHE_DIR="${CLAUDE_PLUGIN_DATA:-${CLAUDIX_HOME:-${XDG_DATA_HOME:-${HOME}/.local/share}/claudix}}"
 BIN_DIR="${CACHE_DIR}/bin"
+# where the stable `claudix` command symlink lands so the downloaded binary is
+# runnable from a shell; overridable for tests
+LOCAL_BIN="${CLAUDIX_LOCAL_BIN:-${HOME}/.local/bin}"
 LOCK_DIR="${CACHE_DIR}/install.lock"
 CLAUDIX_RELEASE_BASE_URL="${CLAUDIX_RELEASE_BASE_URL:-}"
 TEMP_DIR=""
@@ -165,6 +168,40 @@ gc_old_versions() {
   done <<< "$victims"
 }
 
+# drop a cargo-installed claudix so it isn't installed twice next to the
+# release binary; prefer `cargo uninstall`, fall back to removing the file
+remove_cargo_install() {
+  local cb
+  cb="$(cargo_bin_path)"
+  [[ -e "$cb" ]] || return 0
+  if command -v cargo >/dev/null 2>&1 \
+      && cargo uninstall "$PLUGIN_NAME" --quiet 2>/dev/null; then
+    log "removed duplicate cargo install of ${PLUGIN_NAME}"
+    return 0
+  fi
+  rm -f "$cb" 2>/dev/null && log "removed duplicate cargo binary ${cb}"
+}
+
+# point ${LOCAL_BIN}/claudix at the cached binary so `claudix` runs from a
+# shell, then drop any cargo duplicate. unix only — windows symlinks need
+# privileges and PATH works differently there.
+expose_command() {
+  local binary="$1" platform="$2"
+  [[ "$platform" == windows-* ]] && return 0
+
+  mkdir -p "$LOCAL_BIN" 2>/dev/null || return 0
+  local link="${LOCAL_BIN}/${PLUGIN_NAME}"
+  ln -sf "$binary" "$link" 2>/dev/null || return 0
+  log "linked ${link} -> $(basename "$binary")"
+
+  remove_cargo_install
+
+  case ":${PATH}:" in
+    *":${LOCAL_BIN}:"*) ;;
+    *) log "add ${LOCAL_BIN} to PATH to run '${PLUGIN_NAME}' from your shell" ;;
+  esac
+}
+
 install_from_release() {
   local version="$1" platform="$2"
   local asset binary base_url
@@ -190,6 +227,7 @@ install_from_release() {
   mv "$asset_path" "$binary"
   log "installed claudix v${version} for ${platform}"
   gc_old_versions "$platform"
+  expose_command "$binary" "$platform"
   printf '%s\n' "$binary"
 }
 
