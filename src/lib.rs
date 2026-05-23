@@ -29,7 +29,11 @@ use embedding::bundled::{BUNDLED_DIMENSIONS, BUNDLED_MODEL_ID};
 use embedding::{BundledProvider, FallbackProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator, WatchFilter};
 use error::RecoveryHint;
+use search::neighbors::neighbors;
 use search::{SearchQuery, SearchResult, Searcher};
+use store::marker::change_neighbors::{
+    ChangeNeighborsMarker, NeighborEntry, write as write_neighbors_marker,
+};
 use store::{Store, stored_chunks_from_embedded};
 use tokio::{fs, task};
 use types::reject_path_escape;
@@ -224,15 +228,77 @@ impl Claudix {
                 .note_file_hash(&relative_path, file.file_hash.0, self.config.as_ref())?;
             stats
         } else {
-            self.store
+            let stats = self
+                .store
                 .replace_file_chunks(&embedded_chunks, self.config.as_ref())
-                .await?
+                .await?;
+            // Compute change-neighbors using the fresh vectors — no extra embed call.
+            // Fail-open: neighbor computation errors are discarded; the index is already updated.
+            if self.config.hooks.surface_related_on_edit {
+                self.write_change_neighbors_marker(&relative_path, &embedded_chunks)
+                    .await;
+            }
+            stats
         };
 
         Ok(IndexStats {
             file_count: stats.file_count,
             chunk_count: stats.chunk_count,
         })
+    }
+
+    /// Compute semantic neighbors of the freshly-embedded chunks and write the
+    /// marker. Runs inside the detached reindex-file child — ONNX is already
+    /// warm, `read_chunks` is a fast LanceDB scan. Fail-open: any error is
+    /// silently discarded so the hook session continues normally.
+    async fn write_change_neighbors_marker(
+        &self,
+        relative_path: &RelativePath,
+        embedded_chunks: &[EmbeddedChunk],
+    ) {
+        let query_vectors: Vec<Vec<f32>> =
+            embedded_chunks.iter().map(|ec| ec.vector.clone()).collect();
+
+        let Ok(all_rows) = self.store.read_chunks().await else {
+            return;
+        };
+
+        let exclude = relative_path.clone();
+        let top_k = self.config.hooks.related_top_k;
+        let min_similarity = self.config.hooks.related_min_similarity;
+        let Ok(hits) = task::spawn_blocking(move || {
+            neighbors(&all_rows, &query_vectors, &exclude, top_k, min_similarity)
+        })
+        .await
+        else {
+            return;
+        };
+
+        if hits.is_empty() {
+            return;
+        }
+
+        let Ok(store) = Store::new(&self.project_root, self.config.as_ref()) else {
+            return;
+        };
+        let marker_path = store.change_neighbors_marker_path();
+        let entries: Vec<NeighborEntry> = hits
+            .iter()
+            .map(|n| NeighborEntry {
+                file_path: n.file_path.clone(),
+                line_start: n.line_start,
+                line_end: n.line_end,
+                name: n.name.clone(),
+                score: n.score,
+            })
+            .collect();
+        write_neighbors_marker(
+            &marker_path,
+            &ChangeNeighborsMarker {
+                edited_path: relative_path.as_str().to_owned(),
+                neighbors: entries,
+            },
+        );
     }
 
     pub async fn search(&self, query: SearchQuery) -> Result<Vec<SearchResult>> {
@@ -407,6 +473,7 @@ async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
 mod tests {
     use super::*;
     use crate::embedding::StubProvider;
+    use crate::store::marker::change_neighbors as cn_marker;
     use async_trait::async_trait;
     use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -471,6 +538,57 @@ mod tests {
 
         async fn health_check(&self) -> Result<()> {
             self.inner.health_check().await
+        }
+    }
+
+    /// Provider that returns a fixed per-call rotation of vectors, enabling
+    /// deterministic control over cosine similarities in tests.
+    struct RotatingProvider {
+        dimension: Dimension,
+        /// Vectors returned in round-robin per item in a batch.
+        vectors: Vec<Vec<f32>>,
+        calls: std::sync::Mutex<usize>,
+    }
+
+    impl RotatingProvider {
+        fn new(dimension: Dimension, vectors: Vec<Vec<f32>>) -> Self {
+            Self {
+                dimension,
+                vectors,
+                calls: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for RotatingProvider {
+        fn name(&self) -> &str {
+            "rotating"
+        }
+
+        fn dimensions(&self) -> Dimension {
+            self.dimension
+        }
+
+        fn model_id(&self) -> &str {
+            "stub-v1"
+        }
+
+        async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            let mut idx = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            let result = batch
+                .iter()
+                .map(|_| {
+                    let v = self.vectors[*idx % self.vectors.len()].clone();
+                    *idx += 1;
+                    v
+                })
+                .collect();
+            Ok(result)
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -914,6 +1032,190 @@ mod tests {
                 .iter()
                 .all(|row| !row.file_path.starts_with(".claudix")),
             "no chunk under .claudix/ should be embedded"
+        );
+        Ok(())
+    }
+
+    // ── change-neighbors ───────────────────────────────────────────────────
+
+    /// Build a `Claudix` backed by a `RotatingProvider` that cycles through
+    /// the given `vectors` across all embedding calls. Use this to control
+    /// cosine similarities deterministically in neighbor tests.
+    fn claudix_with_rotating(
+        project_root: std::path::PathBuf,
+        mut config: Config,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<Claudix> {
+        config.embedding.dimensions = vectors.first().map(|v| v.len() as u16).unwrap_or(8);
+        let store = Store::new(&project_root, &config)?;
+        let embedder: Arc<dyn Provider> = Arc::new(RotatingProvider::new(
+            Dimension(config.embedding.dimensions),
+            vectors,
+        ));
+        Ok(Claudix {
+            config: Arc::new(config),
+            project_root,
+            embedder,
+            store,
+        })
+    }
+
+    /// Seed the store with a pre-computed chunk so the neighbor scan can find it.
+    async fn seed_chunk(
+        store: &Store,
+        config: &Config,
+        file_path: &str,
+        name: &str,
+        vector: Vec<f32>,
+    ) -> Result<()> {
+        use crate::types::{ByteRange, ChunkId, ChunkKind, EmbeddedChunk, FileHash, LineRange};
+        let chunk = Chunk {
+            id: ChunkId(1),
+            file_path: RelativePath::new(file_path),
+            language: crate::types::Language::Rust,
+            kind: ChunkKind::Function,
+            name: Some(name.to_owned()),
+            line_range: LineRange { start: 1, end: 5 },
+            byte_range: ByteRange { start: 0, end: 50 },
+            file_hash: FileHash([0u8; 16]),
+            content: format!("pub fn {name}() {{}}"),
+        };
+        let embedded = EmbeddedChunk { chunk, vector };
+        store.replace_chunks(&[embedded], config).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reindex_file_writes_change_neighbors_marker_for_near_duplicate() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let mut config = stub_config();
+        // Set a zero floor so any similarity causes a hit.
+        config.hooks.surface_related_on_edit = true;
+        config.hooks.related_top_k = 5;
+        config.hooks.related_min_similarity = 0.0;
+
+        // Both the query vector (used for the edited file's chunks) and the
+        // seed vector (stored for src/other.rs) are [1,0,...,0] → cosine = 1.0.
+        let shared_vector = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let claudix = claudix_with_rotating(
+            fixture.root().to_path_buf(),
+            config.clone(),
+            vec![shared_vector.clone()],
+        )?;
+        claudix.store.ensure_layout()?;
+
+        // Seed "src/other.rs" with the same vector as the to-be-edited file.
+        seed_chunk(
+            &claudix.store,
+            claudix.config.as_ref(),
+            "src/other.rs",
+            "other_fn",
+            shared_vector,
+        )
+        .await?;
+
+        // Write a real file for reindex_file to pick up (it must exist on disk).
+        tokio::fs::write(
+            fixture.root().join("src/lib.rs"),
+            b"pub fn greet(name: &str) -> String { format!(\"Hello, {name}!\") }\n",
+        )
+        .await?;
+
+        claudix.reindex_file(Path::new("src/lib.rs")).await?;
+
+        let marker_path = claudix.store.change_neighbors_marker_path();
+        assert!(
+            marker_path.exists(),
+            "change-neighbors marker must be written after editing a file with a near-duplicate"
+        );
+
+        let marker = cn_marker::read(&marker_path);
+        assert!(marker.is_some(), "marker must parse correctly");
+        let marker = marker.unwrap_or_else(|| unreachable!());
+
+        assert_eq!(marker.edited_path, "src/lib.rs");
+        assert!(
+            marker
+                .neighbors
+                .iter()
+                .any(|n| n.file_path == "src/other.rs"),
+            "near-duplicate src/other.rs must appear in marker neighbors"
+        );
+        assert!(
+            marker.neighbors.iter().all(|n| n.file_path != "src/lib.rs"),
+            "edited file must not appear in its own neighbor list"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reindex_file_no_marker_when_no_similar_code() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let mut config = stub_config();
+        config.hooks.surface_related_on_edit = true;
+        config.hooks.related_top_k = 5;
+        // Use a very high floor — nothing will pass.
+        config.hooks.related_min_similarity = 1.1;
+
+        let claudix = claudix_with_rotating(
+            fixture.root().to_path_buf(),
+            config.clone(),
+            vec![vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]],
+        )?;
+        claudix.store.ensure_layout()?;
+
+        // Seed a dissimilar chunk.
+        seed_chunk(
+            &claudix.store,
+            claudix.config.as_ref(),
+            "src/other.rs",
+            "other_fn",
+            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        )
+        .await?;
+
+        tokio::fs::write(fixture.root().join("src/lib.rs"), b"pub fn greet() {}\n").await?;
+
+        claudix.reindex_file(Path::new("src/lib.rs")).await?;
+
+        assert!(
+            !claudix.store.change_neighbors_marker_path().exists(),
+            "no marker must be written when nothing passes the similarity floor"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reindex_file_no_marker_when_feature_disabled() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let mut config = stub_config();
+        config.hooks.surface_related_on_edit = false;
+        config.hooks.related_min_similarity = 0.0;
+
+        let shared_vector = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let claudix = claudix_with_rotating(
+            fixture.root().to_path_buf(),
+            config.clone(),
+            vec![shared_vector.clone()],
+        )?;
+        claudix.store.ensure_layout()?;
+
+        seed_chunk(
+            &claudix.store,
+            claudix.config.as_ref(),
+            "src/other.rs",
+            "other_fn",
+            shared_vector,
+        )
+        .await?;
+
+        tokio::fs::write(fixture.root().join("src/lib.rs"), b"pub fn greet() {}\n").await?;
+
+        claudix.reindex_file(Path::new("src/lib.rs")).await?;
+
+        assert!(
+            !claudix.store.change_neighbors_marker_path().exists(),
+            "no marker must be written when surface_related_on_edit = false"
         );
         Ok(())
     }

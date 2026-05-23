@@ -1,3 +1,5 @@
+pub mod neighbors;
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -410,7 +412,7 @@ fn compare_scores_desc(
         .then_with(|| left_index.cmp(&right_index))
 }
 
-fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+pub(crate) fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
     if left.len() != right.len() || left.is_empty() {
         return 0.0;
     }

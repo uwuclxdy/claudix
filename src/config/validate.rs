@@ -90,6 +90,20 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    if config.hooks.related_top_k == 0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "hooks.related_top_k must be > 0".into(),
+            recovery: RecoveryHint("Set [hooks].related_top_k to a positive integer"),
+        });
+    }
+
+    if !(0.0..=1.0).contains(&config.hooks.related_min_similarity) {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "hooks.related_min_similarity must be between 0 and 1".into(),
+            recovery: RecoveryHint("Set [hooks].related_min_similarity to a value in [0, 1]"),
+        });
+    }
+
     if config.search.top_k == 0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "search.top_k must be > 0".into(),

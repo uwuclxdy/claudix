@@ -80,6 +80,12 @@ pub struct PartialHooksConfig {
     pub auto_reembed_on_edit: Option<bool>,
     #[serde(default)]
     pub auto_index_on_session_start: Option<bool>,
+    #[serde(default)]
+    pub surface_related_on_edit: Option<bool>,
+    #[serde(default)]
+    pub related_top_k: Option<usize>,
+    #[serde(default)]
+    pub related_min_similarity: Option<f32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -158,6 +164,11 @@ impl PartialHooksConfig {
             auto_index_on_session_start: other
                 .auto_index_on_session_start
                 .or(self.auto_index_on_session_start),
+            surface_related_on_edit: other
+                .surface_related_on_edit
+                .or(self.surface_related_on_edit),
+            related_top_k: other.related_top_k.or(self.related_top_k),
+            related_min_similarity: other.related_min_similarity.or(self.related_min_similarity),
         }
     }
 }

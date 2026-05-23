@@ -2,7 +2,9 @@
 //! background-index spawn path. Each marker is a single file under the
 //! store's state directory whose contents are the pid of the live owner.
 //! The structured pending-index marker lives in [`pending_index`].
+//! The change-neighbor surfacing marker lives in [`change_neighbors`].
 
+pub(crate) mod change_neighbors;
 pub(crate) mod pending_index;
 
 use std::fs;

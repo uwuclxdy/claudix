@@ -56,6 +56,12 @@ pub struct HooksConfig {
     pub intercept_grep: bool,
     pub auto_reembed_on_edit: bool,
     pub auto_index_on_session_start: bool,
+    /// Surface semantically related code after an edit. Set false to disable.
+    pub surface_related_on_edit: bool,
+    /// Maximum number of related-code hits surfaced per edit.
+    pub related_top_k: usize,
+    /// Cosine similarity floor for related-code hits (0.0–1.0).
+    pub related_min_similarity: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +114,9 @@ impl Default for Config {
                 intercept_grep: true,
                 auto_reembed_on_edit: true,
                 auto_index_on_session_start: true,
+                surface_related_on_edit: true,
+                related_top_k: 5,
+                related_min_similarity: 0.65,
             },
             paths: PathsConfig {
                 index_dir: PathBuf::from(".claudix/index"),
@@ -320,6 +329,18 @@ impl Config {
                     .hooks
                     .auto_index_on_session_start
                     .unwrap_or(defaults.hooks.auto_index_on_session_start),
+                surface_related_on_edit: partial
+                    .hooks
+                    .surface_related_on_edit
+                    .unwrap_or(defaults.hooks.surface_related_on_edit),
+                related_top_k: partial
+                    .hooks
+                    .related_top_k
+                    .unwrap_or(defaults.hooks.related_top_k),
+                related_min_similarity: partial
+                    .hooks
+                    .related_min_similarity
+                    .unwrap_or(defaults.hooks.related_min_similarity),
             },
             paths: PathsConfig {
                 index_dir: path_from_partial(partial.paths.index_dir, defaults.paths.index_dir),

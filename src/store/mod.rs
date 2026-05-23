@@ -89,6 +89,10 @@ impl Store {
         self.paths.state_dir.join("watch.pid")
     }
 
+    pub fn change_neighbors_marker_path(&self) -> PathBuf {
+        self.paths.state_dir.join("change-neighbors")
+    }
+
     pub fn state_dir_path(&self) -> &Path {
         &self.paths.state_dir
     }
