@@ -158,10 +158,16 @@ fn search_code_returns_fixture_hit_over_stdio() -> Result<(), Box<dyn std::error
     )?;
     let response = next_response(&mut reader)?;
     let structured = &response["result"]["structuredContent"];
-    let hits = structured["hits"].as_array().ok_or("hits missing array")?;
-    assert!(!hits.is_empty());
-    assert_eq!(hits[0]["file_path"], "src/math.rs");
-    assert_eq!(hits[0]["name"], "add");
+    let groups = structured["groups"]
+        .as_array()
+        .ok_or("groups missing array")?;
+    assert!(!groups.is_empty());
+    let top_hits = groups[0]["hits"]
+        .as_array()
+        .ok_or("hits missing in first group")?;
+    assert!(!top_hits.is_empty());
+    assert_eq!(top_hits[0]["file_path"], "src/math.rs");
+    assert_eq!(top_hits[0]["name"], "add");
 
     drop(stdin);
     let status = child.wait()?;

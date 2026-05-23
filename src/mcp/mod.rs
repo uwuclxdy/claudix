@@ -289,7 +289,7 @@ fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
             "name": "search_code",
-            "description": "Semantic search over indexed source code. Use for conceptual queries ('where is auth handled', 'how does config load'), identifier lookups ('SessionStart', 'handle_post_tool_use'), and cross-file questions. Returns ranked results with file paths, line ranges, and code snippets. Prefer this over grep for anything that isn't a literal string match or regex.",
+            "description": "Semantic search over indexed source code. Use for conceptual queries ('where is auth handled', 'how does config load'), identifier lookups ('SessionStart', 'handle_post_tool_use'), and cross-file questions. Returns results grouped by directory (ordered by best hit score), each group containing file paths, line ranges, and code snippets. Prefer this over grep for anything that isn't a literal string match or regex.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

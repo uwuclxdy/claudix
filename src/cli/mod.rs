@@ -42,8 +42,14 @@ pub struct SearchHit {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct SearchOutput {
+pub struct DirectoryGroup {
+    pub directory: String,
     pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SearchOutput {
+    pub groups: Vec<DirectoryGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -487,22 +493,43 @@ async fn run_search_with_claudix(
     };
     let results = claudix.search(query).await?;
 
-    Ok(SearchOutput {
-        hits: results
-            .into_iter()
-            .map(|result| SearchHit {
-                file_path: result.chunk.file_path.to_string(),
-                language: result.chunk.language.to_string(),
-                kind: result.chunk.kind.to_string(),
-                name: result.chunk.name,
-                line_start: result.chunk.line_range.start,
-                line_end: result.chunk.line_range.end,
-                score: result.score,
-                stale: result.stale,
-                snippet: result.chunk.content,
+    // Walk hits in score order (results is already score-desc from search).
+    // Bucket by directory preserving first-seen order so the first directory
+    // encountered owns the top hit — groups naturally ordered by best score.
+    let mut dir_index: Vec<String> = Vec::new();
+    let mut dir_hits: HashMap<String, Vec<SearchHit>> = HashMap::new();
+
+    for result in results {
+        let hit = SearchHit {
+            file_path: result.chunk.file_path.to_string(),
+            language: result.chunk.language.to_string(),
+            kind: result.chunk.kind.to_string(),
+            name: result.chunk.name,
+            line_start: result.chunk.line_range.start,
+            line_end: result.chunk.line_range.end,
+            score: result.score,
+            stale: result.stale,
+            snippet: result.chunk.content,
+        };
+        let dir = immediate_parent_dir(&hit.file_path);
+        if !dir_hits.contains_key(&dir) {
+            dir_index.push(dir.clone());
+        }
+        dir_hits.entry(dir).or_default().push(hit);
+    }
+
+    let groups = dir_index
+        .into_iter()
+        .filter_map(|dir| {
+            let hits = dir_hits.remove(&dir)?;
+            Some(DirectoryGroup {
+                directory: dir,
+                hits,
             })
-            .collect(),
-    })
+        })
+        .collect();
+
+    Ok(SearchOutput { groups })
 }
 
 async fn status_from_store(store: &Store, config: &crate::config::Config) -> Result<StatusOutput> {
@@ -648,9 +675,10 @@ mod tests {
         assert!(output.is_ok());
         let output = output.ok().unwrap_or_else(|| unreachable!());
 
-        assert!(!output.hits.is_empty());
-        assert_eq!(output.hits[0].name.as_deref(), Some("add"));
-        assert_eq!(output.hits[0].file_path, "src/math.rs");
+        assert!(!output.groups.is_empty());
+        let top_hit = &output.groups[0].hits[0];
+        assert_eq!(top_hit.name.as_deref(), Some("add"));
+        assert_eq!(top_hit.file_path, "src/math.rs");
     }
 
     #[tokio::test]
@@ -670,8 +698,9 @@ mod tests {
         assert!(output.is_ok());
         let output = output.ok().unwrap_or_else(|| unreachable!());
 
-        assert_eq!(output.hits.len(), 1);
-        assert_eq!(output.hits[0].file_path, "src/math.rs");
+        assert_eq!(output.groups.len(), 1);
+        assert_eq!(output.groups[0].hits.len(), 1);
+        assert_eq!(output.groups[0].hits[0].file_path, "src/math.rs");
     }
 
     #[test]
@@ -930,6 +959,75 @@ mod tests {
             output
                 .embedding_error
                 .is_some_and(|reason| reason.contains("http://127.0.0.1:1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn search_groups_hits_by_directory_ordered_by_best_score() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        // "greet add" spans both src/lib.rs and src/math.rs — two directories
+        // are both under "src", so we expect exactly one group named "src".
+        // The small_rust fixture has all files under src/, so one group.
+        let output =
+            run_search_with_claudix(&harness.claudix, "add greet".to_owned(), 10, None, None).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(!output.groups.is_empty(), "expected at least one group");
+
+        // Every group's directory must equal immediate_parent_dir of its hits.
+        for group in &output.groups {
+            for hit in &group.hits {
+                assert_eq!(
+                    immediate_parent_dir(&hit.file_path),
+                    group.directory,
+                    "hit {} belongs in wrong group",
+                    hit.file_path,
+                );
+            }
+        }
+
+        // Hits within each group must be in score-descending order.
+        for group in &output.groups {
+            let scores: Vec<f32> = group.hits.iter().map(|h| h.score).collect();
+            let mut sorted = scores.clone();
+            sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+            assert_eq!(
+                scores, sorted,
+                "hits in group '{}' not score-desc",
+                group.directory
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_grouping_preserves_top_hit_ranking() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let output =
+            run_search_with_claudix(&harness.claudix, "add".to_owned(), 5, None, None).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(!output.groups.is_empty());
+
+        // The globally top-ranked hit must be groups[0].hits[0] — grouping must
+        // not reorder the flat ranking, only reshape its presentation.
+        let top = &output.groups[0].hits[0];
+        let all_scores: Vec<f32> = output
+            .groups
+            .iter()
+            .flat_map(|g| g.hits.iter().map(|h| h.score))
+            .collect();
+        let global_max = all_scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(
+            top.score, global_max,
+            "top hit in groups[0] must have the globally highest score"
         );
     }
 }

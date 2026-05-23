@@ -125,30 +125,33 @@ async fn run() -> Result<()> {
             )
             .await?;
 
-            for hit in output.hits {
-                let stale_warning = stale_warning(hit.stale);
-                match hit.name {
-                    Some(name) => println!(
-                        "{}:{}-{} [{}] {} {} {}{}",
-                        hit.file_path,
-                        hit.line_start,
-                        hit.line_end,
-                        hit.language,
-                        hit.kind,
-                        name,
-                        hit.score,
-                        stale_warning
-                    ),
-                    None => println!(
-                        "{}:{}-{} [{}] {} {}{}",
-                        hit.file_path,
-                        hit.line_start,
-                        hit.line_end,
-                        hit.language,
-                        hit.kind,
-                        hit.score,
-                        stale_warning
-                    ),
+            for group in output.groups {
+                println!("{}:", group.directory);
+                for hit in group.hits {
+                    let stale_warning = stale_warning(hit.stale);
+                    match hit.name {
+                        Some(name) => println!(
+                            "  {}:{}-{} [{}] {} {} {}{}",
+                            hit.file_path,
+                            hit.line_start,
+                            hit.line_end,
+                            hit.language,
+                            hit.kind,
+                            name,
+                            hit.score,
+                            stale_warning
+                        ),
+                        None => println!(
+                            "  {}:{}-{} [{}] {} {}{}",
+                            hit.file_path,
+                            hit.line_start,
+                            hit.line_end,
+                            hit.language,
+                            hit.kind,
+                            hit.score,
+                            stale_warning
+                        ),
+                    }
                 }
             }
         }
