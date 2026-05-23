@@ -67,6 +67,22 @@ enum Command {
         )]
         path_prefix: Option<String>,
     },
+    #[command(about = "Find near-duplicate code chunks within this repo or across listed repos")]
+    FindDuplicates {
+        #[arg(
+            long,
+            help = "Cosine similarity floor (0.0-1.0; default 0.85 — raise to see only very close copies)"
+        )]
+        min_similarity: Option<f32>,
+        #[arg(long, help = "Maximum number of pairs to return (default 50)")]
+        limit: Option<usize>,
+        #[arg(
+            long = "repo",
+            help = "Additional already-indexed repo path to scan; repeatable. \
+                    When specified, ONLY these paths are used — the active project is NOT auto-added."
+        )]
+        repos: Vec<String>,
+    },
     #[command(about = "Run as an MCP server over stdio (invoked by Claude Code)")]
     Mcp,
 }
@@ -245,6 +261,30 @@ async fn run() -> Result<()> {
                 }
             }
         }
+        Command::FindDuplicates {
+            min_similarity,
+            limit,
+            repos,
+        } => {
+            let repos = if repos.is_empty() { None } else { Some(repos) };
+            let output =
+                cli::run_find_duplicates(&project_root, min_similarity, limit, repos).await?;
+
+            for err in &output.repo_errors {
+                eprintln!("warning: {} — {}", err.repo, err.error);
+            }
+
+            if output.pairs.is_empty() {
+                println!("no near-duplicate pairs found");
+            } else {
+                println!("found {} pair(s):", output.pairs.len());
+                for (i, pair) in output.pairs.iter().enumerate() {
+                    println!("\n[{}] similarity: {:.3}", i + 1, pair.similarity);
+                    print_duplicate_chunk("  a", &pair.a);
+                    print_duplicate_chunk("  b", &pair.b);
+                }
+            }
+        }
         Command::Install => {
             let output = cli::run_install(&project_root).await?;
             println!("plugin config: {}", output.config_path);
@@ -255,6 +295,19 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn print_duplicate_chunk(label: &str, chunk: &cli::DuplicateChunk) {
+    match &chunk.name {
+        Some(name) => println!(
+            "{label}: {} {}:{}-{} ({})",
+            chunk.repo, chunk.file_path, chunk.line_start, chunk.line_end, name
+        ),
+        None => println!(
+            "{label}: {} {}:{}-{}",
+            chunk.repo, chunk.file_path, chunk.line_start, chunk.line_end
+        ),
+    }
 }
 
 fn stale_warning(stale: bool) -> &'static str {

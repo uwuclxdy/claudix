@@ -14,6 +14,8 @@ use crate::config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::hooks::HookEvent;
 use crate::search::SearchQuery;
+use crate::search::duplicates::{self, LabeledChunk};
+pub use crate::search::duplicates::{DuplicateChunk, DuplicatePair};
 use crate::store::{IndexLockGuard, Store};
 use crate::types::{RelativePath, path_prefix_matches};
 use crate::{Claudix, IndexFileStatus, IndexProgress};
@@ -24,6 +26,11 @@ use input::{
 
 /// Maximum number of top identifiers surfaced per directory in `OverviewOutput`.
 const TOP_IDENTIFIERS_CAP: usize = 8;
+
+/// Default cosine-similarity floor for [`run_find_duplicates`]. Higher = stricter / fewer pairs.
+pub(crate) const DEFAULT_MIN_SIMILARITY: f32 = 0.85;
+/// Default maximum number of duplicate pairs returned by [`run_find_duplicates`].
+pub(crate) const DEFAULT_DUPLICATE_LIMIT: usize = 50;
 
 pub use install::{run_install, setup_state};
 pub use watch::run_watch;
@@ -186,6 +193,23 @@ pub struct OverviewOutput {
     pub chunk_count: usize,
 }
 
+/// A repo that could not contribute to the duplicate scan, with a reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoError {
+    pub repo: String,
+    pub error: String,
+}
+
+/// Result of [`run_find_duplicates`].
+///
+/// Partial success is intentional: indexed repos produce pairs even when
+/// some listed repos errored.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DuplicatesOutput {
+    pub pairs: Vec<DuplicatePair>,
+    pub repo_errors: Vec<RepoError>,
+}
+
 pub async fn run_overview(
     project_root: impl AsRef<Path>,
     path_prefix: Option<String>,
@@ -298,6 +322,181 @@ pub async fn run_overview(
         file_count,
         chunk_count,
     })
+}
+
+/// Read the embedding identity (model, dimensions) from a repo's manifest without
+/// validating against any reference. Used to bootstrap the reference for the first
+/// repo in a multi-repo scan.
+async fn peek_manifest_identity(repo_path: &str) -> std::result::Result<(String, u16), RepoError> {
+    let config = config::load(std::path::Path::new(repo_path)).map_err(|e| RepoError {
+        repo: repo_path.to_owned(),
+        error: e.to_string(),
+    })?;
+
+    let store = Store::new(repo_path, &config).map_err(|e| RepoError {
+        repo: repo_path.to_owned(),
+        error: e.to_string(),
+    })?;
+
+    let manifest = store.read_manifest().map_err(|e| RepoError {
+        repo: store.project_root().display().to_string(),
+        error: e.to_string(),
+    })?;
+
+    match manifest {
+        Some(m) if m.chunk_count > 0 => Ok((m.embedding_model, m.dimensions)),
+        _ => Err(RepoError {
+            repo: repo_path.to_owned(),
+            error: "not indexed".to_owned(),
+        }),
+    }
+}
+
+/// Open a repo read-only, confirm it is indexed and dimension-compatible,
+/// and return its chunks labeled with the canonical repo path.
+///
+/// This helper is intentionally read-only: it calls only `Store::new`,
+/// `read_manifest`, and `read_chunks` — never `ensure_layout` or `write_manifest`.
+/// Feature 6 (cross-repo search) reuses this to load remote repos without writing.
+///
+/// Returns `Err(RepoError)` when the repo path is invalid, the index is absent,
+/// the chunk count is zero, or the embedding identity (model + dimensions) does
+/// not match `ref_model`/`ref_dims`.
+pub(crate) async fn load_repo_chunks_readonly(
+    repo_path: &str,
+    ref_model: &str,
+    ref_dims: u16,
+) -> std::result::Result<(String, Vec<crate::store::StoredChunk>), RepoError> {
+    let config = config::load(std::path::Path::new(repo_path)).map_err(|e| RepoError {
+        repo: repo_path.to_owned(),
+        error: e.to_string(),
+    })?;
+
+    let store = Store::new(repo_path, &config).map_err(|e| RepoError {
+        repo: repo_path.to_owned(),
+        error: e.to_string(),
+    })?;
+
+    // Use the canonical path the store resolved to as the stable repo key.
+    let canonical_repo = store.project_root().display().to_string();
+
+    let manifest = store.read_manifest().map_err(|e| RepoError {
+        repo: canonical_repo.clone(),
+        error: e.to_string(),
+    })?;
+
+    let manifest = match manifest {
+        Some(m) if m.chunk_count > 0 => m,
+        _ => {
+            return Err(RepoError {
+                repo: canonical_repo,
+                error: "not indexed".to_owned(),
+            });
+        }
+    };
+
+    if manifest.embedding_model != ref_model || manifest.dimensions != ref_dims {
+        return Err(RepoError {
+            repo: canonical_repo.clone(),
+            error: "dimension/model mismatch — cannot compare".to_owned(),
+        });
+    }
+
+    let chunks = store.read_chunks().await.map_err(|e| RepoError {
+        repo: canonical_repo.clone(),
+        error: e.to_string(),
+    })?;
+
+    Ok((canonical_repo, chunks))
+}
+
+/// Find near-duplicate code chunks within the active repo or across an explicit list of repos.
+///
+/// When `repos` is `None` or empty, only `project_root` is scanned.
+/// When `repos` is non-empty, EXACTLY those paths are used — `project_root` is NOT
+/// auto-added; the caller decides what to include.
+///
+/// The reference embedding identity (model + dimensions) is established from the
+/// manifest of the first repo that loads successfully. All subsequent repos must
+/// match that identity or they become `RepoError`s.
+///
+/// The O(n²) detection scan runs inside `tokio::task::spawn_blocking`.
+pub async fn run_find_duplicates(
+    project_root: impl AsRef<Path>,
+    min_similarity: Option<f32>,
+    limit: Option<usize>,
+    repos: Option<Vec<String>>,
+) -> Result<DuplicatesOutput> {
+    let project_root = canonical_project_root(project_root.as_ref())?;
+    let min_similarity = min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY);
+    let limit = limit.unwrap_or(DEFAULT_DUPLICATE_LIMIT);
+
+    // Determine which repo paths to scan.
+    let repo_paths: Vec<String> = match repos {
+        Some(list) if !list.is_empty() => list,
+        _ => vec![project_root.display().to_string()],
+    };
+
+    let mut all_chunks: Vec<crate::store::StoredChunk> = Vec::new();
+    let mut repo_labels: Vec<String> = Vec::new();
+    let mut repo_errors: Vec<RepoError> = Vec::new();
+
+    // The reference embedding identity is taken from the first repo whose manifest
+    // loads successfully. Subsequent repos must match or they become RepoErrors.
+    let mut ref_identity: Option<(String, u16)> = None;
+
+    for path in &repo_paths {
+        // Resolve reference identity lazily from the first successful manifest.
+        if ref_identity.is_none() {
+            match peek_manifest_identity(path).await {
+                Ok(identity) => ref_identity = Some(identity),
+                Err(err) => {
+                    repo_errors.push(err);
+                    continue;
+                }
+            }
+        }
+
+        let Some((ref_model, ref_dims)) = ref_identity.as_ref() else {
+            continue;
+        };
+        match load_repo_chunks_readonly(path, ref_model, *ref_dims).await {
+            Ok((canonical, chunks)) => {
+                for _ in &chunks {
+                    repo_labels.push(canonical.clone());
+                }
+                all_chunks.extend(chunks);
+            }
+            Err(err) => {
+                repo_errors.push(err);
+            }
+        }
+    }
+
+    if all_chunks.is_empty() {
+        return Ok(DuplicatesOutput {
+            pairs: Vec::new(),
+            repo_errors,
+        });
+    }
+
+    // Build the labeled slice for the detection scan.
+    // `spawn_blocking` keeps the O(n²) work off the async executor.
+    let pairs = tokio::task::spawn_blocking(move || {
+        let labeled: Vec<LabeledChunk<'_>> = all_chunks
+            .iter()
+            .zip(repo_labels.iter())
+            .map(|(chunk, repo)| LabeledChunk {
+                repo: repo.as_str(),
+                chunk,
+            })
+            .collect();
+        duplicates::find_duplicates(&labeled, min_similarity, limit)
+    })
+    .await
+    .map_err(|e| ClaudixError::Store(format!("duplicate scan task failed: {e}")))?;
+
+    Ok(DuplicatesOutput { pairs, repo_errors })
 }
 
 /// Returns the immediate parent directory of a repo-relative file path,
@@ -1028,6 +1227,276 @@ mod tests {
         assert_eq!(
             top.score, global_max,
             "top hit in groups[0] must have the globally highest score"
+        );
+    }
+
+    // ── find_duplicates tests ────────────────────────────────────────────────
+
+    /// Build a temporary fixture with two Rust source files having identical content,
+    /// index them with the stub provider, and return (fixture, store) so tests can
+    /// call `run_find_duplicates`.
+    async fn dup_harness() -> Result<(TestFixture, Store)> {
+        let fixture = TestFixture::new("small_rust")?;
+        // Write a second file whose content is byte-identical to src/math.rs so
+        // the StubProvider (content-hash seed) emits the same vector → cosine = 1.0.
+        let dup_content = std::fs::read_to_string(fixture.root().join("src").join("math.rs"))
+            .map_err(ClaudixError::from)?;
+        std::fs::write(fixture.root().join("src").join("math_copy.rs"), dup_content)
+            .map_err(ClaudixError::from)?;
+
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config.clone())?;
+        index_fixture(
+            &claudix.store,
+            claudix.embedder.as_ref(),
+            claudix.project_root(),
+            &config,
+        )
+        .await?;
+        let store = Store::new(fixture.root(), &config)?;
+        Ok((fixture, store))
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_returns_pair_for_identical_content() {
+        let result = dup_harness().await;
+        assert!(result.is_ok());
+        let (fixture, _store) = result.ok().unwrap_or_else(|| unreachable!());
+
+        let output = run_find_duplicates(fixture.root(), None, None, None).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        // math.rs and math_copy.rs share identical content → identical vectors → cosine 1.0.
+        assert!(
+            !output.pairs.is_empty(),
+            "expected at least one pair from identical file content"
+        );
+        // Both chunks name the right files.
+        let pair = &output.pairs[0];
+        let paths = [pair.a.file_path.as_str(), pair.b.file_path.as_str()];
+        assert!(
+            paths.iter().any(|p| p.contains("math.rs")),
+            "expected math.rs in the pair; got {:?}",
+            paths
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("math_copy.rs")),
+            "expected math_copy.rs in the pair; got {:?}",
+            paths
+        );
+        assert!(
+            pair.similarity > 0.99,
+            "similarity should be ~1.0 for identical content"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_returns_empty_for_unique_repo() {
+        // small_rust has lib.rs and math.rs with distinct content → no duplicates.
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let output = run_find_duplicates(harness.claudix.project_root(), None, None, None).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(
+            output.pairs.is_empty(),
+            "distinct-content repo should have no duplicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_threshold_sensitivity() {
+        let result = dup_harness().await;
+        assert!(result.is_ok());
+        let (fixture, _store) = result.ok().unwrap_or_else(|| unreachable!());
+
+        // At threshold 0.99 the identical pair still shows.
+        let high = run_find_duplicates(fixture.root(), Some(0.99), None, None).await;
+        assert!(high.is_ok());
+        let high = high.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            !high.pairs.is_empty(),
+            "threshold 0.99 should still find identical pair"
+        );
+
+        // At threshold > 1.0 nothing qualifies.
+        let ceiling = run_find_duplicates(fixture.root(), Some(1.01), None, None).await;
+        assert!(ceiling.is_ok());
+        let ceiling = ceiling.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            ceiling.pairs.is_empty(),
+            "threshold > 1.0 must return no pairs"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_same_file_not_reported() {
+        // Even when identical chunks come from the same file, only cross-file pairs
+        // should appear. The dup_harness fixture has math.rs AND math_copy.rs (different
+        // files), so the pair is expected — but confirm no entry has a.file_path == b.file_path.
+        let result = dup_harness().await;
+        assert!(result.is_ok());
+        let (fixture, _store) = result.ok().unwrap_or_else(|| unreachable!());
+
+        let output = run_find_duplicates(fixture.root(), Some(0.0), None, None).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        for pair in &output.pairs {
+            assert!(
+                pair.a.file_path != pair.b.file_path || pair.a.repo != pair.b.repo,
+                "same-file pair must not be reported: {} == {}",
+                pair.a.file_path,
+                pair.b.file_path,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_partial_success_on_unindexed_path() {
+        let result = dup_harness().await;
+        assert!(result.is_ok());
+        let (fixture, _store) = result.ok().unwrap_or_else(|| unreachable!());
+
+        let indexed = fixture.root().display().to_string();
+        let unindexed = "/tmp/nonexistent-claudix-test-repo-12345".to_owned();
+
+        let output = run_find_duplicates(
+            fixture.root(),
+            None,
+            None,
+            Some(vec![indexed, unindexed.clone()]),
+        )
+        .await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        // The unindexed path must produce a RepoError.
+        assert!(
+            output.repo_errors.iter().any(|e| e.repo == unindexed
+                || e.error.contains("not indexed")
+                || e.error.contains("No such")),
+            "expected a repo_error for the unindexed path; got: {:?}",
+            output.repo_errors,
+        );
+        // Pairs from the indexed repo are still returned.
+        assert!(
+            !output.pairs.is_empty(),
+            "indexed repo should still produce pairs despite the error"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_repo_chunks_readonly_rejects_dimension_mismatch() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let root = harness.claudix.project_root().display().to_string();
+        // Manifest has dimensions=8 (stub_config). Asking with wrong dims triggers mismatch.
+        let result = load_repo_chunks_readonly(&root, "stub-v1", 999).await;
+        assert!(
+            result.is_err(),
+            "mismatched dimensions must produce a RepoError"
+        );
+        let err = result.err().unwrap_or_else(|| unreachable!());
+        assert!(
+            err.error.contains("mismatch"),
+            "error should mention mismatch; got: {}",
+            err.error,
+        );
+    }
+
+    #[tokio::test]
+    async fn load_repo_chunks_readonly_rejects_model_mismatch() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let root = harness.claudix.project_root().display().to_string();
+        let result = load_repo_chunks_readonly(&root, "different-model", 8).await;
+        assert!(result.is_err(), "mismatched model must produce a RepoError");
+        let err = result.err().unwrap_or_else(|| unreachable!());
+        assert!(
+            err.error.contains("mismatch"),
+            "error should mention mismatch; got: {}",
+            err.error,
+        );
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_multi_repo_detects_cross_repo_pair() {
+        // Build two separate repos with an identical file, index each, then scan both.
+        let fixture_a = TestFixture::new("small_rust");
+        assert!(fixture_a.is_ok());
+        let fixture_a = fixture_a.ok().unwrap_or_else(|| unreachable!());
+
+        let fixture_b = TestFixture::new("small_rust");
+        assert!(fixture_b.is_ok());
+        let fixture_b = fixture_b.ok().unwrap_or_else(|| unreachable!());
+
+        let config = stub_config();
+
+        // Index repo A.
+        let claudix_a = test_claudix(fixture_a.root().to_path_buf(), config.clone());
+        assert!(claudix_a.is_ok());
+        let claudix_a = claudix_a.ok().unwrap_or_else(|| unreachable!());
+        let index_a = index_fixture(
+            &claudix_a.store,
+            claudix_a.embedder.as_ref(),
+            claudix_a.project_root(),
+            &config,
+        )
+        .await;
+        assert!(index_a.is_ok());
+
+        // Index repo B.
+        let claudix_b = test_claudix(fixture_b.root().to_path_buf(), config.clone());
+        assert!(claudix_b.is_ok());
+        let claudix_b = claudix_b.ok().unwrap_or_else(|| unreachable!());
+        let index_b = index_fixture(
+            &claudix_b.store,
+            claudix_b.embedder.as_ref(),
+            claudix_b.project_root(),
+            &config,
+        )
+        .await;
+        assert!(index_b.is_ok());
+
+        let repo_a = fixture_a.root().display().to_string();
+        let repo_b = fixture_b.root().display().to_string();
+
+        // Provide both repos explicitly — active project is NOT auto-added.
+        let output = run_find_duplicates(
+            fixture_a.root(),
+            Some(0.99),
+            None,
+            Some(vec![repo_a.clone(), repo_b.clone()]),
+        )
+        .await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(
+            output.repo_errors.is_empty(),
+            "both repos are indexed; no errors expected"
+        );
+
+        // Both repos contain the same fixture content → at least one cross-repo pair.
+        assert!(
+            !output.pairs.is_empty(),
+            "identical fixture content across repos must produce cross-repo pairs"
+        );
+
+        // At least one pair must have a.repo != b.repo.
+        let has_cross_repo = output.pairs.iter().any(|p| p.a.repo != p.b.repo);
+        assert!(
+            has_cross_repo,
+            "at least one pair must span two different repos"
         );
     }
 }

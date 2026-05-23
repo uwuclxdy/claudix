@@ -1,3 +1,4 @@
+pub mod duplicates;
 pub mod neighbors;
 
 use std::cmp::Ordering;

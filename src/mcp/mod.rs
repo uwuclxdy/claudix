@@ -34,6 +34,16 @@ struct OverviewRequest {
     path_prefix: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+struct FindDuplicatesRequest {
+    #[serde(default)]
+    min_similarity: Option<f32>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    repos: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct ReindexFileRequest {
     path: String,
@@ -164,6 +174,10 @@ async fn handle_tools_call(project_root: &Path, id: Option<Value>, params: Value
             Ok(result) => tool_success_result(result)?,
             Err(error) => tool_error_result(error),
         },
+        "find_duplicates" => match find_duplicates(project_root, call.arguments).await {
+            Ok(result) => tool_success_result(result)?,
+            Err(error) => tool_error_result(error),
+        },
         _ => {
             return Ok(error_response(
                 id,
@@ -244,6 +258,22 @@ async fn overview(project_root: &Path, arguments: Value) -> Result<Value> {
     let request: OverviewRequest =
         parse_tool_arguments(arguments, "overview", "Pass an optional path_prefix string")?;
     let output = cli::run_overview(project_root, request.path_prefix).await?;
+    to_value(output)
+}
+
+async fn find_duplicates(project_root: &Path, arguments: Value) -> Result<Value> {
+    let request: FindDuplicatesRequest = parse_tool_arguments(
+        arguments,
+        "find_duplicates",
+        "Pass optional min_similarity (number), limit (integer), repos (array of strings)",
+    )?;
+    let output = cli::run_find_duplicates(
+        project_root,
+        request.min_similarity,
+        request.limit.map(|n| n as usize),
+        request.repos,
+    )
+    .await?;
     to_value(output)
 }
 
@@ -352,6 +382,31 @@ fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "name": "find_duplicates",
+            "description": "Find near-duplicate or copy-pasted code chunks. Before implementing something, check whether equivalent logic already exists. Scans the active repo or an explicit list of already-indexed repos (read-only). Returns pairs sorted by similarity, highest first. Raise min_similarity toward 1.0 for exact copies; lower it to find looser structural similarities.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "min_similarity": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "description": "Cosine similarity floor (default 0.85). Higher = stricter / fewer pairs."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Maximum number of pairs to return (default 50)"
+                    },
+                    "repos": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Absolute paths to other already-indexed repos to include. When specified, ONLY these paths are scanned — the active project is not auto-added."
+                    }
+                }
+            }
+        }),
     ]
 }
 
@@ -454,6 +509,7 @@ mod tests {
                 "clear_index",
                 "reindex_file",
                 "overview",
+                "find_duplicates",
             ]
         );
     }
