@@ -79,6 +79,11 @@ pub struct PathsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub watch: bool,
+    /// Dev-only: resolve the binary from `cargo install` (`~/.cargo/bin/claudix`)
+    /// instead of the downloaded release. Read by `scripts/ensure-binary.sh`;
+    /// the running binary cannot change which binary launched it, so this field
+    /// exists to be a recognized, doctor-visible key, not to drive resolution.
+    pub development_mode: bool,
     pub embedding: EmbeddingConfig,
     pub indexing: IndexingConfig,
     pub search: SearchConfig,
@@ -90,6 +95,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             watch: false,
+            development_mode: false,
             embedding: EmbeddingConfig {
                 provider: EmbeddingProvider::Bundled,
                 endpoint: String::new(),
@@ -247,6 +253,9 @@ impl Config {
 
         Self {
             watch: partial.watch.unwrap_or(defaults.watch),
+            development_mode: partial
+                .development_mode
+                .unwrap_or(defaults.development_mode),
             embedding: EmbeddingConfig {
                 provider: partial
                     .embedding
@@ -376,6 +385,41 @@ mod tests {
     fn default_config_is_valid() {
         let config = Config::default();
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn development_mode_defaults_to_false() {
+        assert!(!Config::default().development_mode);
+        assert!(validate(&Config::default()).is_ok());
+    }
+
+    #[test]
+    fn development_mode_parses_from_toml() {
+        let parsed: std::result::Result<PartialConfig, toml::de::Error> =
+            toml::from_str("development_mode = true");
+        assert_eq!(parsed.ok().and_then(|cfg| cfg.development_mode), Some(true));
+    }
+
+    #[test]
+    fn development_mode_project_overrides_global() {
+        let global = PartialConfig {
+            development_mode: Some(false),
+            ..Default::default()
+        };
+        let project = PartialConfig {
+            development_mode: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(global.merge(project).development_mode, Some(true));
+    }
+
+    #[test]
+    fn from_partial_applies_development_mode() {
+        let partial = PartialConfig {
+            development_mode: Some(true),
+            ..Default::default()
+        };
+        assert!(Config::from_partial(partial).development_mode);
     }
 
     #[test]

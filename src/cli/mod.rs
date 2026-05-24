@@ -152,6 +152,12 @@ pub struct DoctorOutput {
     /// True when the stored index model differs from the active config model.
     /// Distinct from `embedding_healthy = false` caused by the server being unreachable.
     pub embedding_model_mismatch: bool,
+    /// Dev-only flag from config: when on, `scripts/ensure-binary.sh` runs the
+    /// `cargo install` binary instead of the downloaded release.
+    pub development_mode: bool,
+    /// Absolute path of the binary serving this command, so it is unambiguous
+    /// which build is running (cargo vs. cached release) during development.
+    pub binary_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -684,6 +690,10 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
         embedding_healthy,
         embedding_error,
         embedding_model_mismatch,
+        development_mode: config.development_mode,
+        binary_path: std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_owned()),
     })
 }
 

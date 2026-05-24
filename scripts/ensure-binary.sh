@@ -81,6 +81,41 @@ cargo_bin_path() {
   printf '%s/bin/%s\n' "${CARGO_HOME:-${HOME}/.cargo}" "$PLUGIN_NAME"
 }
 
+# dev-only escape hatch: read `development_mode` from the toml config stack so
+# a contributor can test their freshly-built `cargo install` binary instead of
+# the downloaded release. the running rust binary cannot pick which binary
+# launched it, so this lives here. mirrors the loader's precedence: project
+# config (CLAUDE_PROJECT_DIR, else PWD) overrides global ~/.claude.
+
+# echoes the last uncommented `development_mode` value in $1 (true|false), or nothing
+config_dev_value() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  grep -E '^[[:space:]]*development_mode[[:space:]]*=' "$f" 2>/dev/null \
+    | tail -1 \
+    | sed -E 's/^[[:space:]]*development_mode[[:space:]]*=[[:space:]]*([A-Za-z]+).*/\1/'
+}
+
+development_mode_on() {
+  local val
+  val="$(config_dev_value "${CLAUDE_PROJECT_DIR:-${PWD}}/.claude/claudix.toml")"
+  [[ -z "$val" ]] && val="$(config_dev_value "${HOME}/.claude/claudix.toml")"
+  [[ "$val" == "true" ]]
+}
+
+# prints the cargo binary and returns 0 when present; logs a hint and returns 3
+# (consumed by the bootstrap shim) when development_mode is on but it is missing.
+resolve_dev_binary() {
+  local cb
+  cb="$(cargo_bin_path)"
+  if [[ -x "$cb" ]]; then
+    printf '%s\n' "$cb"
+    return 0
+  fi
+  log "development_mode is on but no cargo binary at ${cb}; run 'cargo install --path .' from the claudix repo"
+  return 3
+}
+
 prebuilt_supported() {
   local platform="$1"
   case "$platform" in
@@ -278,6 +313,13 @@ if [[ -d "$CACHE_DIR" ]]; then
       && ! kill -0 "$(cat "$_pid_file" 2>/dev/null)" 2>/dev/null; then
     rm -rf "$LOCK_DIR" "$_pid_file" 2>/dev/null || true
   fi
+fi
+
+# development_mode bypasses release resolution entirely: cargo binary or a
+# clear failure, never a download. exit 3 signals the shim to surface the hint.
+if development_mode_on; then
+  resolve_dev_binary
+  exit $?
 fi
 
 case "$MODE" in
