@@ -28,6 +28,14 @@ pub(super) async fn handle_post_tool_use(
     // surfacing — it must NEVER spawn a reindex. The edit tools below do.
     let tool_name = payload.tool_name.as_deref();
 
+    if tool_name == Some("Read")
+        && config
+            .as_ref()
+            .is_some_and(|cfg| !cfg.hooks.surface_related_on_read)
+    {
+        return Ok(None);
+    }
+
     // Spawn a background reindex only when an edit tool fired on a real file.
     // The ready-check and neighbor-surfacing runs on every PostToolUse event
     // regardless of whether a spawn happened.
@@ -128,7 +136,9 @@ async fn read_surfacing_context(
     read_path.reject_escape(READ_NEIGHBOR_RECOVERY).ok()?;
 
     let start = input.offset.unwrap_or(1);
-    let end = input.limit.map(|count| start + count.saturating_sub(1));
+    let end = input
+        .limit
+        .map(|count| start.saturating_add(count.saturating_sub(1)));
 
     let store = Store::new(project_root, cfg).ok()?;
     let all_rows = store.read_chunks().await.ok()?;
@@ -796,6 +806,15 @@ mod tests {
         // Open-ended window [10, EOF]: only the lower bound constrains.
         assert!(chunk_overlaps_window(50, 60, 10, None), "far below EOF");
         assert!(!chunk_overlaps_window(1, 9, 10, None), "ends before start");
+        assert!(
+            chunk_overlaps_window(u32::MAX, u32::MAX, u32::MAX, Some(u32::MAX)),
+            "saturating read windows still match the last line"
+        );
+    }
+
+    #[test]
+    fn read_surfacing_defaults_on() {
+        assert!(Config::default().hooks.surface_related_on_read);
     }
 
     #[tokio::test]
@@ -1042,14 +1061,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_surfacing_disabled_by_default_skips_store() -> Result<()> {
+    async fn read_surfacing_disabled_skips_store() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;
-        // Default config: surface_related_on_read = false.
-        let config = stub_config();
-        assert!(
-            !config.hooks.surface_related_on_read,
-            "read surfacing must default off"
-        );
+        let mut config = stub_config();
+        config.hooks.surface_related_on_read = false;
         write_config(fixture.root(), &config);
         let store = Store::new(fixture.root(), &config)?;
         store.ensure_layout()?;

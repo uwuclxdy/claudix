@@ -388,25 +388,24 @@ pub(crate) async fn load_repo_chunks_readonly(
     // Use the canonical path the store resolved to as the stable repo key.
     let canonical_repo = store.project_root().display().to_string();
 
-    let manifest = store.read_manifest().map_err(|e| RepoError {
-        repo: canonical_repo.clone(),
-        error: e.to_string(),
-    })?;
+    let manifest = store
+        .validate_manifest_compatibility(ref_model, ref_dims)
+        .map_err(|e| RepoError {
+            repo: canonical_repo.clone(),
+            error: e.to_string(),
+        })?;
 
-    let manifest = match manifest {
-        Some(m) if m.chunk_count > 0 => m,
-        _ => {
-            return Err(RepoError {
-                repo: canonical_repo,
-                error: "not indexed".to_owned(),
-            });
-        }
+    let Some(manifest) = manifest else {
+        return Err(RepoError {
+            repo: canonical_repo,
+            error: "not indexed".to_owned(),
+        });
     };
 
-    if manifest.embedding_model != ref_model || manifest.dimensions != ref_dims {
+    if manifest.chunk_count == 0 {
         return Err(RepoError {
-            repo: canonical_repo.clone(),
-            error: "dimension/model mismatch — cannot compare".to_owned(),
+            repo: canonical_repo,
+            error: "not indexed".to_owned(),
         });
     }
 
@@ -414,6 +413,13 @@ pub(crate) async fn load_repo_chunks_readonly(
         repo: canonical_repo.clone(),
         error: e.to_string(),
     })?;
+
+    if chunks.is_empty() {
+        return Err(RepoError {
+            repo: canonical_repo,
+            error: "index chunks missing".to_owned(),
+        });
+    }
 
     Ok((canonical_repo, chunks))
 }
@@ -437,7 +443,19 @@ pub async fn run_find_duplicates(
 ) -> Result<DuplicatesOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
     let min_similarity = min_similarity.unwrap_or(DEFAULT_MIN_SIMILARITY);
+    if !min_similarity.is_finite() || !(0.0..=1.0).contains(&min_similarity) {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "min_similarity must be between 0 and 1".to_owned(),
+            recovery: RecoveryHint("Use a finite min_similarity between 0 and 1"),
+        });
+    }
     let limit = limit.unwrap_or(DEFAULT_DUPLICATE_LIMIT);
+    if limit == 0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "limit must be at least 1".to_owned(),
+            recovery: RecoveryHint("Use a positive limit"),
+        });
+    }
 
     // Determine which repo paths to scan.
     let repo_paths: Vec<String> = match repos {
@@ -1380,14 +1398,30 @@ mod tests {
             "threshold 0.99 should still find identical pair"
         );
 
-        // At threshold > 1.0 nothing qualifies.
         let ceiling = run_find_duplicates(fixture.root(), Some(1.01), None, None).await;
-        assert!(ceiling.is_ok());
-        let ceiling = ceiling.ok().unwrap_or_else(|| unreachable!());
         assert!(
-            ceiling.pairs.is_empty(),
-            "threshold > 1.0 must return no pairs"
+            ceiling.is_err(),
+            "threshold > 1.0 must be rejected before scanning"
         );
+    }
+
+    #[tokio::test]
+    async fn find_duplicates_rejects_invalid_threshold_and_limit() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let nan =
+            run_find_duplicates(harness.claudix.project_root(), Some(f32::NAN), None, None).await;
+        assert!(nan.is_err(), "NaN threshold must be rejected");
+
+        let negative =
+            run_find_duplicates(harness.claudix.project_root(), Some(-0.1), None, None).await;
+        assert!(negative.is_err(), "negative threshold must be rejected");
+
+        let zero_limit =
+            run_find_duplicates(harness.claudix.project_root(), None, Some(0), None).await;
+        assert!(zero_limit.is_err(), "zero limit must be rejected");
     }
 
     #[tokio::test]
@@ -1481,6 +1515,30 @@ mod tests {
         assert!(
             err.error.contains("mismatch"),
             "error should mention mismatch; got: {}",
+            err.error,
+        );
+    }
+
+    #[tokio::test]
+    async fn load_repo_chunks_readonly_rejects_missing_chunk_table() {
+        let harness = cli_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+
+        let index_dir = harness.claudix.store.state_dir_path().join("index");
+        let remove = std::fs::remove_dir_all(&index_dir);
+        assert!(remove.is_ok());
+
+        let root = harness.claudix.project_root().display().to_string();
+        let result = load_repo_chunks_readonly(&root, "stub-v1", 8).await;
+        assert!(
+            result.is_err(),
+            "manifest claiming chunks without a chunks table must produce a RepoError"
+        );
+        let err = result.err().unwrap_or_else(|| unreachable!());
+        assert!(
+            err.error.contains("chunks missing"),
+            "error should mention missing chunks; got: {}",
             err.error,
         );
     }

@@ -122,7 +122,7 @@ impl Default for Config {
                 auto_reembed_on_edit: true,
                 auto_index_on_session_start: true,
                 surface_related_on_edit: true,
-                surface_related_on_read: false,
+                surface_related_on_read: true,
                 related_top_k: 5,
                 related_min_similarity: 0.65,
             },

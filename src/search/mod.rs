@@ -95,8 +95,18 @@ impl Searcher {
             });
         }
 
+        let (labeled_rows, repo_errors) = self.collect_labeled_rows(&query).await?;
+        if labeled_rows.is_empty() {
+            return Ok(SearchResults {
+                results: Vec::new(),
+                repo_errors,
+            });
+        }
+
         // Embed the query once with the active embedder. Its model/dimensions
         // are the reference identity every cross-repo's vectors must match.
+        // When the active provider has bundled fallback enabled, this call falls
+        // back before ranking the non-empty corpus.
         let vectors = self.embedder.embed(&[query.query.as_str()]).await?;
         if vectors.len() != 1 {
             return Err(ClaudixError::Embedding(format!(
@@ -106,14 +116,6 @@ impl Searcher {
         }
         let query_vector = vectors.into_iter().next().unwrap_or_default();
         validate_query_vector(&query_vector, self.embedder.dimensions())?;
-
-        let (labeled_rows, repo_errors) = self.collect_labeled_rows(&query).await?;
-        if labeled_rows.is_empty() {
-            return Ok(SearchResults {
-                results: Vec::new(),
-                repo_errors,
-            });
-        }
 
         let config = self.config.clone();
         let mut results =
@@ -888,6 +890,37 @@ mod tests {
             ),
             _fixture: fixture,
         })
+    }
+
+    #[tokio::test]
+    async fn search_returns_empty_before_embedding_when_corpus_empty() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let store = Store::new(fixture.root(), &config)?;
+        let embedder: Arc<dyn Provider> = Arc::new(FixedProvider {
+            dimension: Dimension(384),
+            vectors: Vec::new(),
+        });
+        let searcher = Searcher::new(
+            fixture.root().to_path_buf(),
+            store,
+            embedder,
+            config.search.clone(),
+        );
+
+        let output = searcher
+            .search_all(SearchQuery {
+                query: "add".to_owned(),
+                top_k: 10,
+                language_filter: None,
+                path_prefix: None,
+                repos: Vec::new(),
+            })
+            .await?;
+
+        assert!(output.results.is_empty());
+        assert!(output.repo_errors.is_empty());
+        Ok(())
     }
 
     #[tokio::test]
