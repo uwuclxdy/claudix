@@ -1,3 +1,5 @@
+<div align="center">
+
 ![claudix banner](media/claudix.png)
 
 ![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/uwuclxdy/claudix/.github%2Fworkflows%2Frelease.yml?style=for-the-badge&cacheSeconds=60)
@@ -5,6 +7,8 @@
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-D97757?style=for-the-badge)
 
 # Claude Index: claudix
+
+</div>
 
 Copilot's Codebase Index but for Claude Code. Automatically indexes your repo, embeds with the embedding model of choice and provides semantic search through Claude's slash commands, MCP tools, and grep interception.
 
