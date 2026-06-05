@@ -5,10 +5,45 @@
 //! It is designed to be reused by duplicate detection, read-time surfacing,
 //! and cross-repo features; keep it general.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 use crate::store::StoredChunk;
 use crate::types::RelativePath;
 
 use super::cosine_similarity;
+
+/// Min-heap wrapper for [`Neighbor`] so a `BinaryHeap<NeighborEntry>` acts as
+/// a bounded max-heap: the weakest neighbor sits at the top and is popped when
+/// the heap exceeds `top_k`. Tie-breaking mirrors the original sort:
+/// `partial_cmp` with `unwrap_or(Equal)`, no secondary key.
+struct NeighborEntry(Neighbor);
+
+impl PartialEq for NeighborEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for NeighborEntry {}
+
+impl PartialOrd for NeighborEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NeighborEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Min-heap: smallest score has highest BinaryHeap priority (gets popped first).
+        // Reversed so BinaryHeap::peek() returns the weakest neighbor.
+        other
+            .0
+            .score
+            .partial_cmp(&self.0.score)
+            .unwrap_or(Ordering::Equal)
+    }
+}
 
 /// A single neighbor hit returned by [`neighbors`].
 #[derive(Debug, Clone, PartialEq)]
@@ -72,24 +107,39 @@ pub fn neighbors(
         }
     }
 
-    let mut candidates: Vec<Neighbor> = best
-        .into_values()
-        .filter(|(score, _)| *score >= min_similarity)
-        .map(|(score, row)| Neighbor {
+    // Build a min-heap capped at `top_k` so only qualifying candidates
+    // allocate their output `Neighbor` struct. The heap minimum (weakest score)
+    // is popped when the cap is exceeded.
+    let mut heap: BinaryHeap<NeighborEntry> = BinaryHeap::with_capacity(top_k + 1);
+
+    for (score, row) in best.into_values() {
+        if score < min_similarity {
+            continue;
+        }
+
+        if heap.len() == top_k {
+            if let Some(min_entry) = heap.peek()
+                && score
+                    .partial_cmp(&min_entry.0.score)
+                    .unwrap_or(Ordering::Equal)
+                    != Ordering::Greater
+            {
+                continue;
+            }
+            heap.pop();
+        }
+
+        heap.push(NeighborEntry(Neighbor {
             file_path: row.file_path.clone(),
             line_start: row.line_start,
             line_end: row.line_end,
             name: row.name.clone(),
             score,
-        })
-        .collect();
+        }));
+    }
 
-    candidates.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    candidates.truncate(top_k);
+    let mut candidates: Vec<Neighbor> = heap.into_iter().map(|e| e.0).collect();
+    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
     candidates
 }
 

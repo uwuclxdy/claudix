@@ -6,11 +6,46 @@
 //! For an on-demand tool this is acceptable; the caller scopes the input via
 //! the repo list.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+
 use serde::Serialize;
 
 use crate::store::StoredChunk;
 
 use super::cosine_similarity;
+
+/// Wrapper that gives `DuplicatePair` a min-heap ordering by similarity so a
+/// `BinaryHeap<HeapEntry>` is a bounded max-heap (pop the smallest when over
+/// the cap, keep the largest). Tie-breaking mirrors the original sort:
+/// `partial_cmp` with `unwrap_or(Equal)` and no secondary key.
+struct HeapEntry(DuplicatePair);
+
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for HeapEntry {}
+
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Min-heap: the *smallest* similarity is the highest priority to pop.
+        // Reversed so BinaryHeap::peek() returns the weakest pair.
+        other
+            .0
+            .similarity
+            .partial_cmp(&self.0.similarity)
+            .unwrap_or(Ordering::Equal)
+    }
+}
 
 /// A chunk annotated with the repo it came from.
 ///
@@ -69,7 +104,12 @@ pub fn find_duplicates(
         return Vec::new();
     }
 
-    let mut pairs: Vec<DuplicatePair> = Vec::new();
+    // Min-heap capped at `limit`: we keep the `limit` highest-similarity pairs
+    // without ever storing the full O(n²) set. The minimum-similarity entry is
+    // at the top; when the heap exceeds the cap we pop it (discard lowest).
+    // `DuplicateChunk` string clones are deferred until a pair actually enters
+    // the heap, so rejected pairs allocate nothing beyond a similarity `f32`.
+    let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(limit + 1);
 
     for i in 0..chunks.len() {
         for j in (i + 1)..chunks.len() {
@@ -86,7 +126,20 @@ pub fn find_duplicates(
                 continue;
             }
 
-            pairs.push(DuplicatePair {
+            // Skip if this pair is weaker than the current heap minimum and
+            // the heap is already full — defer the string clones entirely.
+            if heap.len() == limit {
+                if let Some(min_entry) = heap.peek() {
+                    let min_sim = min_entry.0.similarity;
+                    // partial_cmp on f32: treat NaN as equal (same as original).
+                    if sim.partial_cmp(&min_sim).unwrap_or(Ordering::Equal) != Ordering::Greater {
+                        continue;
+                    }
+                }
+                heap.pop();
+            }
+
+            heap.push(HeapEntry(DuplicatePair {
                 a: DuplicateChunk {
                     repo: a.repo.to_owned(),
                     file_path: a.chunk.file_path.clone(),
@@ -102,16 +155,17 @@ pub fn find_duplicates(
                     name: b.chunk.name.clone(),
                 },
                 similarity: sim,
-            });
+            }));
         }
     }
 
+    // Drain heap into a Vec sorted descending by similarity (mirrors original).
+    let mut pairs: Vec<DuplicatePair> = heap.into_iter().map(|e| e.0).collect();
     pairs.sort_by(|x, y| {
         y.similarity
             .partial_cmp(&x.similarity)
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .unwrap_or(Ordering::Equal)
     });
-    pairs.truncate(limit);
     pairs
 }
 
@@ -241,5 +295,74 @@ mod tests {
         let chunks = [labeled("/repo", &a)];
         let pairs = find_duplicates(&chunks, 0.0, 50);
         assert!(pairs.is_empty());
+    }
+
+    /// When `limit` is smaller than the total qualifying pairs, the heap must
+    /// keep the *highest*-similarity ones and discard the lowest, regardless of
+    /// scan order. This guards the heap cap logic against regressions.
+    #[test]
+    fn heap_cap_keeps_highest_similarity_pairs() {
+        // Three files: a↔b = 1.0, a↔c = 0.95, b↔c = 0.90.
+        // With limit=2 the output must be {a↔b=1.0, a↔c=0.95}.
+        let a = stored("src/a.rs", "foo", vec![1.0, 0.0, 0.0, 0.0]);
+        let b = stored("src/b.rs", "bar", vec![1.0, 0.0, 0.0, 0.0]);
+        // c has a small orthogonal component so a↔c ≈ 0.95 and b↔c ≈ 0.95.
+        let c = stored(
+            "src/c.rs",
+            "baz",
+            vec![0.95_f32, 0.31225_f32, 0.0, 0.0], // |v| ≈ 1
+        );
+        let chunks = [
+            labeled("/repo", &a),
+            labeled("/repo", &b),
+            labeled("/repo", &c),
+        ];
+
+        let pairs = find_duplicates(&chunks, 0.0, 2);
+        assert_eq!(pairs.len(), 2, "limit=2 must yield exactly 2 pairs");
+        // Highest pair first.
+        assert!(
+            pairs[0].similarity >= pairs[1].similarity,
+            "output must be sorted descending"
+        );
+        // The top pair must be a↔b (similarity ≈ 1.0).
+        assert!(
+            pairs[0].similarity > 0.99,
+            "a↔b (identical vectors) must be the top pair"
+        );
+        // The discarded pair (lowest of the three) must not appear.
+        let min_sim = pairs[1].similarity;
+        assert!(
+            min_sim > 0.89,
+            "pair with similarity ≈ 0.90 should be dropped, kept pair sim={min_sim}"
+        );
+    }
+
+    /// Equal-similarity pairs (NaN treated as Equal) must not cause panics and
+    /// the output must still be sorted non-strictly descending.
+    #[test]
+    fn tie_similarity_output_is_sorted() {
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let a = stored("src/a.rs", "foo", v.clone());
+        let b = stored("src/b.rs", "bar", v.clone());
+        let c = stored("src/c.rs", "baz", v.clone());
+        let d = stored("src/d.rs", "qux", v.clone());
+        let chunks = [
+            labeled("/repo", &a),
+            labeled("/repo", &b),
+            labeled("/repo", &c),
+            labeled("/repo", &d),
+        ];
+
+        // All pairs have similarity 1.0 — every ordering is valid as long as
+        // it is non-strictly descending.
+        let pairs = find_duplicates(&chunks, 0.0, 3);
+        assert_eq!(pairs.len(), 3);
+        for window in pairs.windows(2) {
+            assert!(
+                window[0].similarity >= window[1].similarity,
+                "pairs not sorted descending on ties"
+            );
+        }
     }
 }

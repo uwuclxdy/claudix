@@ -243,10 +243,17 @@ pub async fn run_overview(
     // Splitting on `/` is sound because file_path comes from RelativePath,
     // which forward-slash-normalizes on construction on every platform.
     // Aggregation is light counting over an already-loaded Vec — no spawn_blocking needed.
-    let mut dir_files: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-    let mut dir_chunks: HashMap<String, usize> = HashMap::new();
-    let mut dir_languages: HashMap<String, HashMap<String, usize>> = HashMap::new();
-    let mut dir_names: HashMap<String, HashMap<String, usize>> = HashMap::new();
+    //
+    // One aggregate per directory keeps the key clone count to at most one per
+    // chunk (on the `entry().or_insert_with` path for new dirs, zero for existing).
+    struct DirAggregate {
+        files: std::collections::HashSet<String>,
+        chunk_count: usize,
+        languages: HashMap<String, usize>,
+        names: HashMap<String, usize>,
+    }
+
+    let mut dir_map: HashMap<String, DirAggregate> = HashMap::new();
 
     for chunk in &metadata {
         // Apply path-prefix filter, consistent with `apply_filters` in search.
@@ -257,45 +264,33 @@ pub async fn run_overview(
         }
 
         let dir = immediate_parent_dir(&chunk.file_path);
-        dir_files
-            .entry(dir.clone())
-            .or_default()
-            .insert(chunk.file_path.clone());
-        *dir_chunks.entry(dir.clone()).or_insert(0) += 1;
-        *dir_languages
-            .entry(dir.clone())
-            .or_default()
-            .entry(chunk.language.clone())
-            .or_insert(0) += 1;
+        let agg = dir_map.entry(dir).or_insert_with(|| DirAggregate {
+            files: std::collections::HashSet::new(),
+            chunk_count: 0,
+            languages: HashMap::new(),
+            names: HashMap::new(),
+        });
+        agg.files.insert(chunk.file_path.clone());
+        agg.chunk_count += 1;
+        *agg.languages.entry(chunk.language.clone()).or_insert(0) += 1;
         if let Some(ref name) = chunk.name
             && !name.is_empty()
         {
-            *dir_names
-                .entry(dir.clone())
-                .or_default()
-                .entry(name.clone())
-                .or_insert(0) += 1;
+            *agg.names.entry(name.clone()).or_insert(0) += 1;
         }
     }
 
-    let mut directories: Vec<DirectoryRollup> = dir_files
-        .keys()
-        .map(|dir| {
-            let file_count = dir_files[dir].len();
-            let chunk_count = dir_chunks[dir];
-
-            let mut languages: Vec<LanguageCount> = dir_languages
-                .get(dir)
-                .map(|lang_map| {
-                    lang_map
-                        .iter()
-                        .map(|(lang, count)| LanguageCount {
-                            language: lang.clone(),
-                            chunk_count: *count,
-                        })
-                        .collect()
+    let mut directories: Vec<DirectoryRollup> = dir_map
+        .into_iter()
+        .map(|(dir, agg)| {
+            let mut languages: Vec<LanguageCount> = agg
+                .languages
+                .into_iter()
+                .map(|(language, chunk_count)| LanguageCount {
+                    language,
+                    chunk_count,
                 })
-                .unwrap_or_default();
+                .collect();
             // Sort by chunk count desc, then language name asc for determinism.
             languages.sort_by(|a, b| {
                 b.chunk_count
@@ -303,24 +298,20 @@ pub async fn run_overview(
                     .then_with(|| a.language.cmp(&b.language))
             });
 
-            let top_identifiers: Vec<String> = dir_names
-                .get(dir)
-                .map(|name_map| {
-                    let mut pairs: Vec<(&String, usize)> =
-                        name_map.iter().map(|(n, c)| (n, *c)).collect();
-                    // Frequency desc, then name asc for determinism, then cap.
-                    pairs.sort_by(|(a_name, a_count), (b_name, b_count)| {
-                        b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
-                    });
-                    pairs.truncate(TOP_IDENTIFIERS_CAP);
-                    pairs.into_iter().map(|(name, _)| name.clone()).collect()
-                })
-                .unwrap_or_default();
+            let top_identifiers: Vec<String> = {
+                let mut pairs: Vec<(String, usize)> = agg.names.into_iter().collect();
+                // Frequency desc, then name asc for determinism, then cap.
+                pairs.sort_by(|(a_name, a_count), (b_name, b_count)| {
+                    b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
+                });
+                pairs.truncate(TOP_IDENTIFIERS_CAP);
+                pairs.into_iter().map(|(name, _)| name).collect()
+            };
 
             DirectoryRollup {
-                path: dir.clone(),
-                file_count,
-                chunk_count,
+                path: dir,
+                file_count: agg.files.len(),
+                chunk_count: agg.chunk_count,
                 languages,
                 top_identifiers,
             }
@@ -340,26 +331,62 @@ pub async fn run_overview(
     })
 }
 
-/// Read the embedding identity (model, dimensions) from a repo's manifest without
-/// validating against any reference. Used to bootstrap the reference for the first
-/// repo in a multi-repo scan.
-async fn peek_manifest_identity(repo_path: &str) -> std::result::Result<(String, u16), RepoError> {
+/// Read the manifest JSON sidecar directly from a repo path without opening a
+/// Store (no LanceDB connection machinery). Derives the manifest path from the
+/// repo's config the same way `Store::new` would, but avoids a second Store
+/// construction in the `load_repo_chunks_readonly` call that always follows.
+///
+/// The manifest file name and location logic must stay in sync with
+/// `Store::new` + `store::manifest::MANIFEST_FILE_NAME`.
+fn read_manifest_at_repo(
+    repo_path: &str,
+) -> std::result::Result<Option<crate::store::Manifest>, RepoError> {
     let config = config::load(std::path::Path::new(repo_path)).map_err(|e| RepoError {
         repo: repo_path.to_owned(),
         error: e.to_string(),
     })?;
 
-    let store = Store::new(repo_path, &config).map_err(|e| RepoError {
+    // Replicate `Store::new` path derivation: canonicalize root, join the
+    // config-relative index_dir (validated at config-load time to not escape),
+    // take its parent as state_dir, append the manifest file name.
+    let root = std::path::Path::new(repo_path)
+        .canonicalize()
+        .map_err(|e| RepoError {
+            repo: repo_path.to_owned(),
+            error: e.to_string(),
+        })?;
+
+    let index_dir = root.join(&config.paths.index_dir);
+
+    let state_dir = index_dir.parent().ok_or_else(|| RepoError {
+        repo: repo_path.to_owned(),
+        error: "index path has no parent directory".to_owned(),
+    })?;
+
+    let manifest_path = state_dir.join(crate::store::manifest::MANIFEST_FILE_NAME);
+
+    if !manifest_path.exists() {
+        return Ok(None);
+    }
+
+    let text = fs::read_to_string(&manifest_path).map_err(|e| RepoError {
         repo: repo_path.to_owned(),
         error: e.to_string(),
     })?;
 
-    let manifest = store.read_manifest().map_err(|e| RepoError {
-        repo: store.project_root().display().to_string(),
+    let manifest: crate::store::Manifest = serde_json::from_str(&text).map_err(|e| RepoError {
+        repo: repo_path.to_owned(),
         error: e.to_string(),
     })?;
 
-    match manifest {
+    Ok(Some(manifest))
+}
+
+/// Read the embedding identity (model, dimensions) from a repo's manifest without
+/// validating against any reference. Used to bootstrap the reference for the first
+/// repo in a multi-repo scan.
+fn peek_manifest_identity(repo_path: &str) -> std::result::Result<(String, u16), RepoError> {
+    match read_manifest_at_repo(repo_path)? {
         Some(m) if m.chunk_count > 0 => Ok((m.embedding_model, m.dimensions)),
         _ => Err(RepoError {
             repo: repo_path.to_owned(),
@@ -472,7 +499,7 @@ pub async fn run_find_duplicates(
     };
 
     let mut all_chunks: Vec<crate::store::StoredChunk> = Vec::new();
-    let mut repo_labels: Vec<String> = Vec::new();
+    let mut repo_labels: Vec<Arc<str>> = Vec::new();
     let mut repo_errors: Vec<RepoError> = Vec::new();
 
     // The reference embedding identity is taken from the first repo whose manifest
@@ -482,7 +509,7 @@ pub async fn run_find_duplicates(
     for path in &repo_paths {
         // Resolve reference identity lazily from the first successful manifest.
         if ref_identity.is_none() {
-            match peek_manifest_identity(path).await {
+            match peek_manifest_identity(path) {
                 Ok(identity) => ref_identity = Some(identity),
                 Err(err) => {
                     repo_errors.push(err);
@@ -496,8 +523,9 @@ pub async fn run_find_duplicates(
         };
         match load_repo_chunks_readonly(path, ref_model, *ref_dims).await {
             Ok((canonical, chunks)) => {
+                let label: Arc<str> = Arc::from(canonical.as_str());
                 for _ in &chunks {
-                    repo_labels.push(canonical.clone());
+                    repo_labels.push(Arc::clone(&label));
                 }
                 all_chunks.extend(chunks);
             }
@@ -521,7 +549,7 @@ pub async fn run_find_duplicates(
             .iter()
             .zip(repo_labels.iter())
             .map(|(chunk, repo)| LabeledChunk {
-                repo: repo.as_str(),
+                repo: repo.as_ref(),
                 chunk,
             })
             .collect();

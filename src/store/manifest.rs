@@ -8,7 +8,7 @@ use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::util::parse_rfc3339;
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub(super) const MANIFEST_FILE_NAME: &str = "manifest.json";
+pub(crate) const MANIFEST_FILE_NAME: &str = "manifest.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {

@@ -136,13 +136,13 @@ impl Searcher {
     async fn collect_labeled_rows(
         &self,
         query: &SearchQuery,
-    ) -> Result<(Vec<(String, StoredChunk)>, Vec<RepoError>)> {
-        let active_repo = self.project_root.display().to_string();
+    ) -> Result<(Vec<(Arc<str>, StoredChunk)>, Vec<RepoError>)> {
+        let active_repo: Arc<str> = Arc::from(self.project_root.display().to_string().as_str());
         let active_rows = self.store.read_chunks().await?;
 
-        let mut labeled: Vec<(String, StoredChunk)> = active_rows
+        let mut labeled: Vec<(Arc<str>, StoredChunk)> = active_rows
             .into_iter()
-            .map(|row| (active_repo.clone(), row))
+            .map(|row| (Arc::clone(&active_repo), row))
             .collect();
         let mut repo_errors = Vec::new();
 
@@ -154,15 +154,16 @@ impl Searcher {
         // embedding is comparable to every repo's stored vectors.
         let ref_model = self.embedder.model_id();
         let ref_dims = self.embedder.dimensions().0;
-        let mut seen: HashSet<String> = HashSet::from([active_repo]);
+        let mut seen: HashSet<Arc<str>> = HashSet::from([Arc::clone(&active_repo)]);
 
         for repo in &query.repos {
             match load_repo_chunks_readonly(repo, ref_model, ref_dims).await {
                 Ok((canonical, rows)) => {
-                    if !seen.insert(canonical.clone()) {
+                    let canonical: Arc<str> = Arc::from(canonical.as_str());
+                    if !seen.insert(Arc::clone(&canonical)) {
                         continue;
                     }
-                    labeled.extend(rows.into_iter().map(|row| (canonical.clone(), row)));
+                    labeled.extend(rows.into_iter().map(|row| (Arc::clone(&canonical), row)));
                 }
                 Err(error) => repo_errors.push(error),
             }
@@ -215,7 +216,7 @@ struct RowScore {
 
 fn rank_rows(
     query: SearchQuery,
-    rows: Vec<(String, StoredChunk)>,
+    rows: Vec<(Arc<str>, StoredChunk)>,
     query_vector: Vec<f32>,
     config: SearchConfig,
 ) -> Result<Vec<SearchResult>> {
@@ -287,7 +288,7 @@ fn rank_rows(
                 chunk: stored_chunk_to_chunk(row),
                 score: boosted_score,
                 stale: false,
-                repo,
+                repo: repo.to_string(),
             })
         })
         .collect::<Vec<_>>();
@@ -441,9 +442,9 @@ fn validate_query_vector(vector: &[f32], dimensions: Dimension) -> Result<()> {
 }
 
 fn apply_filters(
-    rows: Vec<(String, StoredChunk)>,
+    rows: Vec<(Arc<str>, StoredChunk)>,
     query: &SearchQuery,
-) -> Vec<(String, StoredChunk)> {
+) -> Vec<(Arc<str>, StoredChunk)> {
     let language_filter = query.language_filter.as_ref().map(|languages| {
         languages
             .iter()
@@ -745,10 +746,9 @@ mod tests {
     /// Wrap raw `StoredChunk`s with a fake repo label for `rank_rows` tests.
     fn label_rows(
         rows: Vec<crate::store::StoredChunk>,
-    ) -> Vec<(String, crate::store::StoredChunk)> {
-        rows.into_iter()
-            .map(|r| ("/test/repo".to_owned(), r))
-            .collect()
+    ) -> Vec<(Arc<str>, crate::store::StoredChunk)> {
+        let label: Arc<str> = Arc::from("/test/repo");
+        rows.into_iter().map(|r| (Arc::clone(&label), r)).collect()
     }
 
     #[test]
