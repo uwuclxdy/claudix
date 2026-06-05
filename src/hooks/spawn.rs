@@ -263,6 +263,81 @@ mod tests {
         );
     }
 
+    // ── Part A: watcher boot-window visibility ────────────────────────────────
+    //
+    // The sequence in spawn_background_watch is:
+    //   1. try_claim writes parent PID → marker exists with live PID
+    //   2. spawn_detached_claudix forks child C
+    //   3. fs::write(marker, child_pid) → marker has child PID (C is running)
+    //
+    // In run_watch the child does:
+    //   4. PidMarker::install → adopts its own PID (handoff from parent)
+    //   5. early_heartbeat task starts (fires every 30s, first tick consumed)
+    //   6. Claudix::new / ONNX cold load (can take minutes)
+    //
+    // is_alive uses process_running(pid) which is true as long as the process
+    // is alive — mtime is only consulted for unparseable marker content. Both
+    // the parent (steps 1-3) and the child (steps 4+) are live processes, so
+    // watcher_alive() must return true throughout the entire boot sequence.
+    //
+    // These tests exercise the marker/liveness functions directly to confirm
+    // the invariant holds without needing a real child process spawn.
+
+    #[test]
+    fn watcher_boot_window_marker_with_parent_pid_is_alive() {
+        // Simulates step 1: parent wrote its own PID before spawning the child.
+        // Parent is the current process, which is definitely alive.
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("watch.pid");
+        fs::write(&marker_path, std::process::id().to_string()).unwrap_or_else(|_| unreachable!());
+
+        assert!(
+            crate::store::marker::is_alive(
+                &marker_path,
+                Duration::from_secs(WATCH_MARKER_STALE_SECS),
+            ),
+            "marker with parent PID must be alive during pre-spawn window"
+        );
+    }
+
+    #[test]
+    fn watcher_boot_window_fresh_unparseable_marker_is_alive() {
+        // Simulates the brief window between create_new and the PID write
+        // (e.g. empty file or partial write). The mtime-fallback branch of
+        // is_alive must keep the marker alive within WATCH_MARKER_STALE_SECS.
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("watch.pid");
+        fs::write(&marker_path, "").unwrap_or_else(|_| unreachable!());
+        // mtime is now — well within the stale window.
+
+        assert!(
+            crate::store::marker::is_alive(
+                &marker_path,
+                Duration::from_secs(WATCH_MARKER_STALE_SECS),
+            ),
+            "fresh unparseable marker must be treated as alive (boot-window cover)"
+        );
+    }
+
+    #[test]
+    fn watcher_boot_window_stale_unparseable_marker_is_dead() {
+        // A malformed marker older than WATCH_MARKER_STALE_SECS must be
+        // reclaimable so stale-marker recovery still works.
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("watch.pid");
+        fs::write(&marker_path, "not-a-pid").unwrap_or_else(|_| unreachable!());
+        let stale = SystemTime::now() - Duration::from_secs(WATCH_MARKER_STALE_SECS + 1);
+        let _ = fs::File::open(&marker_path).and_then(|f| f.set_modified(stale));
+
+        assert!(
+            !crate::store::marker::is_alive(
+                &marker_path,
+                Duration::from_secs(WATCH_MARKER_STALE_SECS),
+            ),
+            "stale unparseable marker must be reclaimable after timeout"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_background_index_skips_when_manifest_fresh_and_populated()
     -> crate::error::Result<()> {

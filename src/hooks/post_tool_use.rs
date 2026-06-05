@@ -39,20 +39,31 @@ pub(super) async fn handle_post_tool_use(
     // Spawn a background reindex only when an edit tool fired on a real file.
     // The ready-check and neighbor-surfacing runs on every PostToolUse event
     // regardless of whether a spawn happened.
+    //
+    // Multi-file payloads (MultiEdit-style tools) may carry `files_modified`
+    // in addition to or instead of `file_path`. Collect all distinct paths,
+    // dedupe, and spawn one reindex per watchable file.
     let read_input = if let Some(name) = tool_name
         && matches!(name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
         && !watcher_alive(project_root, cfg)
         && let Some(input) = payload.tool_input.as_ref()
-        && let Some(file_path) = input
-            .file_path
-            .as_deref()
-            .or(input.notebook_path.as_deref())
-        && reindex_target_is_watchable(project_root, file_path)
     {
-        spawn_background_reindex_file(project_root, file_path);
-        None
+        let paths = reindex_paths_from_input(input);
+        let spawned = paths
+            .iter()
+            .filter(|p| reindex_target_is_watchable(project_root, p))
+            .inspect(|p| spawn_background_reindex_file(project_root, p))
+            .count();
+        // Preserve tool_input for read-surfacing only when nothing was spawned
+        // (no watchable paths found). When we did spawn, pass None so the
+        // read-surfacing branch correctly skips (it only acts on Read events).
+        if spawned > 0 {
+            None
+        } else {
+            payload.tool_input
+        }
     } else {
         payload.tool_input
     };
@@ -338,6 +349,35 @@ fn reindex_target_is_watchable(project_root: &Path, file_path: &str) -> bool {
     }
 }
 
+/// Collect the distinct file paths that a tool input targets for reindexing.
+///
+/// Merges `file_path`, `notebook_path`, and the `files_modified` list (for
+/// MultiEdit-style payloads). Duplicates are dropped; order is preserved.
+fn reindex_paths_from_input(input: &ToolInput) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut paths = Vec::new();
+
+    let singles = input
+        .file_path
+        .as_deref()
+        .into_iter()
+        .chain(input.notebook_path.as_deref());
+
+    let multi = input
+        .files_modified
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(String::as_str);
+
+    for p in singles.chain(multi) {
+        if seen.insert(p.to_owned()) {
+            paths.push(p.to_owned());
+        }
+    }
+    paths
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +421,45 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    // ── reindex_paths_from_input ──────────────────────────────────────────────
+
+    fn make_tool_input(file_path: Option<&str>, files_modified: Option<Vec<&str>>) -> ToolInput {
+        let json = serde_json::json!({
+            "file_path": file_path,
+            "files_modified": files_modified.map(|v| v.into_iter().collect::<Vec<_>>()),
+        });
+        serde_json::from_value(json).expect("must parse")
+    }
+
+    #[test]
+    fn reindex_paths_only_file_path() {
+        let input = make_tool_input(Some("src/lib.rs"), None);
+        assert_eq!(reindex_paths_from_input(&input), vec!["src/lib.rs"]);
+    }
+
+    #[test]
+    fn reindex_paths_only_files_modified() {
+        let input = make_tool_input(None, Some(vec!["src/lib.rs", "src/main.rs"]));
+        assert_eq!(
+            reindex_paths_from_input(&input),
+            vec!["src/lib.rs", "src/main.rs"]
+        );
+    }
+
+    #[test]
+    fn reindex_paths_both_deduped() {
+        // file_path appears in files_modified too — must appear exactly once.
+        let input = make_tool_input(Some("src/lib.rs"), Some(vec!["src/lib.rs", "src/main.rs"]));
+        let paths = reindex_paths_from_input(&input);
+        assert_eq!(paths, vec!["src/lib.rs", "src/main.rs"]);
+    }
+
+    #[test]
+    fn reindex_paths_neither_field_is_empty() {
+        let input = make_tool_input(None, None);
+        assert!(reindex_paths_from_input(&input).is_empty());
     }
 
     #[tokio::test]
