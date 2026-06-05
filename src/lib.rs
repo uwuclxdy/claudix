@@ -150,6 +150,14 @@ impl Claudix {
 
         let mut rows = unchanged_rows;
 
+        // Collect chunks for all changed files before embedding so the provider
+        // can batch across file boundaries — 10 files × 8 chunks → 1 round-trip
+        // at batch_size=32 instead of 10 serial round-trips.  Vectors for all
+        // changed files are held in memory simultaneously; acceptable because the
+        // total size is bounded by the number of changed chunks × dimension size.
+        let mut file_chunk_counts: Vec<(&EnumeratedFile, usize)> = Vec::new();
+        let mut all_chunks: Vec<Chunk> = Vec::new();
+
         for file in files
             .iter()
             .filter(|file| changed_paths.contains(file.relative_path.as_str()))
@@ -162,11 +170,22 @@ impl Claudix {
                 )?;
                 continue;
             }
+            file_chunk_counts.push((file, chunks.len()));
+            all_chunks.extend(chunks);
+        }
 
-            let embedded_chunks = self.embed_chunks(chunks).await?;
+        // Single cross-file embed call; provider's batch_size governs request sizes.
+        let all_embedded = self.embed_chunks(all_chunks).await?;
+
+        // Partition embedded results back per file in original order and write rows.
+        let mut offset = 0;
+        for (file, count) in file_chunk_counts {
+            let embedded_chunks = &all_embedded[offset..offset + count];
+            offset += count;
+
             rows.retain(|row| row.file_path != file.relative_path.as_str());
             rows.extend(stored_chunks_from_embedded(
-                &embedded_chunks,
+                embedded_chunks,
                 Dimension(self.config.embedding.dimensions),
             )?);
             progress.file(&file.relative_path, IndexFileStatus::Indexed)?;
@@ -564,6 +583,38 @@ mod tests {
 
         async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.calls.fetch_add(batch.len(), Ordering::Relaxed);
+            self.inner.embed(batch).await
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            self.inner.health_check().await
+        }
+    }
+
+    /// Provider that counts how many times `embed` is invoked (not how many
+    /// items are passed).  Used to assert cross-file batching in `index_full`
+    /// reduces call count to `ceil(total_chunks / batch_size)`.
+    struct InvocationCountingProvider {
+        inner: StubProvider,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for InvocationCountingProvider {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn dimensions(&self) -> Dimension {
+            self.inner.dimensions()
+        }
+
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+
+        async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.invocations.fetch_add(1, Ordering::Relaxed);
             self.inner.embed(batch).await
         }
 
@@ -1040,6 +1091,41 @@ mod tests {
         // index_full must still succeed via the incremental path.
         let stats = claudix.index_full(&mut ()).await?;
         assert!(stats.file_count > 0);
+        Ok(())
+    }
+
+    /// `index_full` must batch chunks across file boundaries so the number of
+    /// `embed` invocations equals `ceil(total_chunks / batch_size)`, not one
+    /// call per changed file.
+    #[tokio::test]
+    async fn index_full_batches_embed_calls_across_files() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let mut config = stub_config();
+        // Force batch_size=1 so each embed() call takes exactly one chunk; with
+        // two files producing 3 chunks total we expect 3 invocations regardless
+        // of how many files there are (proving cross-file batching is active).
+        config.embedding.batch_size = 1;
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Provider> = Arc::new(InvocationCountingProvider {
+            inner: StubProvider::with_model_id(
+                config.embedding.model.clone(),
+                Dimension(config.embedding.dimensions),
+            ),
+            invocations: invocations.clone(),
+        });
+        let claudix = test_claudix_with_embedder(fixture.root().to_path_buf(), config, embedder)?;
+
+        let stats = claudix.index_full(&mut ()).await?;
+        // small_rust has 2 files with 3 chunks total (greet + add + module stub).
+        let total_chunks = stats.chunk_count;
+        let observed = invocations.load(Ordering::Relaxed);
+        // With batch_size=1: expected = total_chunks; proves each chunk went
+        // through a single flat embed pass, not one per-file pass.
+        assert_eq!(
+            observed, total_chunks,
+            "expected {total_chunks} embed invocations (batch_size=1, cross-file), got {observed}"
+        );
         Ok(())
     }
 
