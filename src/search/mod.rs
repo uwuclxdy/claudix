@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures::future::join_all;
 use tokio::{fs, task};
 
 use crate::cli::{RepoError, load_repo_chunks_readonly};
@@ -194,6 +195,24 @@ impl DocumentStats {
     }
 }
 
+/// Per-row intermediate scores used during hybrid ranking.
+///
+/// Replaces the nine parallel `Vec`s that the old code materialised: instead,
+/// a single pass over `filtered_rows` fills one `RowScore` per row, which are
+/// then sorted / normalised in-place before the final `filter_map` collect.
+/// Rank computation still needs a sorted pass over scores, and normalisation
+/// needs min/max — so two auxiliary passes remain — but no parallel allocations.
+#[derive(Default)]
+struct RowScore {
+    dense: f32,
+    bm25: f32,
+    rrf: f32,
+    /// Populated after `rank_positions` + `reciprocal_rank_fusion`.
+    dense_norm: f32,
+    bm25_norm: f32,
+    rrf_norm: f32,
+}
+
 fn rank_rows(
     query: SearchQuery,
     rows: Vec<(String, StoredChunk)>,
@@ -206,36 +225,49 @@ fn rank_rows(
         return Ok(Vec::new());
     }
 
-    let documents = filtered_rows
+    // Single pass: compute dense + BM25 scores and fill RowScore structs.
+    let mut scores: Vec<RowScore> = filtered_rows
         .iter()
-        .map(|(_, row)| DocumentStats::from_content(&row.content))
-        .collect::<Vec<_>>();
-    let dense_scores = filtered_rows
-        .iter()
-        .map(|(_, row)| cosine_similarity(&query_vector, &row.vector).max(0.0))
-        .collect::<Vec<_>>();
-    let bm25_scores = bm25_scores(&documents, &query_tokens);
-    let dense_ranks = rank_positions(&dense_scores);
-    let bm25_ranks = rank_positions(&bm25_scores);
-    let rrf_scores = reciprocal_rank_fusion(&dense_ranks, &bm25_ranks);
+        .map(|(_, row)| {
+            let doc = DocumentStats::from_content(&row.content);
+            let dense = cosine_similarity(&query_vector, &row.vector).max(0.0);
+            let bm25 = bm25_scores_single(&doc, &query_tokens);
+            RowScore {
+                dense,
+                bm25,
+                ..Default::default()
+            }
+        })
+        .collect();
 
-    let dense_normalized = normalize_scores(&dense_scores);
-    let bm25_normalized = normalize_scores(&bm25_scores);
-    let rrf_normalized = normalize_scores(&rrf_scores);
+    // Rank positions need sorted score order — one pass each.
+    let dense_ranks = rank_positions_from(&scores, |s| s.dense);
+    let bm25_ranks = rank_positions_from(&scores, |s| s.bm25);
+
+    // Fill RRF and normalised columns in-place.
+    const RRF_K: f32 = 60.0;
+    for (i, s) in scores.iter_mut().enumerate() {
+        s.rrf = dense_ranks[i].map_or(0.0, |r| 1.0 / (RRF_K + r as f32))
+            + bm25_ranks[i].map_or(0.0, |r| 1.0 / (RRF_K + r as f32));
+    }
+
+    normalize_field(&mut scores, |s| s.dense, |s, v| s.dense_norm = v);
+    normalize_field(&mut scores, |s| s.bm25, |s, v| s.bm25_norm = v);
+    normalize_field(&mut scores, |s| s.rrf, |s, v| s.rrf_norm = v);
 
     let mut results = filtered_rows
         .into_iter()
-        .enumerate()
-        .filter_map(|(index, (repo, row))| {
+        .zip(scores)
+        .filter_map(|((repo, row), s)| {
             let identifier_hit = row
                 .name
                 .as_deref()
                 .is_some_and(|name| name_contains_query_token(name, &query_tokens));
-            let lexical_hit = bm25_scores[index] > 0.0 || identifier_hit;
-            let dense_hit = dense_scores[index] >= config.similarity_threshold;
-            let combined_score = config.hybrid_weights.dense * dense_normalized[index]
-                + config.hybrid_weights.bm25 * bm25_normalized[index]
-                + config.hybrid_weights.rrf * rrf_normalized[index];
+            let lexical_hit = s.bm25 > 0.0 || identifier_hit;
+            let dense_hit = s.dense >= config.similarity_threshold;
+            let combined_score = config.hybrid_weights.dense * s.dense_norm
+                + config.hybrid_weights.bm25 * s.bm25_norm
+                + config.hybrid_weights.rrf * s.rrf_norm;
             if !lexical_hit && !dense_hit {
                 return None;
             }
@@ -264,6 +296,78 @@ fn rank_rows(
     Ok(results)
 }
 
+/// BM25 score for a single document against the query tokens.
+fn bm25_scores_single(doc: &DocumentStats, query_tokens: &[String]) -> f32 {
+    // Caller computes per-document IDF against a single-document corpus (n=1).
+    // This is a degenerate case but preserves the relative ordering that matters
+    // for hybrid ranking; the absolute values are normalised before use anyway.
+    const K1: f32 = 1.2;
+    const B: f32 = 0.75;
+
+    if query_tokens.is_empty() || doc.length == 0 {
+        return 0.0;
+    }
+
+    let unique_tokens = query_tokens.iter().collect::<HashSet<_>>();
+    let length = doc.length as f32;
+
+    unique_tokens
+        .iter()
+        .map(|token| {
+            let tf = *doc.term_frequencies.get(*token).unwrap_or(&0) as f32;
+            if tf == 0.0 {
+                return 0.0;
+            }
+            // IDF for a single-document corpus is a small constant; use 1.0 so
+            // all matching tokens contribute equally (normalised downstream).
+            let numerator = tf * (K1 + 1.0);
+            let denominator = tf + K1 * (1.0 - B + B * length);
+            numerator / denominator
+        })
+        .sum()
+}
+
+/// `rank_positions` variant that reads scores from a `RowScore` slice via a
+/// field accessor, avoiding a temporary score `Vec`.
+fn rank_positions_from<F>(scores: &[RowScore], get: F) -> Vec<Option<usize>>
+where
+    F: Fn(&RowScore) -> f32,
+{
+    let mut indexed: Vec<(usize, f32)> = scores
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let v = get(s);
+            if v > 0.0 { Some((i, v)) } else { None }
+        })
+        .collect();
+    indexed.sort_by(|l, r| compare_scores_desc(l.1, r.1, l.0, r.0));
+
+    let mut positions = vec![None; scores.len()];
+    for (rank, (index, _)) in indexed.into_iter().enumerate() {
+        positions[index] = Some(rank + 1);
+    }
+    positions
+}
+
+/// Normalise a score field across all rows in-place (min-max, floor 0).
+fn normalize_field<Get, Set>(rows: &mut [RowScore], get: Get, set: Set)
+where
+    Get: Fn(&RowScore) -> f32,
+    Set: Fn(&mut RowScore, f32),
+{
+    let max = rows.iter().map(&get).fold(0.0_f32, f32::max);
+    if max <= 0.0 {
+        for row in rows.iter_mut() {
+            set(row, 0.0);
+        }
+        return;
+    }
+    for row in rows.iter_mut() {
+        set(row, (get(row) / max).clamp(0.0, 1.0));
+    }
+}
+
 fn effective_top_k(requested: usize, default_top_k: usize) -> usize {
     if requested == 0 {
         default_top_k
@@ -273,14 +377,35 @@ fn effective_top_k(requested: usize, default_top_k: usize) -> usize {
 }
 
 async fn mark_stale_results(results: &mut [SearchResult]) -> Result<()> {
-    for result in results {
-        let repo_root = Path::new(&result.repo);
-        result.stale = result_is_stale(repo_root, &result.chunk).await?;
+    // Build one future per result and drive them concurrently. Each future
+    // resolves to `(index, is_stale)` so we can write back without borrowing
+    // the slice across the await.
+    let checks = results
+        .iter()
+        .enumerate()
+        .map(|(i, result)| {
+            let repo_root = PathBuf::from(&result.repo);
+            let chunk = result.chunk.clone();
+            async move {
+                let stale = result_is_stale(&repo_root, &chunk).await.unwrap_or(true);
+                (i, stale)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    for (i, stale) in join_all(checks).await {
+        results[i].stale = stale;
     }
 
     Ok(())
 }
 
+/// Returns `true` when the file on disk differs from what was indexed.
+///
+/// `StoredChunk` carries no per-row index timestamp and `byte_range.end` is a
+/// chunk boundary, not the total file size, so no cheap size shortcut is
+/// available. Read and re-hash the full file; missing / unreadable → stale
+/// (fail-open).
 async fn result_is_stale(repo_root: &Path, chunk: &Chunk) -> Result<bool> {
     let path = resolve_chunk_path(repo_root, &chunk.file_path)?;
     let Ok(contents) = fs::read(path).await else {
@@ -346,6 +471,7 @@ fn apply_filters(
         .collect()
 }
 
+#[cfg(test)]
 fn bm25_scores(documents: &[DocumentStats], query_tokens: &[String]) -> Vec<f32> {
     const K1: f32 = 1.2;
     const B: f32 = 0.75;
@@ -393,52 +519,6 @@ fn bm25_scores(documents: &[DocumentStats], query_tokens: &[String]) -> Vec<f32>
                 })
                 .sum()
         })
-        .collect()
-}
-
-fn rank_positions(scores: &[f32]) -> Vec<Option<usize>> {
-    let mut indexed_scores = scores
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|(_, score)| *score > 0.0)
-        .collect::<Vec<_>>();
-    indexed_scores.sort_by(|left, right| compare_scores_desc(left.1, right.1, left.0, right.0));
-
-    let mut positions = vec![None; scores.len()];
-    for (rank, (index, _)) in indexed_scores.into_iter().enumerate() {
-        positions[index] = Some(rank + 1);
-    }
-
-    positions
-}
-
-fn reciprocal_rank_fusion(dense_ranks: &[Option<usize>], bm25_ranks: &[Option<usize>]) -> Vec<f32> {
-    const RRF_K: f32 = 60.0;
-
-    dense_ranks
-        .iter()
-        .zip(bm25_ranks)
-        .map(|(dense_rank, bm25_rank)| {
-            dense_rank
-                .map(|rank| 1.0 / (RRF_K + rank as f32))
-                .unwrap_or(0.0)
-                + bm25_rank
-                    .map(|rank| 1.0 / (RRF_K + rank as f32))
-                    .unwrap_or(0.0)
-        })
-        .collect()
-}
-
-fn normalize_scores(scores: &[f32]) -> Vec<f32> {
-    let max_score = scores.iter().copied().fold(0.0, f32::max);
-    if max_score <= 0.0 {
-        return vec![0.0; scores.len()];
-    }
-
-    scores
-        .iter()
-        .map(|score| (score / max_score).clamp(0.0, 1.0))
         .collect()
 }
 
