@@ -899,7 +899,9 @@ mod tests {
     use test_support::{index_fixture, stub_config};
 
     struct CliHarness {
-        _fixture: TestFixture,
+        // Some when the harness owns its fixture (private harness); None when
+        // the fixture is shared and owned by SHARED_FIXTURE_DIR.
+        _fixture: Option<TestFixture>,
         claudix: Claudix,
         store: Store,
     }
@@ -915,7 +917,64 @@ mod tests {
         Ok(Claudix::from_parts(project_root, config, embedder, store))
     }
 
+    // Shared indexed fixture directory — built once per test process.
+    // The TempDir is stored here to keep the path alive for the process lifetime.
+    static SHARED_FIXTURE_DIR: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> =
+        std::sync::OnceLock::new();
+
+    fn shared_fixture_dir() -> &'static (tempfile::TempDir, PathBuf) {
+        SHARED_FIXTURE_DIR.get_or_init(|| {
+            // Spawn a fresh OS thread so `block_on` isn't called from within
+            // an existing tokio runtime (which `#[tokio::test]` provides).
+            // `TestFixture::new` initialises a real git repo so `FileEnumerator`
+            // (called inside `index_fixture`) can enumerate files via git ls-files.
+            // The git cost is paid once here for the entire test process.
+            std::thread::spawn(|| {
+                let fixture = TestFixture::new("small_rust").expect("shared fixture copy failed");
+                let config = stub_config();
+                let root = fixture.root().to_path_buf();
+                let claudix =
+                    test_claudix(root.clone(), config.clone()).expect("shared claudix init failed");
+
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("shared fixture tokio runtime")
+                    .block_on(async {
+                        index_fixture(
+                            &claudix.store,
+                            claudix.embedder.as_ref(),
+                            claudix.project_root(),
+                            &config,
+                        )
+                        .await
+                        .expect("shared fixture indexing failed");
+                    });
+
+                fixture.into_parts()
+            })
+            .join()
+            .expect("shared fixture init thread panicked")
+        })
+    }
+
+    /// Harness for read-only tests: opens a fresh Store/Claudix against the
+    /// shared pre-indexed fixture — no copy, no git, no indexing per test.
     async fn cli_harness() -> Result<CliHarness> {
+        let (_, root) = shared_fixture_dir();
+        let config = stub_config();
+        let claudix = test_claudix(root.clone(), config.clone())?;
+        let store = Store::new(root, &config)?;
+        Ok(CliHarness {
+            _fixture: None,
+            claudix,
+            store,
+        })
+    }
+
+    /// Harness for tests that mutate fixture state (write files, delete the
+    /// index dir, etc.) — each call gets its own isolated copy.
+    async fn cli_harness_private() -> Result<CliHarness> {
         let fixture = TestFixture::new("small_rust")?;
         let config = stub_config();
         let claudix = test_claudix(fixture.root().to_path_buf(), config.clone())?;
@@ -929,7 +988,7 @@ mod tests {
         let store = Store::new(fixture.root(), &config)?;
 
         Ok(CliHarness {
-            _fixture: fixture,
+            _fixture: Some(fixture),
             claudix,
             store,
         })
@@ -1561,7 +1620,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_repo_chunks_readonly_rejects_missing_chunk_table() {
-        let harness = cli_harness().await;
+        let harness = cli_harness_private().await;
         assert!(harness.is_ok());
         let harness = harness.ok().unwrap_or_else(|| unreachable!());
 
@@ -1753,7 +1812,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_partial_success_on_unindexed_repo() {
-        let harness = cli_harness().await;
+        let harness = cli_harness_private().await;
         assert!(harness.is_ok());
         let harness = harness.ok().unwrap_or_else(|| unreachable!());
         let write = write_fixture_config(harness.claudix.project_root(), &stub_config());
@@ -1859,7 +1918,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_dedupes_active_when_listed_in_repos() {
-        let harness = cli_harness().await;
+        let harness = cli_harness_private().await;
         assert!(harness.is_ok());
         let harness = harness.ok().unwrap_or_else(|| unreachable!());
         let write = write_fixture_config(harness.claudix.project_root(), &stub_config());

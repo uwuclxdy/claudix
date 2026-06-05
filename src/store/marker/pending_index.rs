@@ -4,9 +4,11 @@
 //!
 //! Layout (newline-separated):
 //!
-//!     <prior_ts>          // manifest's last_full_index_at when we claimed, or "none"
-//!     <created_at>        // RFC3339, anchors the failure-grace clock
-//!     <child_pid>         // spawned child pid, or "0" placeholder
+//! ```text
+//! <prior_ts>          // manifest's last_full_index_at when we claimed, or "none"
+//! <created_at>        // RFC3339, anchors the failure-grace clock
+//! <child_pid>         // spawned child pid, or "0" placeholder
+//! ```
 //!
 //! Stale recovery is age-based on `created_at` rather than mtime, because
 //! `check_index_ready` rewrites the marker between session-start spawns.

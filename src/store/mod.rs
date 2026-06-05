@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use lancedb::{Connection, Table};
+use tokio::sync::OnceCell;
 
 use crate::config::Config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
@@ -49,10 +50,33 @@ pub struct StoreStats {
     pub file_count: usize,
 }
 
-#[derive(Debug, Clone)]
 pub struct Store {
     project_root: PathBuf,
     paths: StorePaths,
+    /// Cached LanceDB connection — opened once per `Store` instance, cloned on each use.
+    connection: OnceCell<Connection>,
+}
+
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store")
+            .field("project_root", &self.project_root)
+            .field("paths", &self.paths)
+            .field("connection", &self.connection.get().map(|_| "<connected>"))
+            .finish()
+    }
+}
+
+impl Clone for Store {
+    fn clone(&self) -> Self {
+        // Clones share the same paths but get a fresh connection cell; the
+        // connection will be re-established on first use in the clone.
+        Self {
+            project_root: self.project_root.clone(),
+            paths: self.paths.clone(),
+            connection: OnceCell::new(),
+        }
+    }
 }
 
 impl Store {
@@ -74,6 +98,7 @@ impl Store {
         Ok(Self {
             project_root,
             paths,
+            connection: OnceCell::new(),
         })
     }
 
@@ -448,10 +473,15 @@ impl Store {
     }
 
     async fn open_connection(&self) -> Result<Connection> {
-        lancedb::connect(&self.paths.index_dir.to_string_lossy())
-            .execute()
+        self.connection
+            .get_or_try_init(|| async {
+                lancedb::connect(&self.paths.index_dir.to_string_lossy())
+                    .execute()
+                    .await
+                    .map_err(ClaudixError::from)
+            })
             .await
-            .map_err(ClaudixError::from)
+            .cloned()
     }
 
     async fn open_chunks_table(&self) -> Result<Option<Table>> {

@@ -23,8 +23,28 @@ impl TestFixture {
         })
     }
 
+    /// Like `new`, but skips the 5 git subprocess calls. Use this in tests that
+    /// don't exercise git enumeration — saves ~50-100 ms per fixture construction.
+    pub fn without_git(name: &str) -> std::io::Result<Self> {
+        let source = fixture_source(name);
+        let tempdir = tempfile::tempdir()?;
+        let root = tempdir.path().join(name);
+        copy_dir_recursive(&source, &root)?;
+
+        Ok(Self {
+            _tempdir: tempdir,
+            root,
+        })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Decompose into `(TempDir, root_path)` so the caller can store the
+    /// `TempDir` guard without keeping the whole `TestFixture` alive.
+    pub fn into_parts(self) -> (TempDir, PathBuf) {
+        (self._tempdir, self.root)
     }
 }
 

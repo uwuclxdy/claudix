@@ -432,6 +432,7 @@ mod tests {
     use tempfile::tempdir;
 
     #[tokio::test]
+    #[ignore = "hits huggingface network"]
     async fn missing_model_triggers_download_or_network_error() {
         let tempdir = tempdir().ok().unwrap_or_else(|| unreachable!());
 
@@ -442,6 +443,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "hits huggingface network"]
     async fn missing_tokenizer_triggers_download_or_network_error() {
         let tempdir = tempdir().ok().unwrap_or_else(|| unreachable!());
         let model_path = tempdir.path().join(BUNDLED_MODEL_FILENAME);

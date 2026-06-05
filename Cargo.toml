@@ -110,6 +110,122 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 
+# Opt-level for the crate under test: 1 avoids most debug-mode overhead while
+# keeping incremental rebuilds fast. Heavy numerical deps get opt-level 3 (ONNX,
+# tokenizers, ndarray) or 2 (LanceDB / DataFusion / Arrow / tree-sitter) so
+# inference and query planning aren't 10-50x slower in test runs.
+[profile.test]
+opt-level = 1
+
+[profile.dev.package.ort]
+opt-level = 3
+[profile.dev.package.ort-sys]
+opt-level = 3
+[profile.dev.package.tokenizers]
+opt-level = 3
+[profile.dev.package.ndarray]
+opt-level = 3
+
+[profile.dev.package.lancedb]
+opt-level = 2
+[profile.dev.package.lance]
+opt-level = 2
+[profile.dev.package.lance-arrow]
+opt-level = 2
+[profile.dev.package.lance-bitpacking]
+opt-level = 2
+[profile.dev.package.lance-core]
+opt-level = 2
+[profile.dev.package.lance-datafusion]
+opt-level = 2
+[profile.dev.package.lance-encoding]
+opt-level = 2
+[profile.dev.package.lance-file]
+opt-level = 2
+[profile.dev.package.lance-index]
+opt-level = 2
+[profile.dev.package.lance-io]
+opt-level = 2
+[profile.dev.package.lance-linalg]
+opt-level = 2
+[profile.dev.package.lance-table]
+opt-level = 2
+
+[profile.dev.package.datafusion]
+opt-level = 2
+[profile.dev.package.datafusion-catalog]
+opt-level = 2
+[profile.dev.package.datafusion-catalog-listing]
+opt-level = 2
+[profile.dev.package.datafusion-common]
+opt-level = 2
+[profile.dev.package.datafusion-common-runtime]
+opt-level = 2
+[profile.dev.package.datafusion-datasource]
+opt-level = 2
+[profile.dev.package.datafusion-execution]
+opt-level = 2
+[profile.dev.package.datafusion-expr]
+opt-level = 2
+[profile.dev.package.datafusion-expr-common]
+opt-level = 2
+[profile.dev.package.datafusion-functions]
+opt-level = 2
+[profile.dev.package.datafusion-functions-aggregate]
+opt-level = 2
+[profile.dev.package.datafusion-functions-aggregate-common]
+opt-level = 2
+[profile.dev.package.datafusion-optimizer]
+opt-level = 2
+[profile.dev.package.datafusion-physical-expr]
+opt-level = 2
+[profile.dev.package.datafusion-physical-expr-common]
+opt-level = 2
+[profile.dev.package.datafusion-physical-optimizer]
+opt-level = 2
+[profile.dev.package.datafusion-physical-plan]
+opt-level = 2
+[profile.dev.package.datafusion-pruning]
+opt-level = 2
+[profile.dev.package.datafusion-sql]
+opt-level = 2
+
+[profile.dev.package.arrow]
+opt-level = 2
+[profile.dev.package.arrow-array]
+opt-level = 2
+[profile.dev.package.arrow-buffer]
+opt-level = 2
+[profile.dev.package.arrow-cast]
+opt-level = 2
+[profile.dev.package.arrow-data]
+opt-level = 2
+[profile.dev.package.arrow-ipc]
+opt-level = 2
+[profile.dev.package.arrow-schema]
+opt-level = 2
+[profile.dev.package.arrow-select]
+opt-level = 2
+
+[profile.dev.package.tree-sitter]
+opt-level = 2
+[profile.dev.package.tree-sitter-rust]
+opt-level = 2
+[profile.dev.package.tree-sitter-python]
+opt-level = 2
+[profile.dev.package.tree-sitter-javascript]
+opt-level = 2
+[profile.dev.package.tree-sitter-typescript]
+opt-level = 2
+[profile.dev.package.tree-sitter-go]
+opt-level = 2
+[profile.dev.package.tree-sitter-java]
+opt-level = 2
+[profile.dev.package.tree-sitter-c]
+opt-level = 2
+[profile.dev.package.tree-sitter-cpp]
+opt-level = 2
+
 [lints.rust]
 unsafe_code = "forbid"
 
