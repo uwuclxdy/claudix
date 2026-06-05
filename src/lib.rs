@@ -204,13 +204,16 @@ impl Claudix {
             });
         }
 
-        if let Some(stats) = self.skip_unchanged_target(&relative_path).await? {
+        let (skip_stats, preread_bytes) = self.skip_unchanged_target(&relative_path).await?;
+        if let Some(stats) = skip_stats {
             return Ok(stats);
         }
 
         let enumerator =
             FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?;
-        let Some(file) = enumerator.enumerate_one(relative_path.clone(), false)? else {
+        let Some(file) =
+            enumerator.enumerate_one_with_bytes(relative_path.clone(), false, preread_bytes)?
+        else {
             let stats = self
                 .store
                 .delete_file_chunks(&relative_path, self.config.as_ref())
@@ -220,16 +223,6 @@ impl Claudix {
                 chunk_count: stats.chunk_count,
             });
         };
-
-        if let Ok((Some(stored_hash), stats)) =
-            self.store.stored_file_hash_and_stats(&relative_path).await
-            && stored_hash == file.file_hash.0
-        {
-            return Ok(IndexStats {
-                file_count: stats.file_count,
-                chunk_count: stats.chunk_count,
-            });
-        }
 
         let chunks = self.collect_file_chunks(&file).await?;
         let embedded_chunks = self.embed_chunks(chunks).await?;
@@ -331,46 +324,68 @@ impl Claudix {
         self.embedder.health_check().await
     }
 
+    /// Check whether `relative_path` is unchanged according to the manifest.
+    ///
+    /// Returns `(Some(stats), None)` when the file is unchanged and processing
+    /// can be skipped entirely. Returns `(None, Some(bytes))` when the manifest
+    /// was checked but the hash didn't match — the bytes are returned so the
+    /// caller can pass them to `enumerate_one_with_bytes` and avoid a second
+    /// disk read. Returns `(None, None)` when the manifest can't be used as a
+    /// guard (no manifest, model mismatch, file not found, oversized, etc.).
     async fn skip_unchanged_target(
         &self,
         relative_path: &RelativePath,
-    ) -> Result<Option<IndexStats>> {
+    ) -> Result<(Option<IndexStats>, Option<Vec<u8>>)> {
         let Some(manifest) = self.store.read_manifest()? else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let Some(stored_hash) = manifest.file_hashes.get(relative_path.as_str()).copied() else {
-            return Ok(None);
+            return Ok((None, None));
         };
         if manifest.embedding_model != self.config.embedding.model
             || manifest.dimensions != self.config.embedding.dimensions
         {
-            return Ok(None);
+            return Ok((None, None));
         }
 
         let absolute_path = self.project_root.join(relative_path.to_path_buf());
         let bytes = match fs::read(&absolute_path).await {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
             Err(error) => return Err(error.into()),
         };
         if bytes.len() as u64 > self.config.indexing.max_file_size_kb.saturating_mul(1024) {
-            return Ok(None);
+            return Ok((None, None));
         }
         if enumeration::hash_bytes(&bytes).0 != stored_hash {
-            return Ok(None);
+            // Hash mismatch — return the bytes so the caller avoids re-reading.
+            return Ok((None, Some(bytes)));
         }
 
-        Ok(Some(IndexStats {
-            file_count: usize::try_from(manifest.file_count).unwrap_or(usize::MAX),
-            chunk_count: usize::try_from(manifest.chunk_count).unwrap_or(usize::MAX),
-        }))
+        Ok((
+            Some(IndexStats {
+                file_count: usize::try_from(manifest.file_count).unwrap_or(usize::MAX),
+                chunk_count: usize::try_from(manifest.chunk_count).unwrap_or(usize::MAX),
+            }),
+            None,
+        ))
     }
 
     async fn collect_file_chunks(&self, file: &EnumeratedFile) -> Result<Vec<Chunk>> {
-        let content = match fs::read_to_string(&file.absolute_path).await {
-            Ok(content) => content,
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return Ok(Vec::new()),
-            Err(error) => return Err(error.into()),
+        let content = if let Some(bytes) = &file.content {
+            // Bytes were pre-read by the caller; convert without a disk round-trip.
+            match String::from_utf8(bytes.clone()) {
+                Ok(s) => s,
+                Err(_) => return Ok(Vec::new()),
+            }
+        } else {
+            match fs::read_to_string(&file.absolute_path).await {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error.into()),
+            }
         };
         let path = file.relative_path.clone();
         let language = file.language;
@@ -773,6 +788,38 @@ mod tests {
         let stats = stats.ok().unwrap_or_else(|| unreachable!());
         // Chunk count unchanged — no re-embedding happened.
         assert_eq!(stats.chunk_count, 3);
+    }
+
+    #[tokio::test]
+    async fn reindex_file_unchanged_skip_triggers_zero_embed_calls() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
+        claudix.index_full(&mut ()).await?;
+
+        // Wrap the same store+config in a CountingProvider and call reindex_file
+        // on an unchanged file — the manifest hash guard must fire before embedding.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Provider> = Arc::new(CountingProvider {
+            inner: StubProvider::with_model_id(
+                claudix.config().embedding.model.clone(),
+                Dimension(claudix.config().embedding.dimensions),
+            ),
+            calls: calls.clone(),
+        });
+        let c2 = test_claudix_with_embedder(
+            claudix.project_root().to_path_buf(),
+            claudix.config().clone(),
+            embedder,
+        )?;
+        c2.reindex_file(Path::new("src/math.rs")).await?;
+
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "unchanged file must skip embed entirely"
+        );
+        Ok(())
     }
 
     #[tokio::test]

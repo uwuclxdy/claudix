@@ -18,6 +18,9 @@ pub struct EnumeratedFile {
     pub language: Language,
     pub file_hash: FileHash,
     pub force_indexed: bool,
+    /// Raw file bytes pre-read by the caller; `None` in the bulk-index path.
+    /// When present, `enumerate_one` skips the disk read entirely.
+    pub content: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +73,18 @@ impl FileEnumerator {
         relative_path: RelativePath,
         force_indexed: bool,
     ) -> Result<Option<EnumeratedFile>> {
+        self.enumerate_one_with_bytes(relative_path, force_indexed, None)
+    }
+
+    /// Like `enumerate_one` but accepts pre-read bytes to skip the disk read.
+    /// Used by `reindex_file` to thread through bytes already read for hashing,
+    /// so the file is read at most once per `reindex_file` call.
+    pub(crate) fn enumerate_one_with_bytes(
+        &self,
+        relative_path: RelativePath,
+        force_indexed: bool,
+        preread_bytes: Option<Vec<u8>>,
+    ) -> Result<Option<EnumeratedFile>> {
         let absolute_path = self.resolve_relative_path(&relative_path)?;
         let metadata = match fs::symlink_metadata(&absolute_path) {
             Ok(metadata) => metadata,
@@ -105,10 +120,15 @@ impl FileEnumerator {
             absolute_path.clone()
         };
 
-        let contents = match fs::read(&read_path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
+        let contents = if let Some(bytes) = preread_bytes {
+            // Caller already read the file; reuse to avoid a second disk read.
+            bytes
+        } else {
+            match fs::read(&read_path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error.into()),
+            }
         };
         let file_hash = hash_bytes(&contents);
         let language = language_for_path(&absolute_path);
@@ -119,6 +139,7 @@ impl FileEnumerator {
             language,
             file_hash,
             force_indexed,
+            content: Some(contents),
         }))
     }
 
