@@ -116,6 +116,22 @@ impl Claudix {
             .map(|f| (f.relative_path.as_str().to_owned(), f.file_hash.0))
             .collect();
 
+        // Fast path: if the manifest already lists exactly these files with the
+        // same hashes under the same embedding model, skip the LanceDB row read
+        // entirely. touch_manifest_if_in_sync handles the timestamp bump.
+        if self
+            .store
+            .manifest_hashes_match(&current_files, self.config.as_ref())?
+            && let Some(stats) = self
+                .store
+                .touch_manifest_if_in_sync(&current_files, self.config.as_ref())?
+        {
+            return Ok(IndexStats {
+                file_count: stats.file_count,
+                chunk_count: stats.chunk_count,
+            });
+        }
+
         let (changed_paths, unchanged_rows) = self
             .store
             .incremental_file_state(&current_files, &mut *progress)
@@ -891,6 +907,92 @@ mod tests {
             manifest.last_full_index_at.is_some(),
             "verification run must still bump last_full_index_at"
         );
+        Ok(())
+    }
+
+    /// Verifies that a second `index_full` on an unchanged fixture takes the
+    /// manifest-first early exit: `manifest_hashes_match` returns `true` so
+    /// `incremental_file_state` (and therefore any LanceDB read) is never
+    /// reached. Behaviorally this mirrors
+    /// `index_full_skips_lancedb_rewrite_when_nothing_changed` but explicitly
+    /// asserts the manifest guard condition, not just the side effect.
+    #[tokio::test]
+    async fn index_full_takes_manifest_first_early_exit_when_hashes_match() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config.clone())?;
+
+        // First index populates the manifest with file_hashes.
+        let first = claudix.index_full(&mut ()).await?;
+        assert!(first.file_count > 0);
+
+        // Before the second call the manifest must report all hashes in sync.
+        let manifest = claudix
+            .store
+            .read_manifest()?
+            .unwrap_or_else(|| unreachable!());
+        assert!(
+            !manifest.file_hashes.is_empty(),
+            "first index_full must populate file_hashes"
+        );
+        assert!(
+            claudix.store.manifest_hashes_match(
+                &manifest
+                    .file_hashes
+                    .iter()
+                    .map(|(p, h)| (p.clone(), *h))
+                    .collect::<Vec<_>>(),
+                &config
+            )?,
+            "manifest_hashes_match must return true before second index_full"
+        );
+
+        // Second call must return identical stats via the early exit.
+        let second = claudix.index_full(&mut ()).await?;
+        assert_eq!(
+            first, second,
+            "early-exit must return the same stats as the first index"
+        );
+
+        // Timestamp must still be bumped.
+        let manifest2 = claudix
+            .store
+            .read_manifest()?
+            .unwrap_or_else(|| unreachable!());
+        assert!(
+            manifest2.last_full_index_at.is_some(),
+            "early-exit must still bump last_full_index_at"
+        );
+        Ok(())
+    }
+
+    /// Empty `file_hashes` in the manifest (pre-migration index) must fall
+    /// through to the normal incremental path — not take the early exit.
+    #[tokio::test]
+    async fn index_full_falls_through_when_manifest_file_hashes_empty() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config.clone())?;
+
+        // Seed a manifest with empty file_hashes to simulate a pre-migration index.
+        claudix.store.ensure_layout()?;
+        let mut manifest =
+            crate::store::Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        manifest.file_count = 0;
+        manifest.chunk_count = 0;
+        // file_hashes intentionally left empty.
+        claudix.store.write_manifest(&manifest)?;
+
+        // manifest_hashes_match must return false for this shape.
+        let current: Vec<(String, [u8; 16])> = vec![("src/lib.rs".to_owned(), [1u8; 16])];
+        assert!(
+            !claudix.store.manifest_hashes_match(&current, &config)?,
+            "empty file_hashes must not trigger the manifest-first guard"
+        );
+
+        // index_full must still succeed via the incremental path.
+        let stats = claudix.index_full(&mut ()).await?;
+        assert!(stats.file_count > 0);
         Ok(())
     }
 

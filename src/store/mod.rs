@@ -218,6 +218,43 @@ impl Store {
         Ok((changed_paths, unchanged_rows))
     }
 
+    /// Returns `true` when the manifest's `file_hashes` already covers exactly
+    /// `current_files` (same set of paths, same hashes) under the active
+    /// embedding model and dimensions.
+    ///
+    /// A `true` result means the caller can skip every LanceDB row read and
+    /// jump straight to [`Self::touch_manifest_if_in_sync`].
+    ///
+    /// Returns `false` when the manifest is missing, when `file_hashes` is
+    /// empty (pre-migration index), or when any path or hash differs.
+    pub fn manifest_hashes_match(
+        &self,
+        current_files: &[(String, [u8; 16])],
+        config: &Config,
+    ) -> Result<bool> {
+        let Some(manifest) = self.read_manifest()? else {
+            return Ok(false);
+        };
+        if manifest.embedding_model != config.embedding.model
+            || manifest.dimensions != config.embedding.dimensions
+        {
+            return Ok(false);
+        }
+        if manifest.file_hashes.is_empty() {
+            return Ok(false);
+        }
+        if manifest.file_hashes.len() != current_files.len() {
+            return Ok(false);
+        }
+        for (path, hash) in current_files {
+            match manifest.file_hashes.get(path) {
+                Some(stored) if stored == hash => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     /// Bump `last_full_index_at` without rewriting the LanceDB table when the
     /// stored manifest already lists exactly `current_files` (same paths, same
     /// hashes) under the active embedding model.
@@ -1552,5 +1589,129 @@ mod tests {
 
         // Vectors must NOT be present in metadata rows (they don't exist on the type).
         // This is enforced by ChunkMetadata not having a vector field — compile-time guarantee.
+    }
+
+    mod config_support {
+        use crate as claudix;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/config_support.rs"
+        ));
+    }
+
+    use config_support::stub_config;
+
+    #[test]
+    fn manifest_hashes_match_returns_false_when_no_manifest() -> Result<()> {
+        let dir = tempdir()?;
+        let config = stub_config();
+        let store = Store::new(dir.path(), &config)?;
+
+        let current = vec![("src/lib.rs".to_owned(), [1u8; 16])];
+        assert!(!store.manifest_hashes_match(&current, &config)?);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_hashes_match_returns_false_for_empty_file_hashes() -> Result<()> {
+        let dir = tempdir()?;
+        let config = stub_config();
+        let store = Store::new(dir.path(), &config)?;
+        store.ensure_layout()?;
+
+        // Manifest with empty file_hashes (pre-migration shape).
+        let manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        store.write_manifest(&manifest)?;
+
+        let current = vec![("src/lib.rs".to_owned(), [1u8; 16])];
+        assert!(!store.manifest_hashes_match(&current, &config)?);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_hashes_match_returns_false_on_model_mismatch() -> Result<()> {
+        let dir = tempdir()?;
+        let config = stub_config();
+        let store = Store::new(dir.path(), &config)?;
+        store.ensure_layout()?;
+
+        let mut manifest = Manifest::new("other-model", config.embedding.dimensions);
+        manifest
+            .file_hashes
+            .insert("src/lib.rs".to_owned(), [1u8; 16]);
+        manifest.file_count = 1;
+        store.write_manifest(&manifest)?;
+
+        let current = vec![("src/lib.rs".to_owned(), [1u8; 16])];
+        assert!(!store.manifest_hashes_match(&current, &config)?);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_hashes_match_returns_false_when_hash_differs() -> Result<()> {
+        let dir = tempdir()?;
+        let config = stub_config();
+        let store = Store::new(dir.path(), &config)?;
+        store.ensure_layout()?;
+
+        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        manifest
+            .file_hashes
+            .insert("src/lib.rs".to_owned(), [1u8; 16]);
+        manifest.file_count = 1;
+        store.write_manifest(&manifest)?;
+
+        let current = vec![("src/lib.rs".to_owned(), [2u8; 16])];
+        assert!(!store.manifest_hashes_match(&current, &config)?);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_hashes_match_returns_false_when_file_set_differs() -> Result<()> {
+        let dir = tempdir()?;
+        let config = stub_config();
+        let store = Store::new(dir.path(), &config)?;
+        store.ensure_layout()?;
+
+        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        manifest
+            .file_hashes
+            .insert("src/lib.rs".to_owned(), [1u8; 16]);
+        manifest.file_count = 1;
+        store.write_manifest(&manifest)?;
+
+        // Extra file not in manifest.
+        let current = vec![
+            ("src/lib.rs".to_owned(), [1u8; 16]),
+            ("src/main.rs".to_owned(), [2u8; 16]),
+        ];
+        assert!(!store.manifest_hashes_match(&current, &config)?);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_hashes_match_returns_true_when_fully_in_sync() -> Result<()> {
+        let dir = tempdir()?;
+        let config = stub_config();
+        let store = Store::new(dir.path(), &config)?;
+        store.ensure_layout()?;
+
+        let mut manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        manifest
+            .file_hashes
+            .insert("src/lib.rs".to_owned(), [1u8; 16]);
+        manifest
+            .file_hashes
+            .insert("src/math.rs".to_owned(), [2u8; 16]);
+        manifest.file_count = 2;
+        store.write_manifest(&manifest)?;
+
+        let current = vec![
+            ("src/lib.rs".to_owned(), [1u8; 16]),
+            ("src/math.rs".to_owned(), [2u8; 16]),
+        ];
+        assert!(store.manifest_hashes_match(&current, &config)?);
+        Ok(())
     }
 }
