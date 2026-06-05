@@ -77,6 +77,13 @@ pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bo
     true
 }
 
+/// Set on every background child we spawn. A process that finds it in its own
+/// environment must never spawn another background claudix: this caps the spawn
+/// chain at depth 1 and turns a binary that misparses its argv (e.g. a libtest
+/// harness reading `index` as a test-name filter and re-running the suite)
+/// from an unbounded fork bomb into a no-op.
+const BACKGROUND_SENTINEL: &str = "CLAUDIX_BACKGROUND";
+
 pub(super) fn spawn_detached_claudix<const N: usize, S>(
     project_root: &Path,
     args: [S; N],
@@ -84,7 +91,27 @@ pub(super) fn spawn_detached_claudix<const N: usize, S>(
 where
     S: AsRef<OsStr>,
 {
+    // Re-entry guard: background workers (`index`, `watch`, `reindex-file`)
+    // never legitimately spawn further background claudix processes.
+    if std::env::var_os(BACKGROUND_SENTINEL).is_some() {
+        return None;
+    }
     let binary = std::env::current_exe().ok()?;
+
+    // In the unit-test build `current_exe()` is the libtest harness, which
+    // would treat `index`/`watch` as a test-name filter and re-run the suite
+    // from every spawn site — recursively. Shadow the args with a filter that
+    // matches no test: callers still get a real detached PID, and the child
+    // exits after running zero tests.
+    #[cfg(test)]
+    let args = {
+        let _ = args;
+        [
+            OsStr::new("__claudix_no_such_test__"),
+            OsStr::new("--exact"),
+        ]
+    };
+
     spawn_detached_command(project_root, binary.as_os_str(), args)
 }
 
@@ -140,6 +167,7 @@ where
         .args(args.iter().map(AsRef::as_ref))
         .current_dir(project_root)
         .env("CLAUDE_PROJECT_DIR", project_root)
+        .env(BACKGROUND_SENTINEL, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -167,6 +195,7 @@ where
         .args(args.iter().map(AsRef::as_ref))
         .current_dir(project_root)
         .env("CLAUDE_PROJECT_DIR", project_root)
+        .env(BACKGROUND_SENTINEL, "1")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

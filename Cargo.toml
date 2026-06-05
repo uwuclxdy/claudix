@@ -106,7 +106,11 @@ tokio-test = "0.4.5"
 [profile.release]
 strip = true
 opt-level = 3
-lto = "fat"
+# Thin, not fat: fat LTO re-links the whole lancedb/datafusion/ort dep tree on
+# every source change, and `cargo test --release --all-targets` pays that link
+# once per test binary (minutes each). Thin keeps cross-crate inlining at a
+# fraction of the link cost.
+lto = "thin"
 codegen-units = 1
 panic = "abort"
 

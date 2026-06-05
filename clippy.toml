@@ -1,0 +1,4 @@
+# `unwrap_used` / `expect_used` (denied in Cargo.toml lints) protect production
+# paths; panicking on broken preconditions is the correct behavior inside tests.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

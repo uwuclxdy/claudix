@@ -25,6 +25,9 @@ impl TestFixture {
 
     /// Like `new`, but skips the 5 git subprocess calls. Use this in tests that
     /// don't exercise git enumeration — saves ~50-100 ms per fixture construction.
+    // This file is `include!`d into several test modules; not every copy uses
+    // every helper.
+    #[allow(dead_code)]
     pub fn without_git(name: &str) -> std::io::Result<Self> {
         let source = fixture_source(name);
         let tempdir = tempfile::tempdir()?;
@@ -43,6 +46,7 @@ impl TestFixture {
 
     /// Decompose into `(TempDir, root_path)` so the caller can store the
     /// `TempDir` guard without keeping the whole `TestFixture` alive.
+    #[allow(dead_code)]
     pub fn into_parts(self) -> (TempDir, PathBuf) {
         (self._tempdir, self.root)
     }
@@ -84,10 +88,29 @@ fn init_git_repo(root: &Path) -> std::io::Result<()> {
 }
 
 fn run<const N: usize>(root: &Path, args: [&str; N]) -> std::io::Result<()> {
-    let status = Command::new("git").current_dir(root).args(args).status()?;
-    if status.success() {
+    // Neutralise the developer's global/system git config for the throwaway
+    // fixture repo. The user's `commit.gpgsign = true` otherwise routes every
+    // fixture commit through gpg-agent (eddsa signing), adding 10-30s per
+    // fixture and intermittently failing under parallel test load. Pointing
+    // both config scopes at a path that does not exist makes git read them as
+    // empty (portable across platforms); the local `user.name`/`user.email`
+    // we set still land in `.git/config`.
+    let empty_config = root.join(".claudix-test-empty-gitconfig");
+    // `output()` (not `status()`) so fixture git chatter — init hints, commit
+    // summaries — never pollutes test output; stderr surfaces only on failure.
+    let output = Command::new("git")
+        .current_dir(root)
+        .env("GIT_CONFIG_GLOBAL", &empty_config)
+        .env("GIT_CONFIG_SYSTEM", &empty_config)
+        .args(args)
+        .output()?;
+    if output.status.success() {
         return Ok(());
     }
 
-    Err(std::io::Error::other(format!("git command failed: {:?}", args)))
+    Err(std::io::Error::other(format!(
+        "git command failed: {:?}: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    )))
 }
