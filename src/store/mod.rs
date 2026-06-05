@@ -24,10 +24,10 @@ use crate::types::{Dimension, EmbeddedChunk, RelativePath, reject_path_escape};
 use crate::util::now_rfc3339;
 use crate::{IndexFileStatus, IndexProgress};
 
-use arrow::{chunk_schema, read_all_rows, record_batch_from_rows};
+use arrow::{chunk_schema, read_all_rows, read_metadata_rows, record_batch_from_rows};
 
-pub use chunk_row::StoredChunk;
 pub(crate) use chunk_row::stored_chunks_from_embedded;
+pub use chunk_row::{ChunkMetadata, StoredChunk};
 pub use lock::IndexLockGuard;
 pub use manifest::{Manifest, SCHEMA_VERSION};
 
@@ -149,6 +149,16 @@ impl Store {
         Ok(rows)
     }
 
+    /// Projected read that returns only lightweight scalar metadata, omitting
+    /// embedding vectors. Use this when callers only need `file_path`,
+    /// `file_hash`, `language`, or `name` — avoids loading large float arrays.
+    pub async fn read_chunk_metadata(&self) -> Result<Vec<ChunkMetadata>> {
+        let Some(table) = self.open_chunks_table().await? else {
+            return Ok(Vec::new());
+        };
+        read_metadata_rows(&table).await
+    }
+
     pub async fn stored_file_hash_and_stats(
         &self,
         relative_path: &RelativePath,
@@ -165,10 +175,16 @@ impl Store {
         current_files: &[(String, [u8; 16])],
         progress: &mut dyn IndexProgress,
     ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
-        let stored_rows = self.read_chunks().await?;
-        let stored_file_hashes = self.stored_file_hashes(&stored_rows)?;
+        // Use the projected metadata read to build the hash map — no vectors needed here.
+        let metadata = self.read_chunk_metadata().await?;
+        let stored_file_hashes = self.stored_file_hashes_from_metadata(&metadata)?;
         let stored_path_set: HashSet<&str> =
             stored_file_hashes.keys().map(String::as_str).collect();
+
+        // Full rows are still required for the unchanged_rows output (callers
+        // pass them straight into persist_incremental), so we load them after
+        // the cheap hash-comparison pass.
+        let stored_rows = self.read_chunks().await?;
 
         let mut changed_paths: HashSet<String> = HashSet::new();
         for (path, hash) in current_files {
@@ -457,6 +473,23 @@ impl Store {
 
         Ok(manifest.file_hashes)
     }
+
+    /// Same logic as [`stored_file_hashes`], but accepts lightweight metadata
+    /// rows instead of full [`StoredChunk`]s so callers can avoid loading vectors.
+    fn stored_file_hashes_from_metadata(
+        &self,
+        metadata: &[ChunkMetadata],
+    ) -> Result<BTreeMap<String, [u8; 16]>> {
+        let Some(manifest) = self.read_manifest()? else {
+            return Ok(file_hashes_from_metadata(metadata));
+        };
+
+        if manifest.file_hashes.is_empty() {
+            return Ok(file_hashes_from_metadata(metadata));
+        }
+
+        Ok(manifest.file_hashes)
+    }
 }
 
 fn resolve_project_path(project_root: &Path, relative_path: &Path) -> Result<PathBuf> {
@@ -481,6 +514,13 @@ fn distinct_file_paths(rows: &[StoredChunk]) -> BTreeSet<String> {
 fn file_hashes_from_rows(rows: &[StoredChunk]) -> BTreeMap<String, [u8; 16]> {
     rows.iter()
         .map(|row| (row.file_path.clone(), row.file_hash))
+        .collect()
+}
+
+fn file_hashes_from_metadata(metadata: &[ChunkMetadata]) -> BTreeMap<String, [u8; 16]> {
+    metadata
+        .iter()
+        .map(|m| (m.file_path.clone(), m.file_hash))
         .collect()
 }
 
@@ -1412,5 +1452,105 @@ mod tests {
         );
         assert_eq!(manifest.chunk_count, 0);
         assert_eq!(manifest.file_count, 0);
+    }
+
+    #[tokio::test]
+    async fn read_chunk_metadata_on_empty_store_returns_empty() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+
+        let store = Store::new(project_root.path(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let metadata = store.read_chunk_metadata().await;
+        assert!(metadata.is_ok());
+        assert!(
+            metadata.ok().unwrap_or_else(|| unreachable!()).is_empty(),
+            "metadata read on empty store must return an empty vec"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_chunk_metadata_returns_same_set_as_read_chunks() {
+        let project_root = tempdir();
+        assert!(project_root.is_ok());
+        let project_root = project_root.ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+
+        let store = Store::new(project_root.path(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        let chunks = vec![
+            sample_chunk(1, "src/lib.rs", "alpha", "pub fn alpha() {}", &[1.0; 384]),
+            sample_chunk(2, "src/util.rs", "beta", "pub fn beta() {}", &[2.0; 384]),
+            sample_chunk(3, "src/util.rs", "gamma", "pub fn gamma() {}", &[3.0; 384]),
+        ];
+        assert!(store.replace_chunks(&chunks, &config).await.is_ok());
+
+        let full_rows = store.read_chunks().await;
+        assert!(full_rows.is_ok());
+        let full_rows = full_rows.ok().unwrap_or_else(|| unreachable!());
+
+        let metadata = store.read_chunk_metadata().await;
+        assert!(metadata.is_ok());
+        let metadata = metadata.ok().unwrap_or_else(|| unreachable!());
+
+        // Metadata count must equal full-row count.
+        assert_eq!(
+            metadata.len(),
+            full_rows.len(),
+            "metadata row count must match full read"
+        );
+
+        // Build a sorted view of (file_path, name) from both sides for comparison.
+        let mut full_keys: Vec<(String, Option<String>)> = full_rows
+            .iter()
+            .map(|r| (r.file_path.clone(), r.name.clone()))
+            .collect();
+        full_keys.sort();
+
+        let mut meta_keys: Vec<(String, Option<String>)> = metadata
+            .iter()
+            .map(|m| (m.file_path.clone(), m.name.clone()))
+            .collect();
+        meta_keys.sort();
+
+        assert_eq!(
+            meta_keys, full_keys,
+            "metadata (file_path, name) pairs must match full read"
+        );
+
+        // file_hash must also be preserved correctly.
+        let mut full_hashes: Vec<(String, [u8; 16])> = full_rows
+            .iter()
+            .map(|r| (r.file_path.clone(), r.file_hash))
+            .collect();
+        full_hashes.sort_by_key(|(p, _)| p.clone());
+
+        let mut meta_hashes: Vec<(String, [u8; 16])> = metadata
+            .iter()
+            .map(|m| (m.file_path.clone(), m.file_hash))
+            .collect();
+        meta_hashes.sort_by_key(|(p, _)| p.clone());
+
+        assert_eq!(
+            meta_hashes, full_hashes,
+            "file_hash values must match between metadata and full read"
+        );
+
+        // language must be preserved.
+        for m in &metadata {
+            assert!(
+                !m.language.is_empty(),
+                "metadata language must not be empty"
+            );
+        }
+
+        // Vectors must NOT be present in metadata rows (they don't exist on the type).
+        // This is enforced by ChunkMetadata not having a vector field — compile-time guarantee.
     }
 }

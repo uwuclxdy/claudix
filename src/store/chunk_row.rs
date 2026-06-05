@@ -1,6 +1,18 @@
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::types::{Dimension, EmbeddedChunk};
 
+/// Lightweight projection of a stored chunk that omits the embedding vector.
+///
+/// Used by read paths that need only scalar metadata — overview, incremental
+/// hash comparison, etc. — so the large float arrays are never loaded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkMetadata {
+    pub file_path: String,
+    pub file_hash: [u8; 16],
+    pub language: String,
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredChunk {
     pub chunk_id: u64,

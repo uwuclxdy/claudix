@@ -13,7 +13,7 @@ use lancedb::query::{ExecutableQuery, QueryBase};
 use crate::error::{ClaudixError, Result};
 use crate::types::Dimension;
 
-use super::chunk_row::{StoredChunk, validate_vector};
+use super::chunk_row::{ChunkMetadata, StoredChunk, validate_vector};
 
 pub(super) const FIELD_CHUNK_ID: &str = "chunk_id";
 pub(super) const FIELD_FILE_PATH: &str = "file_path";
@@ -134,6 +134,44 @@ pub(super) async fn read_all_rows(table: &Table) -> Result<Vec<StoredChunk>> {
         .try_collect::<Vec<_>>()
         .await?;
     batches_to_rows(batches)
+}
+
+/// Projected read that fetches only scalar metadata columns, skipping the
+/// embedding vector. Callers that only need `file_path`, `file_hash`,
+/// `language`, and `name` should prefer this over [`read_all_rows`] to avoid
+/// deserializing potentially large float arrays.
+pub(super) async fn read_metadata_rows(table: &Table) -> Result<Vec<ChunkMetadata>> {
+    let columns = [FIELD_FILE_PATH, FIELD_FILE_HASH, FIELD_LANGUAGE, FIELD_NAME]
+        .map(str::to_owned)
+        .to_vec();
+
+    let batches = table
+        .query()
+        .select(lancedb::query::Select::Columns(columns))
+        .limit(i64::MAX as usize)
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    batches_to_metadata_rows(batches)
+}
+
+fn batches_to_metadata_rows(batches: Vec<RecordBatch>) -> Result<Vec<ChunkMetadata>> {
+    let mut rows = Vec::new();
+
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            rows.push(ChunkMetadata {
+                file_path: read_string(&batch, FIELD_FILE_PATH, row_index)?,
+                file_hash: read_file_hash(&batch, row_index)?,
+                language: read_string(&batch, FIELD_LANGUAGE, row_index)?,
+                name: read_optional_string(&batch, FIELD_NAME, row_index)?,
+            });
+        }
+    }
+
+    Ok(rows)
 }
 
 pub(super) fn batches_to_rows(batches: Vec<RecordBatch>) -> Result<Vec<StoredChunk>> {

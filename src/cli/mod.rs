@@ -235,7 +235,9 @@ pub async fn run_overview(
     // Validate and normalize the path prefix the same way search does.
     let prefix: Option<RelativePath> = parse_path_prefix(path_prefix)?;
 
-    let chunks = store.read_chunks().await?;
+    // Metadata projection — skips embedding vectors; only file_path, file_hash,
+    // language, and name are needed for the directory rollup.
+    let metadata = store.read_chunk_metadata().await?;
 
     // Group chunks by the immediate parent directory of their file_path.
     // Splitting on `/` is sound because file_path comes from RelativePath,
@@ -246,7 +248,7 @@ pub async fn run_overview(
     let mut dir_languages: HashMap<String, HashMap<String, usize>> = HashMap::new();
     let mut dir_names: HashMap<String, HashMap<String, usize>> = HashMap::new();
 
-    for chunk in &chunks {
+    for chunk in &metadata {
         // Apply path-prefix filter, consistent with `apply_filters` in search.
         if let Some(ref prefix) = prefix
             && !path_prefix_matches(&chunk.file_path, prefix.as_str())
