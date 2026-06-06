@@ -14,6 +14,7 @@ use crate::config::SearchConfig;
 use crate::embedding::Provider;
 use crate::enumeration::hash_bytes;
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 use crate::store::{Store, StoredChunk};
 use crate::types::{
     ByteRange, Chunk, ChunkId, ChunkKind, Dimension, FileHash, Language, LineRange, RelativePath,
@@ -426,9 +427,7 @@ fn validate_query_vector(vector: &[f32], dimensions: Dimension) -> Result<()> {
         return Err(ClaudixError::DimensionMismatch {
             store_dim: dimensions.0,
             model_dim: u16::try_from(vector.len()).unwrap_or(u16::MAX),
-            recovery: RecoveryHint(
-                "Rebuild the index with the configured embedding dimensions or fix the endpoint model",
-            ),
+            recovery: RecoveryHint(hints::REBUILD_INDEX_DIMENSIONS),
         });
     }
 

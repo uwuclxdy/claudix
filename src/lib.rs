@@ -6,6 +6,7 @@ pub mod enumeration;
 pub mod error;
 pub mod hooks;
 pub mod mcp;
+pub mod prompts;
 pub mod search;
 pub mod store;
 pub mod types;
@@ -29,6 +30,7 @@ use embedding::bundled::{BUNDLED_DIMENSIONS, BUNDLED_MODEL_ID};
 use embedding::{BundledProvider, FallbackProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator, WatchFilter};
 use error::RecoveryHint;
+use prompts::hints;
 use search::neighbors::neighbors;
 use search::{SearchQuery, SearchResults, Searcher};
 use store::marker::change_neighbors::{
@@ -453,9 +455,7 @@ impl Claudix {
                     return Err(ClaudixError::DimensionMismatch {
                         store_dim: expected_dimensions.0,
                         model_dim: actual_dimensions,
-                        recovery: RecoveryHint(
-                            "Reindex the project after aligning embedding dimensions with the active model",
-                        ),
+                        recovery: RecoveryHint(hints::REINDEX_ALIGN_DIMENSIONS),
                     });
                 }
 
@@ -467,19 +467,18 @@ impl Claudix {
     }
 
     fn relative_path_from_input(&self, path: &Path) -> Result<RelativePath> {
-        const RECOVERY: &str = "Only reindex files inside $CLAUDE_PROJECT_DIR";
         if path.is_absolute() {
             let relative =
                 path.strip_prefix(&self.project_root)
                     .map_err(|_| ClaudixError::PathTraversal {
                         path: path.to_path_buf(),
-                        recovery: RecoveryHint(RECOVERY),
+                        recovery: RecoveryHint(hints::REINDEX_INSIDE_PROJECT_DIR),
                     })?;
-            reject_path_escape(relative, RECOVERY)?;
+            reject_path_escape(relative, hints::REINDEX_INSIDE_PROJECT_DIR)?;
             return Ok(RelativePath::from_path(relative));
         }
 
-        reject_path_escape(path, RECOVERY)?;
+        reject_path_escape(path, hints::REINDEX_INSIDE_PROJECT_DIR)?;
         Ok(RelativePath::from_path(path))
     }
 }

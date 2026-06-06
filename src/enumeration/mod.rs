@@ -191,7 +191,7 @@ fn ensure_within_root(root: &Path, path: &Path) -> Result<()> {
 
     Err(ClaudixError::PathTraversal {
         path: path.to_path_buf(),
-        recovery: RecoveryHint("Only enumerate files inside $CLAUDE_PROJECT_DIR"),
+        recovery: RecoveryHint(crate::prompts::hints::ENUMERATE_INSIDE_PROJECT_DIR),
     })
 }
 

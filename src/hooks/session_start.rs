@@ -1,10 +1,11 @@
 use std::path::Path;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::cli;
 use crate::config;
 use crate::error::Result;
+use crate::prompts::hooks::{session_start_message, session_start_response};
 use crate::store::Store;
 
 use super::payload::HookPayload;
@@ -73,68 +74,14 @@ pub(super) async fn handle_session_start(
         indexing_in_flight,
         log_hint.as_deref(),
     );
-    let user_message = session_start_message(cli::setup_state(project_root).await);
+    let user_message = match cli::setup_state(project_root).await {
+        cli::SetupState::Ready => String::new(),
+        cli::SetupState::Missing(missing) => session_start_message(&missing),
+    };
     if !user_message.is_empty() {
         response["systemMessage"] = Value::String(user_message);
     }
     Ok(Some(response))
-}
-
-fn session_start_message(setup_state: cli::SetupState) -> String {
-    match setup_state {
-        cli::SetupState::Ready => String::new(),
-        cli::SetupState::Missing(parts) => format!(
-            "claudix setup incomplete (missing {}); run the install script again",
-            parts.join(", ")
-        ),
-    }
-}
-
-fn session_start_response(
-    file_count: u64,
-    chunk_count: u64,
-    stale: bool,
-    model_mismatch: bool,
-    indexing_in_flight: bool,
-    log_hint: Option<&str>,
-) -> Value {
-    let progress_suffix = log_hint
-        .map(|p| format!(" Tail `{p}` to follow progress."))
-        .unwrap_or_default();
-    let additional_context = if model_mismatch {
-        "claudix semantic search unavailable — embedding model mismatch. Run `claudix clear && claudix index` to rebuild.".to_owned()
-    } else if chunk_count == 0 && indexing_in_flight {
-        format!(
-            "claudix is building its first index in the background — search_code will report when ready. \
-             Use Grep or Read in the meantime.{progress_suffix}"
-        )
-    } else if chunk_count == 0 {
-        "claudix is installed but the index is empty. Run /claudix:index to build it; until then use Grep or Read for code discovery.".to_owned()
-    } else if indexing_in_flight {
-        format!(
-            "claudix semantic search ready — {file_count} files, {chunk_count} chunks (reindexing in background; you'll be notified when complete). \
-             Use search_code for fast semantic search: conceptual queries, identifier lookups, cross-file discovery. \
-             Use Grep for exact literals, regexes, or path-filtered scans.{progress_suffix}"
-        )
-    } else if stale {
-        format!(
-            "claudix semantic search ready — {file_count} files, {chunk_count} chunks (index stale). \
-             Use search_code for fast semantic search: conceptual queries, identifier lookups, cross-file discovery. \
-             Use Grep for exact literals, regexes, or path-filtered scans."
-        )
-    } else {
-        format!(
-            "claudix semantic search ready — {file_count} files, {chunk_count} chunks. \
-             Use search_code for fast semantic search: conceptual queries, identifier lookups, cross-file discovery. \
-             Use Grep for exact literals, regexes, or path-filtered scans."
-        )
-    };
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "SessionStart",
-            "additionalContext": additional_context,
-        }
-    })
 }
 
 #[cfg(test)]
@@ -223,9 +170,9 @@ mod tests {
 
     #[test]
     fn session_start_message_reports_ready_setup() {
-        assert_eq!(session_start_message(cli::SetupState::Ready), "");
+        assert_eq!(session_start_message(&[]), "");
         assert_eq!(
-            session_start_message(cli::SetupState::Missing(vec!["bin"])),
+            session_start_message(&["bin"]),
             "claudix setup incomplete (missing bin); run the install script again"
         );
     }

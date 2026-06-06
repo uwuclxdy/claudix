@@ -1,4 +1,5 @@
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 use crate::types::{Dimension, EmbeddedChunk};
 
 /// Lightweight projection of a stored chunk that omits the embedding vector.
@@ -65,9 +66,7 @@ pub(super) fn validate_vector(vector: &[f32], dimension: Dimension) -> Result<()
         return Err(ClaudixError::DimensionMismatch {
             store_dim: dimension.0,
             model_dim: u16::try_from(vector.len()).unwrap_or(u16::MAX),
-            recovery: RecoveryHint(
-                "Reindex the project after aligning embedding dimensions with the active model",
-            ),
+            recovery: RecoveryHint(hints::REINDEX_ALIGN_DIMENSIONS),
         });
     }
 

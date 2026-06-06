@@ -3,11 +3,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::Claudix;
 use crate::config;
 use crate::error::{ClaudixError, Result};
+use crate::prompts::hooks::pre_tool_use_search_response;
 use crate::search::SearchQuery;
 use crate::store::Store;
 
@@ -134,66 +135,11 @@ fn write_cached_health(marker_path: &Path, healthy: bool) {
     let _ = fs::write(marker_path, if healthy { "1" } else { "0" });
 }
 
-fn pre_tool_use_search_response(query: &str, results: Vec<crate::search::SearchResult>) -> Value {
-    let mut lines = vec![
-        format!("claudix search results for '{query}':"),
-        String::new(),
-    ];
-    for result in &results {
-        let chunk = &result.chunk;
-        let name_part = chunk
-            .name
-            .as_deref()
-            .map(|n| format!(" {n}"))
-            .unwrap_or_default();
-        let stale_warning = if result.stale {
-            " [STALE - file modified since index]"
-        } else {
-            ""
-        };
-        lines.push(format!(
-            "{}:{}-{} [{}] {}{name_part} ({:.3}){}",
-            chunk.file_path,
-            chunk.line_range.start,
-            chunk.line_range.end,
-            chunk.language,
-            chunk.kind,
-            result.score,
-            stale_warning,
-        ));
-        if !chunk.content.is_empty() {
-            lines.push(truncate_snippet(&chunk.content, 20));
-        }
-        lines.push(String::new());
-    }
-    lines.push(
-        "Tip: call search_code MCP tool directly next time to skip this interception round-trip."
-            .to_owned(),
-    );
-    let context = lines.join("\n");
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": format!("claudix found {} semantic matches for '{query}' — see additionalContext.", results.len()),
-            "additionalContext": context,
-        }
-    })
-}
-
-fn truncate_snippet(content: &str, max_lines: usize) -> String {
-    let mut lines = content.lines();
-    let taken: Vec<&str> = lines.by_ref().take(max_lines).collect();
-    if lines.next().is_some() {
-        format!("{}\n…", taken.join("\n"))
-    } else {
-        taken.join("\n")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use serde_json::json;
 
     use std::fs;
     use std::sync::Arc;

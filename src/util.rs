@@ -1,6 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 
 const SECONDS_PER_DAY: i64 = 86_400;
 
@@ -91,7 +92,7 @@ fn parse_number(bytes: &[u8], original: &str) -> Result<i64> {
 fn invalid_timestamp(timestamp: &str) -> ClaudixError {
     ClaudixError::ConfigInvalid {
         message: format!("invalid RFC3339 timestamp: {timestamp}"),
-        recovery: RecoveryHint("Use UTC timestamps in the form 2026-04-27T12:00:00Z"),
+        recovery: RecoveryHint(hints::UTC_TIMESTAMP_FORMAT),
     }
 }
 

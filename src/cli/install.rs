@@ -6,6 +6,7 @@ use tokio::fs;
 use crate::Claudix;
 use crate::config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 
 use super::{InstallOutput, SetupState, canonical_project_root};
 
@@ -187,7 +188,7 @@ async fn required_plugin_asset(project_root: &Path, source_relative: &str) -> Re
 
     Err(ClaudixError::ConfigInvalid {
         message: format!("required plugin asset missing: {}", source.display()),
-        recovery: RecoveryHint("Restore the plugin metadata files before running claudix install"),
+        recovery: RecoveryHint(hints::RESTORE_PLUGIN_ASSETS),
     })
 }
 
@@ -277,9 +278,7 @@ fn plugin_root_from_env(
 
     Err(ClaudixError::ConfigInvalid {
         message: "CLAUDE_PLUGIN_ROOT is not set".into(),
-        recovery: RecoveryHint(
-            "Run claudix install from the plugin directory or plugin environment",
-        ),
+        recovery: RecoveryHint(hints::INSTALL_FROM_PLUGIN_ROOT),
     })
 }
 
@@ -297,7 +296,7 @@ fn global_config_path() -> Result<PathBuf> {
         .map(|home| home.join(".claude").join("claudix.toml"))
         .ok_or_else(|| ClaudixError::ConfigInvalid {
             message: "home directory is not available".into(),
-            recovery: RecoveryHint("Set HOME before running claudix install"),
+            recovery: RecoveryHint(hints::SET_HOME_FOR_INSTALL),
         })
 }
 

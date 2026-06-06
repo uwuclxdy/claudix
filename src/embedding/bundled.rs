@@ -13,6 +13,7 @@ use tokio::{fs, task};
 
 use crate::embedding::Provider;
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 use crate::types::Dimension;
 
 pub const BUNDLED_MODEL_ID: &str = "bge-small-en-v1.5";
@@ -233,7 +234,7 @@ fn validate_model_contract(model_id: &str, dimensions: Dimension) -> Result<()> 
         return Err(ClaudixError::DimensionMismatch {
             store_dim: BUNDLED_DIMENSIONS.0,
             model_dim: dimensions.0,
-            recovery: RecoveryHint("Set [embedding].dimensions = 384 for the bundled provider"),
+            recovery: RecoveryHint(hints::BUNDLED_DIMENSIONS_384),
         });
     }
 
@@ -259,9 +260,7 @@ async fn ensure_assets_exist(paths: &AssetPaths, model_id: &str) -> Result<()> {
 
     Err(ClaudixError::BundledAssetsMissing {
         model_id: model_id.to_owned(),
-        recovery: RecoveryHint(
-            "Run claudix again after restoring network access, or switch to [embedding] provider = \"http\"",
-        ),
+        recovery: RecoveryHint(hints::DOWNLOAD_BUNDLED_ASSETS),
     })
 }
 
@@ -360,9 +359,7 @@ fn validate_output_shape(
         return Err(ClaudixError::DimensionMismatch {
             store_dim: dimensions.0,
             model_dim: u16::try_from(actual_dimensions).unwrap_or(u16::MAX),
-            recovery: RecoveryHint(
-                "Use the bundled bge-small-en-v1.5 export with 384-dimensional hidden states",
-            ),
+            recovery: RecoveryHint(hints::BUNDLED_HIDDEN_STATES_384),
         });
     }
 

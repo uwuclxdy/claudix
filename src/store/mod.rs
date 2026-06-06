@@ -560,8 +560,8 @@ impl Store {
 }
 
 fn resolve_project_path(project_root: &Path, relative_path: &Path) -> Result<PathBuf> {
-    const RECOVERY: &str = "Only use store paths inside $CLAUDE_PROJECT_DIR";
-    reject_path_escape(relative_path, RECOVERY)?;
+    use crate::prompts::hints::STORE_INSIDE_PROJECT_DIR;
+    reject_path_escape(relative_path, STORE_INSIDE_PROJECT_DIR)?;
 
     let resolved = project_root.join(relative_path);
     if resolved.starts_with(project_root) {
@@ -570,7 +570,7 @@ fn resolve_project_path(project_root: &Path, relative_path: &Path) -> Result<Pat
 
     Err(ClaudixError::PathTraversal {
         path: resolved,
-        recovery: RecoveryHint(RECOVERY),
+        recovery: RecoveryHint(STORE_INSIDE_PROJECT_DIR),
     })
 }
 

@@ -2,9 +2,10 @@ use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::config::Config;
+use crate::prompts::hooks::{indexing_complete_response, indexing_failed_response};
 use crate::store::Store;
 use crate::store::marker::pending_index::{self, FAILURE_GRACE_SECS};
 
@@ -51,16 +52,11 @@ pub(super) fn check_index_ready(
             // the user is informed instead of silently dropping the signal.
             return Some(indexing_failed_response(event_name));
         };
-        return Some(json!({
-            "hookSpecificOutput": {
-                "hookEventName": event_name,
-                "additionalContext": format!(
-                    "claudix indexing complete — {} files, {} chunks. Semantic search is now ready: \
-                     use search_code for conceptual queries, identifier lookups, and cross-file discovery.",
-                    manifest.file_count, manifest.chunk_count
-                ),
-            }
-        }));
+        return Some(indexing_complete_response(
+            event_name,
+            manifest.file_count,
+            manifest.chunk_count,
+        ));
     }
 
     // Manifest timestamp unchanged AND no index lock holder. If the spawned
@@ -94,17 +90,6 @@ pub(super) fn check_index_ready(
     }
 
     Some(indexing_failed_response(event_name))
-}
-
-fn indexing_failed_response(event_name: &str) -> Value {
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": event_name,
-            "additionalContext":
-                "claudix background indexing ended without updating the index — it may have failed. \
-                 Run /claudix:doctor to diagnose.",
-        }
-    })
 }
 
 #[cfg(test)]

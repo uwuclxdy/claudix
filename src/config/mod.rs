@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
@@ -166,7 +167,7 @@ fn load_from_paths(
         partial = partial.merge(read_partial_config(
             path,
             "global config",
-            "Fix ~/.claude/claudix.toml",
+            hints::FIX_GLOBAL_CONFIG,
         )?);
     }
 
@@ -174,7 +175,7 @@ fn load_from_paths(
         partial = partial.merge(read_partial_config(
             project_path,
             "project config",
-            "Fix .claude/claudix.toml",
+            hints::FIX_PROJECT_CONFIG,
         )?);
     }
 
@@ -184,7 +185,7 @@ fn load_from_paths(
         partial = partial.merge(read_partial_config(
             path,
             "CIRRUS_CONFIG",
-            "Fix the file at CIRRUS_CONFIG path",
+            hints::FIX_CIRRUS_CONFIG,
         )?);
     }
 
@@ -227,7 +228,7 @@ pub(crate) fn validate_project_relative_path(path: &Path, field_name: &'static s
 
     Err(ClaudixError::ConfigInvalid {
         message: format!("{field_name} must be a relative path inside the project root"),
-        recovery: RecoveryHint("Set the path to a project-relative value such as .claudix/index"),
+        recovery: RecoveryHint(hints::PROJECT_RELATIVE_PATH),
     })
 }
 

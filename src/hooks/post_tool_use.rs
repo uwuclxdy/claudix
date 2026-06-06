@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use crate::config::{self, Config};
 use crate::enumeration::WatchFilter;
 use crate::error::Result;
+use crate::prompts;
 use crate::search::neighbors::neighbors;
 use crate::store::Store;
 use crate::store::marker::change_neighbors;
@@ -15,8 +16,6 @@ use super::payload::{HookPayload, ToolInput};
 use super::ready_check::check_index_ready;
 use super::spawn::spawn_background_reindex_file;
 use crate::store::marker::WATCH_MARKER_STALE_SECS;
-
-const READ_NEIGHBOR_RECOVERY: &str = "Read a path inside the project root";
 
 pub(super) async fn handle_post_tool_use(
     project_root: &Path,
@@ -144,7 +143,9 @@ async fn read_surfacing_context(
         raw.to_path_buf()
     };
     let read_path = RelativePath::from_path(&relative);
-    read_path.reject_escape(READ_NEIGHBOR_RECOVERY).ok()?;
+    read_path
+        .reject_escape(prompts::hints::READ_INSIDE_PROJECT_DIR)
+        .ok()?;
 
     let start = input.offset.unwrap_or(1);
     let end = input
@@ -179,27 +180,17 @@ async fn read_surfacing_context(
     let locations: Vec<String> = hits
         .iter()
         .map(|n| {
-            let name_part = n
-                .name
-                .as_deref()
-                .map(|name| format!(" `{name}`"))
-                .unwrap_or_default();
-            format!(
-                "{}:{}-{}{} ({:.2})",
-                n.file_path, n.line_start, n.line_end, name_part, n.score
+            prompts::hooks::read_neighbor_line(
+                &n.file_path,
+                n.line_start,
+                n.line_end,
+                n.name.as_deref(),
+                n.score,
             )
         })
         .collect();
 
-    let region = match end {
-        Some(end) => format!("lines {start}-{end}"),
-        None => format!("lines {start}+"),
-    };
-    let context = format!(
-        "claudix: code related to {region} of `{}`: {}",
-        read_path.as_str(),
-        locations.join("; "),
-    );
+    let context = prompts::hooks::read_related_context(read_path.as_str(), start, end, &locations);
 
     Some(json!({
         "hookSpecificOutput": {
@@ -243,14 +234,12 @@ pub(super) fn take_change_neighbors_context(
         .iter()
         .filter(|n| n.file_path != marker.edited_path)
         .map(|n| {
-            let name_part = n
-                .name
-                .as_deref()
-                .map(|name| format!(" `{name}`"))
-                .unwrap_or_default();
-            format!(
-                "{}:{}-{}{}  ({:.2})",
-                n.file_path, n.line_start, n.line_end, name_part, n.score
+            prompts::hooks::edit_neighbor_line(
+                &n.file_path,
+                n.line_start,
+                n.line_end,
+                n.name.as_deref(),
+                n.score,
             )
         })
         .collect();
@@ -259,11 +248,7 @@ pub(super) fn take_change_neighbors_context(
         return None;
     }
 
-    let context = format!(
-        "claudix: code related to your edit of `{}` (may need matching changes): {}",
-        marker.edited_path,
-        hits.join("; "),
-    );
+    let context = prompts::hooks::edit_related_context(&marker.edited_path, &hits);
 
     Some(json!({
         "hookSpecificOutput": {

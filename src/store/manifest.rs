@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 use crate::util::parse_rfc3339;
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -70,9 +71,7 @@ pub(super) fn validate_manifest_compatibility(
         return Err(ClaudixError::SchemaMismatch {
             store: manifest.schema_version,
             binary: SCHEMA_VERSION,
-            recovery: RecoveryHint(
-                "Reindex the project to rebuild the store with the current schema version",
-            ),
+            recovery: RecoveryHint(hints::REINDEX_SCHEMA_VERSION),
         });
     }
 
@@ -80,9 +79,7 @@ pub(super) fn validate_manifest_compatibility(
         return Err(ClaudixError::EmbeddingModelMismatch {
             store_model: manifest.embedding_model,
             active_model: expected_model.to_owned(),
-            recovery: RecoveryHint(
-                "Reindex the project after changing the configured embedding model",
-            ),
+            recovery: RecoveryHint(hints::REINDEX_AFTER_MODEL_CHANGE),
         });
     }
 
@@ -90,9 +87,7 @@ pub(super) fn validate_manifest_compatibility(
         return Err(ClaudixError::DimensionMismatch {
             store_dim: manifest.dimensions,
             model_dim: expected_dimensions,
-            recovery: RecoveryHint(
-                "Reindex the project after changing the configured embedding dimensions",
-            ),
+            recovery: RecoveryHint(hints::REINDEX_AFTER_DIMENSION_CHANGE),
         });
     }
 

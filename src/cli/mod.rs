@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::config;
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::hooks::HookEvent;
+use crate::prompts::hints;
 use crate::search::SearchQuery;
 use crate::search::duplicates::{self, LabeledChunk};
 pub use crate::search::duplicates::{DuplicateChunk, DuplicatePair};
@@ -481,14 +482,14 @@ pub async fn run_find_duplicates(
     if !min_similarity.is_finite() || !(0.0..=1.0).contains(&min_similarity) {
         return Err(ClaudixError::ConfigInvalid {
             message: "min_similarity must be between 0 and 1".to_owned(),
-            recovery: RecoveryHint("Use a finite min_similarity between 0 and 1"),
+            recovery: RecoveryHint(hints::FINITE_MIN_SIMILARITY),
         });
     }
     let limit = limit.unwrap_or(DEFAULT_DUPLICATE_LIMIT);
     if limit == 0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "limit must be at least 1".to_owned(),
-            recovery: RecoveryHint("Use a positive limit"),
+            recovery: RecoveryHint(hints::POSITIVE_LIMIT),
         });
     }
 
@@ -753,9 +754,7 @@ pub fn parse_hook_event(value: &str) -> Result<HookEvent> {
         "UserPromptSubmit" => Ok(HookEvent::UserPromptSubmit),
         _ => Err(ClaudixError::ConfigInvalid {
             message: format!("unknown hook event: {value}"),
-            recovery: RecoveryHint(
-                "Use one of: SessionStart, PostToolUse, PreToolUse, UserPromptSubmit",
-            ),
+            recovery: RecoveryHint(hints::VALID_HOOK_EVENTS),
         }),
     }
 }
@@ -861,7 +860,7 @@ fn require_git_repo(project_root: &Path) -> Result<()> {
     if !crate::enumeration::is_git_repo(project_root) {
         return Err(ClaudixError::NotAGitRepository {
             path: project_root.to_path_buf(),
-            recovery: RecoveryHint("Run claudix index from inside a git repository"),
+            recovery: RecoveryHint(hints::GIT_REPO_REQUIRED),
         });
     }
     Ok(())
@@ -1067,19 +1066,19 @@ mod tests {
         assert!(requires_clean_reindex(&ClaudixError::SchemaMismatch {
             store: 0,
             binary: 1,
-            recovery: RecoveryHint("reindex"),
+            recovery: RecoveryHint(hints::RUN_REINDEX),
         }));
         assert!(requires_clean_reindex(
             &ClaudixError::EmbeddingModelMismatch {
                 store_model: "old".to_owned(),
                 active_model: "new".to_owned(),
-                recovery: RecoveryHint("reindex"),
+                recovery: RecoveryHint(hints::RUN_REINDEX),
             }
         ));
         assert!(requires_clean_reindex(&ClaudixError::DimensionMismatch {
             store_dim: 384,
             model_dim: 768,
-            recovery: RecoveryHint("reindex"),
+            recovery: RecoveryHint(hints::RUN_REINDEX),
         }));
         assert!(!requires_clean_reindex(&ClaudixError::Store(
             "index already running".to_owned()

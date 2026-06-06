@@ -2,13 +2,14 @@ use std::path::Path;
 
 use crate::config::validate_project_relative_path;
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 use crate::types::{Language, RelativePath};
 
 pub(super) fn validate_search_query(query: &str) -> Result<()> {
     if query.trim().is_empty() {
         return Err(ClaudixError::ConfigInvalid {
             message: "search query cannot be empty".into(),
-            recovery: RecoveryHint("Pass a non-empty search query"),
+            recovery: RecoveryHint(hints::SEARCH_QUERY_NON_EMPTY),
         });
     }
     Ok(())
@@ -18,7 +19,7 @@ pub(super) fn validate_search_top_k(top_k: usize) -> Result<()> {
     if top_k == 0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "top_k must be > 0".into(),
-            recovery: RecoveryHint("Pass a positive top_k value"),
+            recovery: RecoveryHint(hints::POSITIVE_TOP_K),
         });
     }
 
@@ -59,9 +60,7 @@ pub(super) fn parse_path_prefix(path_prefix: Option<String>) -> Result<Option<Re
 fn parse_language(value: &str) -> Result<Language> {
     Language::from_filter_input(value).ok_or_else(|| ClaudixError::ConfigInvalid {
         message: format!("unsupported language filter: {}", value.trim()),
-        recovery: RecoveryHint(
-            "Use one of: rust, python, javascript, typescript, go, java, c, cpp, unknown",
-        ),
+        recovery: RecoveryHint(hints::VALID_LANGUAGE_FILTERS),
     })
 }
 

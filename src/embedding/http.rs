@@ -6,6 +6,7 @@ use serde::Deserialize;
 
 use crate::embedding::Provider;
 use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::prompts::hints;
 use crate::types::Dimension;
 
 #[derive(Debug, Clone)]
@@ -46,13 +47,13 @@ impl HttpProvider {
             return ClaudixError::EmbeddingTimedOut {
                 endpoint: self.endpoint.clone(),
                 timeout_ms: u64::try_from(self.timeout.as_millis()).unwrap_or(u64::MAX),
-                recovery: RecoveryHint(TIMEOUT_HINT),
+                recovery: RecoveryHint(hints::EMBEDDING_TIMEOUT),
             };
         }
         ClaudixError::EmbeddingUnreachable {
             endpoint: self.endpoint.clone(),
             source,
-            recovery: RecoveryHint(DOCTOR_HINT),
+            recovery: RecoveryHint(hints::RUN_DOCTOR),
         }
     }
 
@@ -61,12 +62,12 @@ impl HttpProvider {
             Some(status @ (401 | 403)) => ClaudixError::EmbeddingAuthRejected {
                 endpoint: self.endpoint.clone(),
                 status,
-                recovery: RecoveryHint(AUTH_HINT),
+                recovery: RecoveryHint(hints::EMBEDDING_AUTH),
             },
             Some(status) => ClaudixError::EmbeddingHttpStatus {
                 endpoint: self.endpoint.clone(),
                 status,
-                recovery: RecoveryHint(DOCTOR_HINT),
+                recovery: RecoveryHint(hints::RUN_DOCTOR),
             },
             None => self.transport_error(source),
         }
@@ -198,11 +199,6 @@ const MAX_RETRY_ATTEMPTS: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(200);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
-const DOCTOR_HINT: &str =
-    "Run /claudix:doctor to check the embedding endpoint or switch to the bundled provider";
-const AUTH_HINT: &str = "The embedding endpoint requires auth; disable auth on the server or switch to the bundled provider";
-const TIMEOUT_HINT: &str = "The model may still be loading; raise [embedding].timeout_ms or switch to the bundled provider";
-
 fn is_retryable_transport(error: &reqwest::Error) -> bool {
     error.is_timeout() || error.is_connect() || error.is_request()
 }
@@ -212,9 +208,7 @@ fn normalize_endpoint(endpoint: String) -> Result<String> {
     if endpoint.is_empty() {
         return Err(ClaudixError::ConfigInvalid {
             message: "embedding endpoint cannot be empty".to_owned(),
-            recovery: RecoveryHint(
-                "Set [embedding].endpoint to the base URL for the HTTP provider",
-            ),
+            recovery: RecoveryHint(hints::SET_ENDPOINT_URL),
         });
     }
     Ok(endpoint)
@@ -228,9 +222,7 @@ fn validate_dimensions(vectors: &[Vec<f32>], dimensions: Dimension) -> Result<()
             return Err(ClaudixError::DimensionMismatch {
                 store_dim: dimensions.0,
                 model_dim: u16::try_from(vector.len()).unwrap_or(u16::MAX),
-                recovery: RecoveryHint(
-                    "Rebuild the index with the configured embedding dimensions or fix the endpoint model",
-                ),
+                recovery: RecoveryHint(hints::REBUILD_INDEX_DIMENSIONS),
             });
         }
         if vector.iter().any(|value| !value.is_finite()) {
