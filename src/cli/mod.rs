@@ -625,12 +625,38 @@ pub async fn run_index(project_root: impl AsRef<Path>, progress: bool) -> Result
     } else {
         &mut ()
     };
-    let stats = session.claudix.index_full(progress).await?;
+    let stats = match session.claudix.index_full(progress).await {
+        Ok(stats) => stats,
+        Err(error) => {
+            // The background index runs with stderr → null, so its terminal
+            // error would otherwise vanish. Leave a breadcrumb in index.log so
+            // the failure notice can surface the cause.
+            append_index_log_error(&log_dir, &error);
+            return Err(error);
+        }
+    };
 
     Ok(IndexOutput {
         file_count: stats.file_count,
         chunk_count: stats.chunk_count,
     })
+}
+
+/// Append a terminal error line to `index.log` so a failed background index
+/// leaves a debuggable trace. Best-effort: a logging failure must never mask
+/// the real indexing error.
+fn append_index_log_error(log_dir: &Path, error: &ClaudixError) {
+    if fs::create_dir_all(log_dir).is_err() {
+        return;
+    }
+    let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("index.log"))
+    else {
+        return;
+    };
+    let _ = writeln!(file, "error: {error}");
 }
 
 struct IndexSession {
@@ -1083,6 +1109,19 @@ mod tests {
         assert!(!requires_clean_reindex(&ClaudixError::Store(
             "index already running".to_owned()
         )));
+    }
+
+    #[test]
+    fn append_index_log_error_writes_error_line() {
+        let dir = tempfile::tempdir().unwrap_or_else(|_| unreachable!());
+        let log_dir = dir.path().join("logs");
+        append_index_log_error(&log_dir, &ClaudixError::Store("boom".to_owned()));
+        let text =
+            std::fs::read_to_string(log_dir.join("index.log")).unwrap_or_else(|_| unreachable!());
+        assert!(
+            text.starts_with("error:") && text.contains("boom"),
+            "log must capture the terminal error so the failure notice can quote it, got: {text}"
+        );
     }
 
     #[tokio::test]

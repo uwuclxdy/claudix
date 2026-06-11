@@ -50,7 +50,7 @@ pub(super) fn check_index_ready(
         let Some(manifest) = manifest else {
             // ts changed but the manifest is gone — treat as a failed run so
             // the user is informed instead of silently dropping the signal.
-            return Some(indexing_failed_response(event_name));
+            return Some(build_failed_response(project_root, config, event_name));
         };
         return Some(indexing_complete_response(
             event_name,
@@ -89,7 +89,34 @@ pub(super) fn check_index_ready(
         return None;
     }
 
-    Some(indexing_failed_response(event_name))
+    Some(build_failed_response(project_root, config, event_name))
+}
+
+/// Build the indexing-failed notice with a pointer to `index.log` and, when
+/// cheap to read, the last error line the failed run left behind. The log path
+/// is shown in the config-relative form (matching the SessionStart hint); the
+/// last error is read from the resolved absolute path.
+fn build_failed_response(project_root: &Path, config: &Config, event_name: &str) -> Value {
+    let display = config.paths.log_dir.join("index.log");
+    let absolute = project_root.join(&config.paths.log_dir).join("index.log");
+    let last_error = last_index_error(&absolute);
+    indexing_failed_response(
+        event_name,
+        &display.to_string_lossy(),
+        last_error.as_deref(),
+    )
+}
+
+/// Last `error:` line a failed index appended to `index.log`, if any. Cheap: the
+/// log is one short line per file (tens of KB even for large repos). Benign
+/// progress lines (`indexed …`/`verified …`) are ignored so only a real error
+/// is surfaced.
+fn last_index_error(log_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(log_path).ok()?;
+    text.lines()
+        .rev()
+        .find(|line| line.starts_with("error:"))
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -187,6 +214,46 @@ mod tests {
         assert!(
             store.pending_index_marker_path().exists(),
             "marker must survive the deferred decision"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_index_ready_failure_points_at_log_and_last_error() -> crate::error::Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // A failed background index appended its error to index.log.
+        let log_dir = fixture.root().join(&config.paths.log_dir);
+        fs::create_dir_all(&log_dir)?;
+        fs::write(
+            log_dir.join("index.log"),
+            "indexed src/lib.rs\nerror: embedding provider unreachable\n",
+        )?;
+
+        let stale_created_at = "2025-01-01T00:00:00Z";
+        let payload = format!("none\n{stale_created_at}\n");
+        fs::write(store.pending_index_marker_path(), payload)?;
+
+        let response = check_index_ready(fixture.root(), &config, "UserPromptSubmit");
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("ended without updating the index"),
+            "must still carry the failure phrase, got: {context}"
+        );
+        assert!(
+            context.contains("index.log"),
+            "failure notice must point at the log path, got: {context}"
+        );
+        assert!(
+            context.contains("embedding provider unreachable"),
+            "failure notice must surface the last error line, got: {context}"
         );
         Ok(())
     }

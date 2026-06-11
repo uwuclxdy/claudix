@@ -258,18 +258,26 @@ impl Claudix {
                 .note_file_hash(&relative_path, file.file_hash.0, self.config.as_ref())?;
             stats
         } else {
-            let stats = self
-                .store
+            self.store
                 .replace_file_chunks(&embedded_chunks, self.config.as_ref())
-                .await?;
-            // Compute change-neighbors using the fresh vectors — no extra embed call.
-            // Fail-open: neighbor computation errors are discarded; the index is already updated.
-            if self.config.hooks.surface_related_on_edit {
-                self.write_change_neighbors_marker(&relative_path, &embedded_chunks)
-                    .await;
-            }
-            stats
+                .await?
         };
+
+        // A per-file reindex only touches the edited file, so chunks for files
+        // deleted out-of-band linger until the next full index. Prune them now,
+        // before neighbor surfacing, so a deleted file is never offered as
+        // related code. Fail-open: a prune error keeps the replace/delete stats.
+        let stats = match self.store.prune_missing_files(self.config.as_ref()).await {
+            Ok(Some(pruned)) => pruned,
+            _ => stats,
+        };
+
+        // Compute change-neighbors using the fresh vectors — no extra embed call.
+        // Fail-open: neighbor computation errors are discarded; the index is already updated.
+        if !embedded_chunks.is_empty() && self.config.hooks.surface_related_on_edit {
+            self.write_change_neighbors_marker(&relative_path, &embedded_chunks)
+                .await;
+        }
 
         Ok(IndexStats {
             file_count: stats.file_count,
@@ -1212,6 +1220,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reindex_file_prunes_chunks_for_out_of_band_deletion() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+
+        let claudix = test_claudix(fixture.root().to_path_buf(), config);
+        assert!(claudix.is_ok());
+        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(claudix.index_full(&mut ()).await.is_ok());
+
+        // Delete math.rs out-of-band (rm / git / branch switch) — nothing
+        // reindexes it directly. Then edit a DIFFERENT file so its reindex runs
+        // for real; the per-file pass must still prune the deleted file's chunks.
+        assert!(
+            fs::remove_file(fixture.root().join("src/math.rs"))
+                .await
+                .is_ok()
+        );
+        assert!(
+            fs::write(
+                fixture.root().join("src/lib.rs"),
+                b"pub fn greet() -> &'static str {\n    \"hello\"\n}\n",
+            )
+            .await
+            .is_ok()
+        );
+
+        let stats = claudix.reindex_file(Path::new("src/lib.rs")).await;
+        assert!(stats.is_ok());
+
+        let rows = claudix.store.read_chunks().await;
+        assert!(rows.is_ok());
+        let rows = rows.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            rows.iter().all(|row| row.file_path != "src/math.rs"),
+            "chunks for a file deleted out-of-band must be pruned on the next per-file reindex"
+        );
+        assert!(
+            rows.iter().any(|row| row.file_path == "src/lib.rs"),
+            "the reindexed file's chunks must remain"
+        );
+    }
+
+    #[tokio::test]
     async fn reindex_file_removes_stale_chunks_when_file_becomes_empty() {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
@@ -1339,12 +1393,19 @@ mod tests {
         claudix.store.ensure_layout()?;
 
         // Seed "src/other.rs" with the same vector as the to-be-edited file.
+        // It must also exist on disk or the reindex-time prune (which drops
+        // chunks for deleted files) would remove it before neighbor surfacing.
         seed_chunk(
             &claudix.store,
             claudix.config.as_ref(),
             "src/other.rs",
             "other_fn",
             shared_vector,
+        )
+        .await?;
+        tokio::fs::write(
+            fixture.root().join("src/other.rs"),
+            b"pub fn other_fn() {}\n",
         )
         .await?;
 

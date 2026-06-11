@@ -173,6 +173,13 @@ async fn read_surfacing_context(
     })
     .await
     .ok()?;
+    // Defense in depth on top of index-time pruning: a file deleted out-of-band
+    // may still have chunks in the store until the next reindex, so never offer
+    // a now-missing file as related code. Cheap: one stat per hit (≤ top_k).
+    let hits: Vec<_> = hits
+        .into_iter()
+        .filter(|n| neighbor_file_exists(project_root, &n.file_path))
+        .collect();
     if hits.is_empty() {
         return None;
     }
@@ -198,6 +205,12 @@ async fn read_surfacing_context(
             "additionalContext": context,
         }
     }))
+}
+
+/// Whether a neighbor's repo-relative file still exists on disk. Guards against
+/// surfacing stale chunks for files deleted since they were indexed.
+fn neighbor_file_exists(project_root: &Path, relative_path: &str) -> bool {
+    project_root.join(relative_path).exists()
 }
 
 /// Whether a chunk's inclusive `[chunk_start, chunk_end]` line span overlaps the
@@ -233,6 +246,7 @@ pub(super) fn take_change_neighbors_context(
         .neighbors
         .iter()
         .filter(|n| n.file_path != marker.edited_path)
+        .filter(|n| neighbor_file_exists(project_root, &n.file_path))
         .map(|n| {
             prompts::hooks::edit_neighbor_line(
                 &n.file_path,
@@ -821,6 +835,16 @@ mod tests {
             ByteRange, Chunk, ChunkId, ChunkKind, EmbeddedChunk, FileHash, Language, LineRange,
             RelativePath,
         };
+        // Materialize each referenced file on disk so the neighbor-existence
+        // guard (which drops surfaced neighbors whose file was deleted) treats
+        // them as live — these tests assert real files get surfaced.
+        for (path, ..) in rows {
+            let abs = store.project_root().join(path);
+            if let Some(parent) = abs.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&abs, "// seeded\n");
+        }
         let embedded: Vec<EmbeddedChunk> = rows
             .iter()
             .enumerate()
@@ -992,6 +1016,51 @@ mod tests {
         assert!(
             context.contains("src/bar.rs"),
             "absolute-path read must still surface the neighbor, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleted_neighbor_is_not_surfaced_on_read() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // seed_rows materializes both files on disk; the neighbor (bar.rs) is
+        // then deleted out-of-band so only its now-stale chunk remains indexed.
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+        assert!(fs::remove_file(store.project_root().join("src/bar.rs")).is_ok());
+
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 12, "limit": 6 }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(
+            response.is_none(),
+            "a neighbor whose file was deleted on disk must not be surfaced"
         );
         Ok(())
     }

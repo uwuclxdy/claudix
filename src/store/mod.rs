@@ -418,6 +418,59 @@ impl Store {
         Ok(stats)
     }
 
+    /// Drop indexed chunks for files that no longer exist under the project
+    /// root, returning the post-prune stats when anything was removed.
+    ///
+    /// The per-file reindex path only ever touches the edited file, so a file
+    /// deleted out-of-band (`rm`, `git rm`, a branch switch) keeps its chunks —
+    /// and would surface as a phantom search hit or read-time neighbor — until
+    /// the next full index. This closes that window cheaply: a projected
+    /// metadata scan (no vectors) finds the missing paths, and the table is
+    /// rewritten only when at least one path is actually gone. Returns `None`
+    /// (no write) when every indexed file is still present.
+    pub async fn prune_missing_files(&self, config: &Config) -> Result<Option<StoreStats>> {
+        let metadata = self.read_chunk_metadata().await?;
+        let missing = self.missing_paths_from_metadata(&metadata);
+        if missing.is_empty() {
+            return Ok(None);
+        }
+
+        let dimension = Dimension(config.embedding.dimensions);
+        let remaining_rows: Vec<_> = self
+            .read_chunks()
+            .await?
+            .into_iter()
+            .filter(|row| !missing.contains(&row.file_path))
+            .collect();
+
+        let stats = stats_from_rows(&remaining_rows);
+        let mut file_hashes = self
+            .read_manifest()?
+            .map(|m| m.file_hashes)
+            .unwrap_or_default();
+        for path in &missing {
+            file_hashes.remove(path.as_str());
+        }
+        file_hashes.extend(file_hashes_from_rows(&remaining_rows));
+        self.persist_rows(remaining_rows, dimension).await?;
+        self.sync_manifest_with_timestamp(config, &stats, file_hashes, false)?;
+        Ok(Some(stats))
+    }
+
+    /// Distinct row paths whose file no longer exists under the project root.
+    /// Each distinct path is stat'd once.
+    fn missing_paths_from_metadata(&self, metadata: &[ChunkMetadata]) -> HashSet<String> {
+        let mut distinct: HashSet<&str> = HashSet::new();
+        for entry in metadata {
+            distinct.insert(entry.file_path.as_str());
+        }
+        distinct
+            .into_iter()
+            .filter(|path| !self.project_root.join(path).exists())
+            .map(str::to_owned)
+            .collect()
+    }
+
     pub fn note_file_hash(
         &self,
         path: &RelativePath,
@@ -1125,6 +1178,55 @@ mod tests {
         let rows = rows.ok().unwrap_or_else(|| unreachable!());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_path, "src/other.rs");
+    }
+
+    #[tokio::test]
+    async fn prune_missing_files_drops_chunks_for_deleted_paths() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        // present.rs exists on disk; gone.rs does not (deleted out-of-band).
+        let src = store.project_root().join("src");
+        fs::create_dir_all(&src)?;
+        fs::write(src.join("present.rs"), "fn present() {}")?;
+
+        let initial = vec![
+            sample_chunk(
+                1,
+                "src/present.rs",
+                "present",
+                "fn present() {}",
+                &[1.0; 384],
+            ),
+            sample_chunk(2, "src/gone.rs", "gone", "fn gone() {}", &[2.0; 384]),
+        ];
+        store.replace_chunks(&initial, &config).await?;
+
+        let pruned = store.prune_missing_files(&config).await?;
+        assert_eq!(
+            pruned,
+            Some(StoreStats {
+                chunk_count: 1,
+                file_count: 1,
+            }),
+            "prune must drop the deleted file and report post-prune stats"
+        );
+
+        let rows = store.read_chunks().await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_path, "src/present.rs");
+
+        let manifest = store.read_manifest()?.unwrap_or_else(|| unreachable!());
+        assert!(
+            !manifest.file_hashes.contains_key("src/gone.rs"),
+            "deleted path must be dropped from manifest file_hashes"
+        );
+        assert!(manifest.file_hashes.contains_key("src/present.rs"));
+
+        // Every indexed file now exists → second prune is a noop (no rewrite).
+        assert!(store.prune_missing_files(&config).await?.is_none());
+        Ok(())
     }
 
     #[tokio::test]

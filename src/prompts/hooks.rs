@@ -82,13 +82,21 @@ pub fn indexing_complete_response(event_name: &str, file_count: u64, chunk_count
     })
 }
 
-pub fn indexing_failed_response(event_name: &str) -> Value {
+pub fn indexing_failed_response(
+    event_name: &str,
+    log_path: &str,
+    last_error: Option<&str>,
+) -> Value {
+    let error_suffix = last_error
+        .map(|line| format!(" Last error: {line}."))
+        .unwrap_or_default();
     json!({
         "hookSpecificOutput": {
             "hookEventName": event_name,
-            "additionalContext":
-                "claudix background indexing ended without updating the index. \
-                 Run /claudix:doctor to diagnose.",
+            "additionalContext": format!(
+                "claudix background indexing ended without updating the index.{error_suffix} \
+                 See `{log_path}` for the full log, or run /claudix:doctor to diagnose."
+            ),
         }
     })
 }
