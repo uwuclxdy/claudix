@@ -154,31 +154,31 @@ async fn handle_tools_call(project_root: &Path, id: Option<Value>, params: Value
 
     let tool_result = match call.name.as_str() {
         "search_code" => match search_code(project_root, call.arguments).await {
-            Ok(result) => tool_success_result(result)?,
+            Ok(result) => tool_result_or_error(result),
             Err(error) => tool_error_result(error),
         },
         "get_index_status" => match get_index_status(project_root).await {
-            Ok(result) => tool_success_result(result)?,
+            Ok(result) => tool_result_or_error(result),
             Err(error) => tool_error_result(error),
         },
         "reindex" => match reindex(project_root, call.arguments).await {
-            Ok(result) => tool_success_result(result)?,
+            Ok(result) => tool_result_or_error(result),
             Err(error) => tool_error_result(error),
         },
         "clear_index" => match clear_index(project_root).await {
-            Ok(result) => tool_success_result(result)?,
+            Ok(result) => tool_result_or_error(result),
             Err(error) => tool_error_result(error),
         },
         "reindex_file" => match reindex_file(project_root, call.arguments).await {
-            Ok(result) => tool_success_result(result)?,
+            Ok(result) => tool_result_or_error(result),
             Err(error) => tool_error_result(error),
         },
         "overview" => match overview(project_root, call.arguments).await {
-            Ok(result) => tool_success_result(result)?,
+            Ok(result) => tool_result_or_error(result),
             Err(error) => tool_error_result(error),
         },
         "find_duplicates" => match find_duplicates(project_root, call.arguments).await {
-            Ok(result) => tool_success_result(result)?,
+            Ok(result) => tool_result_or_error(result),
             Err(error) => tool_error_result(error),
         },
         _ => {
@@ -347,6 +347,17 @@ fn tool_success_result(payload: Value) -> Result<Value> {
         "content": [TextContent { kind: "text", text }],
         "structuredContent": payload,
     }))
+}
+
+/// Serialize a successful tool payload, degrading a serialize failure into a
+/// tool-level error instead of propagating it out of `handle_tools_call` (which
+/// would kill the server loop). `to_string` on a `Value` won't realistically
+/// fail, but the success arm must never be able to take down the server.
+fn tool_result_or_error(payload: Value) -> Value {
+    match tool_success_result(payload) {
+        Ok(result) => result,
+        Err(error) => tool_error_result(error),
+    }
 }
 
 fn tool_error_result(error: ClaudixError) -> Value {

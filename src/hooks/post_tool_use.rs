@@ -17,6 +17,15 @@ use super::ready_check::check_index_ready;
 use super::spawn::spawn_background_reindex_file;
 use crate::store::marker::WATCH_MARKER_STALE_SECS;
 
+/// Fail-open budget for the read-time surfacing load + cosine scan. The `Read`
+/// hook must not stall the session, so the whole-corpus read and O(n²) scan are
+/// each capped at this; on elapse the hook surfaces nothing.
+const READ_SURFACING_TIMEOUT_MS: u64 = 2_000;
+
+/// Corpus ceiling for read-time surfacing. Above this the O(n²) scan is too
+/// expensive to run on the hot `Read` path, so surfacing is skipped entirely.
+const READ_SURFACING_MAX_CHUNKS: usize = 50_000;
+
 pub(super) async fn handle_post_tool_use(
     project_root: &Path,
     payload: HookPayload,
@@ -153,7 +162,23 @@ async fn read_surfacing_context(
         .map(|count| start.saturating_add(count.saturating_sub(1)));
 
     let store = Store::new(project_root, cfg).ok()?;
-    let all_rows = store.read_chunks().await.ok()?;
+    // Read-time surfacing rides the hot `Read` path. `read_chunks` deserializes
+    // every vector and the cosine scan is O(n²); on a large repo (or while a full
+    // reindex holds the write lock) either can block for seconds and stall the
+    // session. Bound the whole load+scan in a timeout and skip outright when the
+    // corpus is too large to scan cheaply. Fail-open: any elapse/error → noop.
+    let all_rows = match tokio::time::timeout(
+        Duration::from_millis(READ_SURFACING_TIMEOUT_MS),
+        store.read_chunks(),
+    )
+    .await
+    {
+        Ok(Ok(rows)) => rows,
+        _ => return None,
+    };
+    if all_rows.len() > READ_SURFACING_MAX_CHUNKS {
+        return None;
+    }
 
     let query_vectors: Vec<Vec<f32>> = all_rows
         .iter()
@@ -168,11 +193,17 @@ async fn read_surfacing_context(
     let exclude = read_path.clone();
     let top_k = cfg.hooks.related_top_k;
     let min_similarity = cfg.hooks.related_min_similarity;
-    let hits = tokio::task::spawn_blocking(move || {
-        neighbors(&all_rows, &query_vectors, &exclude, top_k, min_similarity)
-    })
+    let hits = match tokio::time::timeout(
+        Duration::from_millis(READ_SURFACING_TIMEOUT_MS),
+        tokio::task::spawn_blocking(move || {
+            neighbors(&all_rows, &query_vectors, &exclude, top_k, min_similarity)
+        }),
+    )
     .await
-    .ok()?;
+    {
+        Ok(Ok(hits)) => hits,
+        _ => return None,
+    };
     // Defense in depth on top of index-time pruning: a file deleted out-of-band
     // may still have chunks in the store until the next reindex, so never offer
     // a now-missing file as related code. Cheap: one stat per hit (≤ top_k).

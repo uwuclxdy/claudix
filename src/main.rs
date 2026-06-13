@@ -366,6 +366,11 @@ fn active_project_root() -> Result<std::path::PathBuf> {
     }
 }
 
+/// Outer fail-open budget for a whole hook handler. Generous over PreToolUse's
+/// internal 1.5 s search budget so legitimate background-spawn paths finish, but
+/// finite so a stalled store/embed/lock can't hang the host on the hook.
+const HOOK_COMMAND_TIMEOUT_MS: u64 = 5_000;
+
 async fn run_hook_command(project_root: &std::path::Path, event: hooks::HookEvent) {
     let payload = read_stdin_payload();
     // Canonicalize so `path.strip_prefix(project_root)` lines up with the
@@ -377,18 +382,33 @@ async fn run_hook_command(project_root: &std::path::Path, event: hooks::HookEven
         .unwrap_or_else(|_| project_root.to_path_buf());
     let handle = tokio::spawn(async move { hooks::run(&project_root, event, &payload).await });
 
-    match handle.await {
-        Ok(Ok(Some(response))) => {
+    // Hooks must fail open: a stalled handler (slow store on NFS, a slow embed,
+    // a poisoned mutex) is as fatal to the session as a panic, because the host
+    // waits on the hook. Cap the whole handler with an outer budget consistent
+    // with PreToolUse's internal one, but generous enough that the legitimate
+    // background-spawn paths (which return promptly) never trip it. On elapse we
+    // emit no JSON and exit normally — the session continues.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(HOOK_COMMAND_TIMEOUT_MS),
+        handle,
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(Ok(Some(response)))) => {
             if let Ok(encoded) = to_string(&response) {
                 println!("{encoded}");
             }
         }
-        Ok(Ok(None)) => {}
-        Ok(Err(error)) => {
+        Ok(Ok(Ok(None))) => {}
+        Ok(Ok(Err(error))) => {
             eprintln!("claudix hook failed open: {error}");
         }
-        Err(_) => {
+        Ok(Err(_)) => {
             eprintln!("claudix hook panicked and failed open");
+        }
+        Err(_) => {
+            eprintln!("claudix hook timed out and failed open");
         }
     }
 }
