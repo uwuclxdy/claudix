@@ -21,7 +21,7 @@ Core design goal: never break the session, always recover gracefully.
 ## Requirements
 
 - **macOS 11+ (Apple Silicon)** or **Linux x86_64** (glibc 2.28+ or musl) or **Windows 10+ x86_64**
-- **Rust 1.83+**
+- **Rust 1.91+**
 - **Optional**: LM Studio or Ollama for custom embedding backends (
   - bundled `bge-small-en-v1.5` requires `libonnxruntime` or `onnxruntime.dll`)
 
@@ -211,7 +211,7 @@ All three backends return 384-dimensional vectors (for bge-small); other models 
 
 ## Building from Source
 
-Requires **Rust 1.83+** and **Cargo**.
+Requires **Rust 1.91+** and **Cargo**.
 
 ```bash
 git clone <repo>
