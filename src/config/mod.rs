@@ -129,7 +129,7 @@ impl Default for Config {
                 auto_reembed_on_edit: true,
                 auto_index_on_session_start: true,
                 surface_related_on_edit: true,
-                surface_related_on_read: true,
+                surface_related_on_read: false,
                 related_top_k: 5,
                 related_min_similarity: 0.65,
             },
@@ -392,6 +392,11 @@ mod tests {
     fn development_mode_defaults_to_false() {
         assert!(!Config::default().development_mode);
         assert!(validate(&Config::default()).is_ok());
+    }
+
+    #[test]
+    fn surface_related_on_read_defaults_to_false() {
+        assert!(!Config::default().hooks.surface_related_on_read);
     }
 
     #[test]

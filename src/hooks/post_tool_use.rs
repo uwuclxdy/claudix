@@ -990,8 +990,8 @@ mod tests {
     }
 
     #[test]
-    fn read_surfacing_defaults_on() {
-        assert!(Config::default().hooks.surface_related_on_read);
+    fn read_surfacing_defaults_off() {
+        assert!(!Config::default().hooks.surface_related_on_read);
     }
 
     #[tokio::test]

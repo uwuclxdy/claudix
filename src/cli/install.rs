@@ -243,6 +243,7 @@ fn default_global_config() -> &'static str {
 # auto_index_on_session_start = true  # trigger background reindex when stale
 # intercept_grep = true               # redirect conceptual Grep/rg to search_code
 # auto_reembed_on_edit = true         # re-embed edited files in background
+# surface_related_on_read = false     # opt-in: surface related code on Read (off by default)
 
 [search]
 # top_k = 10                     # default result count for search_code
