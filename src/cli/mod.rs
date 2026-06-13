@@ -2124,4 +2124,132 @@ mod tests {
         let merged = effective_cross_repos(&[], None);
         assert!(merged.is_empty());
     }
+
+    /// `run_doctor` must surface `development_mode` from config and `binary_path`
+    /// from the running process. The default config has `development_mode = false`;
+    /// a project config with `development_mode = true` must flip the field.
+    #[tokio::test]
+    async fn run_doctor_surfaces_development_mode_and_binary_path() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        // `development_mode` is a top-level key — must precede any section header.
+        let claude_dir = fixture.root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                "development_mode = true\n\n[embedding]\nmodel = \"stub-v1\"\ndimensions = 8\n",
+            )
+            .is_ok()
+        );
+
+        let output = run_doctor(fixture.root()).await;
+        assert!(output.is_ok(), "run_doctor failed: {:?}", output.err());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(
+            output.development_mode,
+            "development_mode must be true when set in project config"
+        );
+        assert!(
+            !output.binary_path.is_empty(),
+            "binary_path must be a non-empty string"
+        );
+        assert!(
+            output.binary_path != "<unknown>" || std::env::current_exe().is_err(),
+            "binary_path must resolve to the current exe path when available"
+        );
+    }
+
+    /// `run_doctor` must surface `development_mode = false` when the project config
+    /// explicitly sets it to false, overriding any global setting.
+    #[tokio::test]
+    async fn run_doctor_development_mode_false_when_project_config_disables_it() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        // `development_mode` is a top-level key — must appear before any
+        // section header so the TOML parser does not assign it to [embedding].
+        // This ensures the project layer wins over any global config the test
+        // host may have (e.g. ~/.claude/claudix.toml with development_mode = true).
+        let claude_dir = fixture.root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                "development_mode = false\n\n[embedding]\nmodel = \"stub-v1\"\ndimensions = 8\n",
+            )
+            .is_ok()
+        );
+
+        let output = run_doctor(fixture.root()).await;
+        assert!(output.is_ok(), "run_doctor failed: {:?}", output.err());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(
+            !output.development_mode,
+            "development_mode must be false when project config explicitly disables it"
+        );
+    }
+
+    /// `run_index` must clear the store and produce a working index when
+    /// `validate_manifest_compatibility` returns `SchemaMismatch` (future schema
+    /// bump). This exercises the `requires_clean_reindex` → `clear_chunks` →
+    /// `Claudix::new` retry path inside `IndexSession::new`.
+    #[tokio::test]
+    async fn run_index_clears_schema_mismatch_and_reindexes() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        // Write a project config so run_index can load it.
+        let claude_dir = fixture.root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                "[embedding]\nmodel = \"stub-v1\"\ndimensions = 8\n",
+            )
+            .is_ok()
+        );
+
+        let config = stub_config();
+        let store = Store::new(fixture.root(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+
+        // Inject a manifest with a future schema_version to trigger SchemaMismatch.
+        let mut stale_manifest =
+            Manifest::new(&config.embedding.model, config.embedding.dimensions);
+        stale_manifest.schema_version = crate::store::SCHEMA_VERSION + 1;
+        assert!(store.write_manifest(&stale_manifest).is_ok());
+
+        // run_index must detect SchemaMismatch, clear, and reindex successfully.
+        let output = run_index(fixture.root(), false).await;
+        assert!(
+            output.is_ok(),
+            "run_index must succeed after schema mismatch: {:?}",
+            output.err()
+        );
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            output.chunk_count > 0,
+            "reindex after schema mismatch must produce chunks"
+        );
+
+        // The manifest written after the reindex must carry the current schema version.
+        let manifest = store.read_manifest();
+        assert!(manifest.is_ok());
+        let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
+        assert!(manifest.is_some());
+        let manifest = manifest.unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            manifest.schema_version,
+            crate::store::SCHEMA_VERSION,
+            "schema_version must match binary after clean reindex"
+        );
+    }
 }

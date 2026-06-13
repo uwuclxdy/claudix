@@ -767,4 +767,63 @@ cross_repos = ["/path/one", "/path/two"]
             Some(["/path/one".to_owned(), "/path/two".to_owned()].as_slice())
         );
     }
+
+    /// Three-level stack: global < project < CIRRUS_CONFIG.
+    ///
+    /// Verifies that `load_from_paths` applies the correct precedence when all
+    /// three layers are present. The test_override (CIRRUS_CONFIG path) must win
+    /// over both global and project.
+    #[test]
+    fn three_level_config_stack_cirrus_wins_over_project() {
+        let temp = tempdir().expect("tempdir");
+
+        let global_path = temp.path().join("global.toml");
+        let project_path = temp.path().join("project.toml");
+        let cirrus_path = temp.path().join("cirrus.toml");
+
+        fs::write(&global_path, "[search]\ntop_k = 5\n").expect("write global");
+        fs::write(&project_path, "[search]\ntop_k = 15\n").expect("write project");
+        // CIRRUS_CONFIG overrides project — top_k = 30 must win.
+        fs::write(&cirrus_path, "[search]\ntop_k = 30\n").expect("write cirrus");
+
+        let config = load_from_paths(Some(&global_path), &project_path, Some(&cirrus_path));
+        assert!(config.is_ok(), "load_from_paths failed: {:?}", config.err());
+        assert_eq!(
+            config.unwrap_or_else(|_| unreachable!()).search.top_k,
+            30,
+            "CIRRUS_CONFIG must override both global and project"
+        );
+    }
+
+    /// Three-level stack: global-only key is preserved when project and
+    /// CIRRUS_CONFIG do not touch it, confirming cascaded merge (not replacement).
+    #[test]
+    fn three_level_config_stack_global_key_preserved_when_not_overridden() {
+        let temp = tempdir().expect("tempdir");
+
+        let global_path = temp.path().join("global.toml");
+        let project_path = temp.path().join("project.toml");
+        let cirrus_path = temp.path().join("cirrus.toml");
+
+        // Global sets endpoint; neither project nor cirrus touch it.
+        fs::write(
+            &global_path,
+            "[embedding]\nprovider = \"http\"\nendpoint = \"http://global.example\"\n",
+        )
+        .expect("write global");
+        fs::write(&project_path, "[search]\ntop_k = 10\n").expect("write project");
+        fs::write(&cirrus_path, "[search]\ntop_k = 25\n").expect("write cirrus");
+
+        let config = load_from_paths(Some(&global_path), &project_path, Some(&cirrus_path));
+        assert!(config.is_ok(), "load_from_paths failed: {:?}", config.err());
+        let config = config.unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            config.embedding.endpoint, "http://global.example",
+            "global-only key must survive project and CIRRUS_CONFIG merge"
+        );
+        assert_eq!(
+            config.search.top_k, 25,
+            "CIRRUS_CONFIG must still override project for touched keys"
+        );
+    }
 }
