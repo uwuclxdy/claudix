@@ -97,3 +97,20 @@ pub const SET_HOME_FOR_INSTALL: &str = "Set HOME before running claudix install"
 
 // --- util ---------------------------------------------------------------
 pub const UTC_TIMESTAMP_FORMAT: &str = "Use UTC timestamps in the form 2026-04-27T12:00:00Z";
+
+// --- i/o & runtime errors -----------------------------------------------
+pub const IO_CHECK_DISK: &str =
+    "Check disk space and file permissions, then run /claudix:doctor if the error persists";
+pub const STORE_DOCTOR: &str =
+    "Run /claudix:doctor to inspect the store, or reindex with force: true to rebuild";
+pub const LANCE_DOCTOR: &str =
+    "Run /claudix:doctor; if the store is corrupt, reindex with force: true to rebuild";
+pub const GIT_ENUM_DOCTOR: &str =
+    "Ensure the project is a valid git repository and run /claudix:doctor";
+pub const IGNORE_PATTERN: &str =
+    "Check .indexignore/.indexinclude for invalid glob patterns, then retry";
+pub const HTTP_DOCTOR: &str =
+    "Run /claudix:doctor to check network access and the configured embedding endpoint";
+pub const EMBEDDING_GENERIC: &str = "Run /claudix:doctor to check the embedding provider; switch to bundled if the endpoint is unavailable";
+pub const TREE_SITTER_REINDEX: &str =
+    "The file may contain syntax that the parser cannot handle; it will be skipped on next reindex";

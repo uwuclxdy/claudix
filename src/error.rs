@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+use crate::prompts::hints;
+
 #[derive(Debug, Clone, Copy)]
 pub struct RecoveryHint(pub &'static str);
 
@@ -128,7 +130,17 @@ impl ClaudixError {
             Self::NotAGitRepository { recovery, .. } => Some(recovery.0),
             Self::PathTraversal { recovery, .. } => Some(recovery.0),
             Self::BundledAssetsMissing { recovery, .. } => Some(recovery.0),
-            _ => None,
+            // High-frequency runtime variants: return actionable hints.
+            Self::Io(_) => Some(hints::IO_CHECK_DISK),
+            Self::Store(_) => Some(hints::STORE_DOCTOR),
+            Self::Lance(_) => Some(hints::LANCE_DOCTOR),
+            Self::Git(_) => Some(hints::GIT_ENUM_DOCTOR),
+            Self::Ignore(_) => Some(hints::IGNORE_PATTERN),
+            Self::Http(_) => Some(hints::HTTP_DOCTOR),
+            Self::Embedding(_) => Some(hints::EMBEDDING_GENERIC),
+            Self::TreeSitter(_) => Some(hints::TREE_SITTER_REINDEX),
+            // JSON serialization errors are not user-actionable; no hint.
+            Self::Serialization(_) => None,
         }
     }
 
