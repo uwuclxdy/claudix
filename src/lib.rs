@@ -18,6 +18,7 @@ pub use types::{
     RelativePath,
 };
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -118,12 +119,31 @@ impl Claudix {
             .map(|f| (f.relative_path.as_str().to_owned(), f.file_hash.0))
             .collect();
 
-        // Fast path: if the manifest already lists exactly these files with the
-        // same hashes under the same embedding model, skip the LanceDB row read
-        // entirely. touch_manifest_if_in_sync handles the timestamp bump.
-        if self
+        // Files the active `.indexinclude` rules force into the index. One that
+        // the store holds at zero chunks was last indexed before its rule
+        // existed (e.g. the per-file hook recorded it via `note_file_hash` while
+        // it routed through the no-op `Unknown` chunker). Its content hash is
+        // unchanged, so the hash fast paths below would skip it forever; collect
+        // such paths so they re-chunk on this incremental pass instead of only
+        // after a full `force` rebuild.
+        let force_included: HashSet<&str> = files
+            .iter()
+            .filter(|file| file.force_indexed)
+            .map(|file| file.relative_path.as_str())
+            .collect();
+        let force_recheck = self
             .store
-            .manifest_hashes_match(&current_files, self.config.as_ref())?
+            .force_included_without_chunks(&force_included)
+            .await?;
+
+        // Fast path: if the manifest already lists exactly these files with the
+        // same hashes under the same embedding model — and no force-included
+        // file is stuck at zero chunks — skip the LanceDB row read entirely.
+        // touch_manifest_if_in_sync handles the timestamp bump.
+        if force_recheck.is_empty()
+            && self
+                .store
+                .manifest_hashes_match(&current_files, self.config.as_ref())?
             && let Some(stats) = self
                 .store
                 .touch_manifest_if_in_sync(&current_files, self.config.as_ref())?
@@ -136,7 +156,7 @@ impl Claudix {
 
         let (changed_paths, unchanged_rows) = self
             .store
-            .incremental_file_state(&current_files, &mut *progress)
+            .incremental_file_state(&current_files, &force_recheck, &mut *progress)
             .await?;
 
         if changed_paths.is_empty()
@@ -1108,6 +1128,63 @@ mod tests {
         // index_full must still succeed via the incremental path.
         let stats = claudix.index_full(&mut ()).await?;
         assert!(stats.file_count > 0);
+        Ok(())
+    }
+
+    /// A doc the per-file hook recorded at zero chunks before its
+    /// `.indexinclude` rule existed must re-chunk on the next incremental
+    /// `index_full`, not stay invisible until a full `force` rebuild. The
+    /// content hash is unchanged across the rule addition, so the manifest-cache
+    /// fast paths would otherwise skip it forever.
+    #[tokio::test]
+    async fn index_full_rechunks_force_included_zero_chunk_doc() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+
+        // `docs/` is gitignored, so without a rule the bulk walk never sees it.
+        fs::write(fixture.root().join(".gitignore"), "docs/\n").await?;
+        let doc = "# Internals\n\nLoad-bearing design notes for the project.\n";
+        fs::create_dir_all(fixture.root().join("docs")).await?;
+        fs::write(fixture.root().join("docs/internals.md"), doc).await?;
+
+        let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
+
+        // 1. Index with no rule: docs/ is pruned by gitignore, absent from the store.
+        claudix.index_full(&mut ()).await?;
+        let baseline = claudix.store.read_chunks().await?;
+        assert!(
+            baseline.iter().all(|r| r.file_path != "docs/internals.md"),
+            "doc must not be indexed before its rule exists"
+        );
+
+        // 2. Simulate the PostToolUse hook having touched the doc earlier (a
+        //    global gitignore makes it watchable) → Unknown chunker → 0 chunks →
+        //    hash recorded in the manifest.
+        claudix.store.note_file_hash(
+            &RelativePath::new("docs/internals.md"),
+            crate::enumeration::hash_bytes(doc.as_bytes()).0,
+            claudix.config.as_ref(),
+        )?;
+
+        // 3. Add the include rule. The doc's content is unchanged, so its
+        //    manifest hash still matches — this is where the bug skipped it.
+        fs::write(fixture.root().join(".indexinclude"), "docs/**\n").await?;
+
+        claudix.index_full(&mut ()).await?;
+        let rows = claudix.store.read_chunks().await?;
+        assert!(
+            rows.iter().any(|r| r.file_path == "docs/internals.md"),
+            "force-included doc must re-chunk on incremental reindex after rule add"
+        );
+
+        // 4. Self-heal is stable: once it has chunks, force_recheck is empty so a
+        //    further reindex takes the fast path and keeps the doc — no flapping.
+        claudix.index_full(&mut ()).await?;
+        let rows = claudix.store.read_chunks().await?;
+        assert!(
+            rows.iter().any(|r| r.file_path == "docs/internals.md"),
+            "doc must stay indexed on subsequent reindexes"
+        );
         Ok(())
     }
 

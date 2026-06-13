@@ -198,6 +198,7 @@ impl Store {
     pub async fn incremental_file_state(
         &self,
         current_files: &[(String, [u8; 16])],
+        force_recheck: &HashSet<String>,
         progress: &mut dyn IndexProgress,
     ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
         // Use the projected metadata read to build the hash map — no vectors needed here.
@@ -214,7 +215,10 @@ impl Store {
         let mut changed_paths: HashSet<String> = HashSet::new();
         for (path, hash) in current_files {
             match stored_file_hashes.get(path.as_str()) {
-                Some(stored_hash) if stored_hash == hash => {
+                // A `force_recheck` path is re-chunked even at the same hash: its
+                // `.indexinclude` rule was added after it was last indexed at zero
+                // chunks, so a content-hash match no longer proves it is current.
+                Some(stored_hash) if stored_hash == hash && !force_recheck.contains(path) => {
                     progress.file(&RelativePath::new(path.as_str()), IndexFileStatus::Verified)?;
                 }
                 _ => {
@@ -241,6 +245,35 @@ impl Store {
             .collect();
 
         Ok((changed_paths, unchanged_rows))
+    }
+
+    /// Subset of `force_included` whose files have no stored chunk rows.
+    ///
+    /// A force-included file with zero chunks was last indexed before its
+    /// `.indexinclude` rule existed — e.g. the per-file hook recorded it at
+    /// zero chunks via [`Self::note_file_hash`] while it routed through the
+    /// no-op `Language::Unknown` chunker. Its content hash is unchanged, so the
+    /// hash-based fast paths ([`Self::manifest_hashes_match`] and the per-file
+    /// `Verified` shortcut) would skip it forever. Callers pass the result back
+    /// into [`Self::incremental_file_state`] as `force_recheck` so a freshly
+    /// added include rule takes effect on the next incremental reindex instead
+    /// of only after a full `force` rebuild. Returns an empty set — and skips
+    /// the projected metadata read — when `force_included` is empty, so a
+    /// no-include repo pays nothing.
+    pub async fn force_included_without_chunks(
+        &self,
+        force_included: &HashSet<&str>,
+    ) -> Result<HashSet<String>> {
+        if force_included.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let metadata = self.read_chunk_metadata().await?;
+        let chunk_bearing: HashSet<&str> = metadata.iter().map(|m| m.file_path.as_str()).collect();
+        Ok(force_included
+            .iter()
+            .filter(|path| !chunk_bearing.contains(**path))
+            .map(|path| (*path).to_owned())
+            .collect())
     }
 
     /// Returns `true` when the manifest's `file_hashes` already covers exactly
@@ -1412,7 +1445,7 @@ mod tests {
         ];
 
         let (changed_paths, unchanged_rows) = store
-            .incremental_file_state(&current_files, &mut ())
+            .incremental_file_state(&current_files, &HashSet::new(), &mut ())
             .await?;
 
         assert!(
@@ -1443,7 +1476,7 @@ mod tests {
 
         let current_files = vec![("src/empty.rs".to_owned(), [7u8; 16])];
         let (changed_paths, unchanged_rows) = store
-            .incremental_file_state(&current_files, &mut ())
+            .incremental_file_state(&current_files, &HashSet::new(), &mut ())
             .await?;
 
         assert!(changed_paths.is_empty());
@@ -1467,12 +1500,67 @@ mod tests {
         let current_files = vec![("src/a.rs".to_owned(), [1u8; 16])];
 
         let (changed_paths, unchanged_rows) = store
-            .incremental_file_state(&current_files, &mut ())
+            .incremental_file_state(&current_files, &HashSet::new(), &mut ())
             .await?;
 
         assert!(changed_paths.is_empty());
         assert_eq!(unchanged_rows.len(), 1);
         assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn force_included_without_chunks_flags_zero_chunk_entry() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        // One chunk-bearing file plus a manifest-only zero-chunk entry — the
+        // latter mirrors a doc the per-file hook recorded before its
+        // `.indexinclude` rule existed.
+        store
+            .replace_chunks(
+                &[sample_chunk(
+                    1,
+                    "src/a.rs",
+                    "fn_a",
+                    "fn a() {}",
+                    &[1.0; 384],
+                )],
+                &config,
+            )
+            .await?;
+        store.note_file_hash(&RelativePath::new("docs/x.md"), [7u8; 16], &config)?;
+
+        let force_included: HashSet<&str> = ["src/a.rs", "docs/x.md"].into_iter().collect();
+        let stuck = store.force_included_without_chunks(&force_included).await?;
+        assert!(
+            stuck.contains("docs/x.md"),
+            "zero-chunk force-included file must be flagged for recheck"
+        );
+        assert!(
+            !stuck.contains("src/a.rs"),
+            "a chunk-bearing file must not be flagged"
+        );
+
+        // An empty force-include set skips the read and returns empty.
+        assert!(
+            store
+                .force_included_without_chunks(&HashSet::new())
+                .await?
+                .is_empty()
+        );
+
+        // Fed back as `force_recheck`, the zero-chunk path is re-chunked even
+        // though its manifest hash matches.
+        let current_files = vec![("docs/x.md".to_owned(), [7u8; 16])];
+        let (changed_paths, _) = store
+            .incremental_file_state(&current_files, &stuck, &mut ())
+            .await?;
+        assert!(
+            changed_paths.contains("docs/x.md"),
+            "force_recheck must override the hash-match Verified shortcut"
+        );
         Ok(())
     }
 
