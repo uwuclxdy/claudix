@@ -284,6 +284,9 @@ fn build_chunk(
     })
 }
 
+// Content-addressed: hashes only `(file_hash, byte_range)`, NOT `file_path`.
+// See `ChunkId` docs — storage keys by `(file_path, byte_start, chunk_id)`, so
+// cross-file collisions are disambiguated there, not here.
 fn chunk_id(file_hash: FileHash, byte_range: ByteRange) -> ChunkId {
     let mut payload = [0_u8; 24];
     payload[..16].copy_from_slice(&file_hash.0);

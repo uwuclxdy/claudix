@@ -3,7 +3,15 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::error::{ClaudixError, RecoveryHint, Result};
 
-/// Deterministic chunk identifier derived from (file_hash, byte_range).
+/// Content-addressed chunk identifier: xxh3 of `(file_hash, byte_range)`.
+///
+/// Deliberately NOT row-unique. `FileHash` is xxh3 of file content, so two
+/// different files with byte-identical content and matching byte ranges hash to
+/// the same `ChunkId`. Storage keys rows by `(file_path, byte_start, chunk_id)`
+/// — `file_path` disambiguates such collisions — so this is correct for the
+/// current store. Do NOT promote `ChunkId` to a standalone primary or dedup key
+/// without folding `file_path` into the hash first, or cross-file duplicates
+/// will silently merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ChunkId(pub u64);
 
@@ -31,6 +39,13 @@ impl fmt::Display for FileHash {
 pub struct Dimension(pub u16);
 
 /// Repo-relative path, always forward-slash normalized.
+///
+/// INVARIANT (advisory): `new`/`from_path` only normalize separators — they do
+/// NOT enforce relativity. An absolute (`/etc/passwd`) or escaping (`../..`,
+/// `C:\…`) string is accepted as-is. Any caller that joins this against a root
+/// or crosses a trust boundary (hook payloads, stored rows, tool input) MUST
+/// call [`RelativePath::reject_escape`] first to keep operations inside
+/// `$CLAUDE_PROJECT_DIR`.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -80,6 +95,8 @@ impl RelativePath {
         reject_path_escape(&self.to_path_buf(), recovery)
     }
 
+    /// Normalize separators only. Does NOT enforce relativity — see the type
+    /// docs; trust-boundary callers must follow with [`Self::reject_escape`].
     pub fn new(s: impl Into<String>) -> Self {
         let raw = s.into();
         let normalized = raw.replace('\\', "/");

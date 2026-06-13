@@ -54,7 +54,12 @@ pub(super) fn parse_path_prefix(path_prefix: Option<String>) -> Result<Option<Re
     }
 
     validate_project_relative_path(Path::new(trimmed), "search.path_prefix")?;
-    Ok(Some(RelativePath::new(trimmed.to_owned())))
+    let prefix = RelativePath::new(trimmed.to_owned());
+    // Defense-in-depth: `RelativePath::new` only normalizes separators, so
+    // re-check the constructed value against the trust boundary even though the
+    // string already passed `validate_project_relative_path` above.
+    prefix.reject_escape(hints::PROJECT_RELATIVE_PATH)?;
+    Ok(Some(prefix))
 }
 
 fn parse_language(value: &str) -> Result<Language> {
