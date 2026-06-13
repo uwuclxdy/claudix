@@ -248,6 +248,14 @@ async fn ensure_assets_exist(paths: &AssetPaths, model_id: &str) -> Result<()> {
 
     if let Some(parent) = paths.model.parent() {
         fs::create_dir_all(parent).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_perms = std::fs::Permissions::from_mode(0o700);
+            if let Err(e) = fs::set_permissions(parent, dir_perms).await {
+                tracing::warn!("could not set perms on model cache dir: {e}");
+            }
+        }
     }
 
     eprintln!("downloading default embeddings model (~120MB)...");
@@ -280,6 +288,14 @@ async fn download_asset(url: &str, destination: &Path) -> Result<()> {
     file.flush().await?;
     drop(file);
     fs::rename(temp_path, destination).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file_perms = std::fs::Permissions::from_mode(0o600);
+        if let Err(e) = fs::set_permissions(destination, file_perms).await {
+            tracing::warn!("could not set perms on downloaded asset: {e}");
+        }
+    }
     Ok(())
 }
 

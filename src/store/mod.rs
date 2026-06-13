@@ -124,7 +124,23 @@ impl Store {
 
     pub fn ensure_layout(&self) -> Result<()> {
         fs::create_dir_all(&self.paths.index_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_perms = std::fs::Permissions::from_mode(0o700);
+            fs::set_permissions(&self.paths.state_dir, dir_perms.clone())
+                .unwrap_or_else(|e| tracing::warn!("could not set perms on state dir: {e}"));
+            fs::set_permissions(&self.paths.index_dir, dir_perms)
+                .unwrap_or_else(|e| tracing::warn!("could not set perms on index dir: {e}"));
+        }
         fs::write(&self.paths.gitignore_path, GITIGNORE_CONTENTS)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_perms = std::fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&self.paths.gitignore_path, file_perms)
+                .unwrap_or_else(|e| tracing::warn!("could not set perms on .gitignore: {e}"));
+        }
         Ok(())
     }
 
