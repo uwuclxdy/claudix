@@ -32,6 +32,11 @@ const TOP_IDENTIFIERS_CAP: usize = 8;
 pub(crate) const DEFAULT_MIN_SIMILARITY: f32 = 0.85;
 /// Default maximum number of duplicate pairs returned by [`run_find_duplicates`].
 pub(crate) const DEFAULT_DUPLICATE_LIMIT: usize = 50;
+/// Hard ceiling on the combined chunk count fed to the O(n²) duplicate scan.
+/// `limit` caps only the output heap, not the input, so a caller pointing at
+/// many large repos could drive an unbounded pairwise scan (≈ n²/2 comparisons).
+/// Beyond this the scan is skipped and a notice is surfaced instead.
+pub(crate) const MAX_DUPLICATE_CORPUS_CHUNKS: usize = 50_000;
 
 pub use install::{run_install, setup_state};
 pub use watch::run_watch;
@@ -537,6 +542,24 @@ pub async fn run_find_duplicates(
     }
 
     if all_chunks.is_empty() {
+        return Ok(DuplicatesOutput {
+            pairs: Vec::new(),
+            repo_errors,
+        });
+    }
+
+    // Cap the combined corpus before the O(n²) scan: `limit` bounds only the
+    // output, so a large multi-repo input is a CPU/memory amplifier. Skip the
+    // scan and surface a notice rather than churning through millions of pairs.
+    if all_chunks.len() > MAX_DUPLICATE_CORPUS_CHUNKS {
+        repo_errors.push(RepoError {
+            repo: project_root.display().to_string(),
+            error: format!(
+                "duplicate scan skipped: {} chunks exceeds the {MAX_DUPLICATE_CORPUS_CHUNKS} cap; \
+                 narrow the repo list",
+                all_chunks.len()
+            ),
+        });
         return Ok(DuplicatesOutput {
             pairs: Vec::new(),
             repo_errors,

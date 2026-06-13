@@ -13,10 +13,21 @@ use crate::types::RelativePath;
 
 use super::cosine_similarity;
 
+/// Total order over neighbors, best-first: higher score wins, ties broken
+/// deterministically by `file_path` then `line_start`. Without the tiebreak,
+/// when more files tie on score than `top_k`, *which* survive the heap depends
+/// on `HashMap` drain order — so identical input could yield different sets.
+fn neighbor_rank(a: &Neighbor, b: &Neighbor) -> Ordering {
+    b.score
+        .partial_cmp(&a.score)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| a.file_path.cmp(&b.file_path))
+        .then_with(|| a.line_start.cmp(&b.line_start))
+}
+
 /// Min-heap wrapper for [`Neighbor`] so a `BinaryHeap<NeighborEntry>` acts as
-/// a bounded max-heap: the weakest neighbor sits at the top and is popped when
-/// the heap exceeds `top_k`. Tie-breaking mirrors the original sort:
-/// `partial_cmp` with `unwrap_or(Equal)`, no secondary key.
+/// a bounded max-heap: the weakest neighbor (worst under [`neighbor_rank`]) sits
+/// at the top and is popped when the heap exceeds `top_k`.
 struct NeighborEntry(Neighbor);
 
 impl PartialEq for NeighborEntry {
@@ -35,13 +46,11 @@ impl PartialOrd for NeighborEntry {
 
 impl Ord for NeighborEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Min-heap: smallest score has highest BinaryHeap priority (gets popped first).
-        // Reversed so BinaryHeap::peek() returns the weakest neighbor.
-        other
-            .0
-            .score
-            .partial_cmp(&self.0.score)
-            .unwrap_or(Ordering::Equal)
+        // BinaryHeap is a max-heap; we want its top (peek/pop) to be the *worst*
+        // neighbor. `neighbor_rank` is best-first (better compares `Less`), so a
+        // worse neighbor already compares `Greater` — use it directly so the
+        // worst sits at the top.
+        neighbor_rank(&self.0, &other.0)
     }
 }
 
@@ -108,8 +117,9 @@ pub fn neighbors(
     }
 
     // Build a min-heap capped at `top_k` so only qualifying candidates
-    // allocate their output `Neighbor` struct. The heap minimum (weakest score)
-    // is popped when the cap is exceeded.
+    // allocate their output `Neighbor` struct. The weakest neighbor under
+    // `neighbor_rank` (lowest score, then highest path/line) is popped when the
+    // cap is exceeded.
     let mut heap: BinaryHeap<NeighborEntry> = BinaryHeap::with_capacity(top_k + 1);
 
     for (score, row) in best.into_values() {
@@ -117,29 +127,31 @@ pub fn neighbors(
             continue;
         }
 
+        let candidate = Neighbor {
+            file_path: row.file_path.clone(),
+            line_start: row.line_start,
+            line_end: row.line_end,
+            name: row.name.clone(),
+            score,
+        };
+
         if heap.len() == top_k {
+            // Drop the candidate when it does not rank strictly better than the
+            // current weakest (heap min). `neighbor_rank` is best-first, so a
+            // better candidate compares `Less`.
             if let Some(min_entry) = heap.peek()
-                && score
-                    .partial_cmp(&min_entry.0.score)
-                    .unwrap_or(Ordering::Equal)
-                    != Ordering::Greater
+                && neighbor_rank(&candidate, &min_entry.0) != Ordering::Less
             {
                 continue;
             }
             heap.pop();
         }
 
-        heap.push(NeighborEntry(Neighbor {
-            file_path: row.file_path.clone(),
-            line_start: row.line_start,
-            line_end: row.line_end,
-            name: row.name.clone(),
-            score,
-        }));
+        heap.push(NeighborEntry(candidate));
     }
 
     let mut candidates: Vec<Neighbor> = heap.into_iter().map(|e| e.0).collect();
-    candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+    candidates.sort_by(neighbor_rank);
     candidates
 }
 
@@ -241,6 +253,30 @@ mod tests {
 
         let hits = neighbors(&rows, &query, &exclude, 5, 0.65);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn neighbors_tied_scores_yield_a_stable_set() {
+        // Five files all identical to the query (score 1.0); top_k=3. The cap
+        // forces a choice among tied scores — the deterministic tiebreak
+        // (file_path) must pick the same three on every run, in path order.
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        let rows = vec![
+            make_row("src/e.rs", "e", v.clone()),
+            make_row("src/b.rs", "b", v.clone()),
+            make_row("src/d.rs", "d", v.clone()),
+            make_row("src/a.rs", "a", v.clone()),
+            make_row("src/c.rs", "c", v.clone()),
+        ];
+        let query = vec![v];
+        let exclude = RelativePath::new("src/edited.rs");
+
+        let expected = ["src/a.rs", "src/b.rs", "src/c.rs"];
+        for _ in 0..16 {
+            let hits = neighbors(&rows, &query, &exclude, 3, 0.0);
+            let paths: Vec<&str> = hits.iter().map(|h| h.file_path.as_str()).collect();
+            assert_eq!(paths, expected, "tied-score survivors must be stable");
+        }
     }
 
     #[test]

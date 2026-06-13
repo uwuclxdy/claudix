@@ -15,10 +15,27 @@ use crate::store::StoredChunk;
 
 use super::cosine_similarity;
 
-/// Wrapper that gives `DuplicatePair` a min-heap ordering by similarity so a
-/// `BinaryHeap<HeapEntry>` is a bounded max-heap (pop the smallest when over
-/// the cap, keep the largest). Tie-breaking mirrors the original sort:
-/// `partial_cmp` with `unwrap_or(Equal)` and no secondary key.
+/// Stable identity tuple for a single chunk member, used as a tiebreak key.
+fn chunk_key(c: &DuplicateChunk) -> (&str, &str, u32) {
+    (&c.repo, &c.file_path, c.line_start)
+}
+
+/// Total order over pairs, best-first: higher similarity wins, ties broken
+/// deterministically by `(repo, file_path, line_start)` of each member. Without
+/// the tiebreak, when more equal-similarity pairs tie than `limit`, *which*
+/// survive the heap depends on scan order — so identical input could yield a
+/// different duplicate set across runs.
+fn pair_rank(a: &DuplicatePair, b: &DuplicatePair) -> Ordering {
+    b.similarity
+        .partial_cmp(&a.similarity)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| chunk_key(&a.a).cmp(&chunk_key(&b.a)))
+        .then_with(|| chunk_key(&a.b).cmp(&chunk_key(&b.b)))
+}
+
+/// Wrapper that gives `DuplicatePair` a min-heap ordering so a
+/// `BinaryHeap<HeapEntry>` is a bounded max-heap (pop the weakest under
+/// [`pair_rank`] when over the cap, keep the strongest).
 struct HeapEntry(DuplicatePair);
 
 impl PartialEq for HeapEntry {
@@ -37,13 +54,11 @@ impl PartialOrd for HeapEntry {
 
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
-        // Min-heap: the *smallest* similarity is the highest priority to pop.
-        // Reversed so BinaryHeap::peek() returns the weakest pair.
-        other
-            .0
-            .similarity
-            .partial_cmp(&self.0.similarity)
-            .unwrap_or(Ordering::Equal)
+        // BinaryHeap is a max-heap; we want its top (peek/pop) to be the *worst*
+        // pair. `pair_rank` is best-first (better compares `Less`), so a worse
+        // pair already compares `Greater` — use it directly so the worst sits at
+        // the top.
+        pair_rank(&self.0, &other.0)
     }
 }
 
@@ -126,20 +141,21 @@ pub fn find_duplicates(
                 continue;
             }
 
-            // Skip if this pair is weaker than the current heap minimum and
-            // the heap is already full — defer the string clones entirely.
-            if heap.len() == limit {
-                if let Some(min_entry) = heap.peek() {
-                    let min_sim = min_entry.0.similarity;
-                    // partial_cmp on f32: treat NaN as equal (same as original).
-                    if sim.partial_cmp(&min_sim).unwrap_or(Ordering::Equal) != Ordering::Greater {
-                        continue;
-                    }
-                }
-                heap.pop();
+            // Fast reject: a pair strictly weaker than the current heap minimum
+            // can never enter, so skip the clones. Equal-similarity pairs fall
+            // through and are resolved by the deterministic `pair_rank` tiebreak
+            // below — a tied pair may still displace the current minimum.
+            if heap.len() == limit
+                && let Some(min_entry) = heap.peek()
+                && sim
+                    .partial_cmp(&min_entry.0.similarity)
+                    .unwrap_or(Ordering::Equal)
+                    == Ordering::Less
+            {
+                continue;
             }
 
-            heap.push(HeapEntry(DuplicatePair {
+            let candidate = DuplicatePair {
                 a: DuplicateChunk {
                     repo: a.repo.to_owned(),
                     file_path: a.chunk.file_path.clone(),
@@ -155,17 +171,27 @@ pub fn find_duplicates(
                     name: b.chunk.name.clone(),
                 },
                 similarity: sim,
-            }));
+            };
+
+            if heap.len() == limit {
+                // Drop the candidate when it does not rank strictly better than
+                // the current weakest (heap min). `pair_rank` is best-first, so
+                // a better candidate compares `Less`.
+                if let Some(min_entry) = heap.peek()
+                    && pair_rank(&candidate, &min_entry.0) != Ordering::Less
+                {
+                    continue;
+                }
+                heap.pop();
+            }
+
+            heap.push(HeapEntry(candidate));
         }
     }
 
-    // Drain heap into a Vec sorted descending by similarity (mirrors original).
+    // Drain heap into a Vec sorted best-first via the deterministic `pair_rank`.
     let mut pairs: Vec<DuplicatePair> = heap.into_iter().map(|e| e.0).collect();
-    pairs.sort_by(|x, y| {
-        y.similarity
-            .partial_cmp(&x.similarity)
-            .unwrap_or(Ordering::Equal)
-    });
+    pairs.sort_by(pair_rank);
     pairs
 }
 
@@ -336,6 +362,40 @@ mod tests {
             min_sim > 0.89,
             "pair with similarity ≈ 0.90 should be dropped, kept pair sim={min_sim}"
         );
+    }
+
+    /// With more equal-similarity pairs than `limit`, the deterministic
+    /// `(repo, file_path, line_start)` tiebreak must pick the same survivors on
+    /// every run — identical input must not yield different duplicate sets.
+    #[test]
+    fn tied_similarity_yields_a_stable_set() {
+        let v = vec![1.0_f32, 0.0, 0.0, 0.0];
+        // Four files, all mutually identical → six pairs, all similarity 1.0.
+        let a = stored("src/a.rs", "a", v.clone());
+        let b = stored("src/b.rs", "b", v.clone());
+        let c = stored("src/c.rs", "c", v.clone());
+        let d = stored("src/d.rs", "d", v.clone());
+        let chunks = [
+            labeled("/repo", &a),
+            labeled("/repo", &b),
+            labeled("/repo", &c),
+            labeled("/repo", &d),
+        ];
+
+        let key = |p: &DuplicatePair| {
+            (
+                p.a.file_path.clone(),
+                p.a.line_start,
+                p.b.file_path.clone(),
+                p.b.line_start,
+            )
+        };
+        let baseline: Vec<_> = find_duplicates(&chunks, 0.0, 3).iter().map(key).collect();
+        assert_eq!(baseline.len(), 3);
+        for _ in 0..16 {
+            let again: Vec<_> = find_duplicates(&chunks, 0.0, 3).iter().map(key).collect();
+            assert_eq!(again, baseline, "tied-similarity survivors must be stable");
+        }
     }
 
     /// Equal-similarity pairs (NaN treated as Equal) must not cause panics and

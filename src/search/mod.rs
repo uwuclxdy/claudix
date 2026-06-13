@@ -402,14 +402,28 @@ async fn mark_stale_results(results: &mut [SearchResult]) -> Result<()> {
     Ok(())
 }
 
+/// Upper bound on a file we will read+hash for the staleness check, mirroring
+/// the indexing default `[indexing].max_file_size_kb` (512 KB). A file larger
+/// than this could not have been indexed under the default, so re-reading it on
+/// every search returning its chunk is wasted I/O; treat oversized as stale.
+const MAX_STALE_CHECK_BYTES: u64 = 512 * 1024;
+
 /// Returns `true` when the file on disk differs from what was indexed.
 ///
 /// `StoredChunk` carries no per-row index timestamp and `byte_range.end` is a
 /// chunk boundary, not the total file size, so no cheap size shortcut is
-/// available. Read and re-hash the full file; missing / unreadable → stale
-/// (fail-open).
+/// available beyond the stat below. We `stat` first and cap the read at
+/// [`MAX_STALE_CHECK_BYTES`]: an oversized file is reported stale without an
+/// unbounded read. Otherwise read and re-hash the full file; missing /
+/// unreadable → stale (fail-open).
 async fn result_is_stale(repo_root: &Path, chunk: &Chunk) -> Result<bool> {
     let path = resolve_chunk_path(repo_root, &chunk.file_path)?;
+    let Ok(metadata) = fs::metadata(&path).await else {
+        return Ok(true);
+    };
+    if metadata.len() > MAX_STALE_CHECK_BYTES {
+        return Ok(true);
+    }
     let Ok(contents) = fs::read(path).await else {
         return Ok(true);
     };
@@ -1115,6 +1129,67 @@ mod tests {
 
         assert!(!results.is_empty());
         assert!(results[0].stale);
+    }
+
+    #[tokio::test]
+    async fn result_is_stale_treats_oversized_file_as_stale() {
+        // A file larger than the staleness read cap must be reported stale
+        // without an unbounded read, even when its content hash would match.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let big = vec![b'x'; (MAX_STALE_CHECK_BYTES as usize) + 1];
+        let matching_hash = hash_bytes(&big);
+        tokio::fs::write(dir.path().join("big.rs"), &big)
+            .await
+            .expect("write oversized file");
+
+        let row = StoredChunk {
+            chunk_id: 0,
+            file_path: "big.rs".to_owned(),
+            language: "rust".into(),
+            kind: "function".into(),
+            name: None,
+            line_start: 1,
+            line_end: 1,
+            byte_start: 0,
+            byte_end: 1,
+            file_hash: matching_hash.0,
+            content: String::new(),
+            vector: vec![0.0],
+        };
+        let chunk = stored_chunk_to_chunk(row);
+
+        let stale = result_is_stale(dir.path(), &chunk).await;
+        assert!(matches!(stale, Ok(true)), "oversized file must be stale");
+    }
+
+    #[tokio::test]
+    async fn result_is_stale_matches_unchanged_in_cap_file() {
+        // A file at or below the cap with a matching hash is NOT stale.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let small = b"pub fn ok() {}\n";
+        let matching_hash = hash_bytes(small);
+        tokio::fs::write(dir.path().join("ok.rs"), small)
+            .await
+            .expect("write file");
+
+        let row = StoredChunk {
+            chunk_id: 0,
+            file_path: "ok.rs".to_owned(),
+            language: "rust".into(),
+            kind: "function".into(),
+            name: None,
+            line_start: 1,
+            line_end: 1,
+            byte_start: 0,
+            byte_end: small.len() as u32,
+            file_hash: matching_hash.0,
+            content: String::new(),
+            vector: vec![0.0],
+        };
+        let chunk = stored_chunk_to_chunk(row);
+
+        let stale = result_is_stale(dir.path(), &chunk).await;
+        assert!(matches!(stale, Ok(false)), "unchanged in-cap file is fresh");
     }
 
     #[tokio::test]
