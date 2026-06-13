@@ -32,6 +32,54 @@ pub fn list_candidate_paths(repo: &Repository) -> Result<Vec<RelativePath>> {
     Ok(paths.into_iter().collect())
 }
 
+/// Walk every file under the work tree ignoring `.gitignore` entirely, so files
+/// inside gitignored directories (e.g. a doc tree) are visible. Never descends
+/// into `.git` or `.claudix`. The gitignore-aware [`list_candidate_paths`] walk
+/// prunes ignored subtrees before any `.indexinclude` rule can re-include them;
+/// the enumerator consults this list to add back the paths an include rule
+/// matches and to discover nested rule files that live inside ignored subtrees.
+///
+/// Full-reindex only, and only when an include rule is present — it reads
+/// directory entries, not file contents. Paths still pass through the normal
+/// `.indexinclude`/`.indexignore` filters afterwards, so this never widens the
+/// indexed set on its own.
+pub fn list_all_paths(repo: &Repository) -> Result<Vec<RelativePath>> {
+    let workdir = repo
+        .workdir()
+        .ok_or_else(|| ClaudixError::Git("bare repositories are not supported".into()))?;
+    let mut paths = Vec::new();
+    let mut builder = WalkBuilder::new(workdir);
+    builder.hidden(false);
+    builder.git_ignore(false);
+    builder.git_exclude(false);
+    builder.git_global(false);
+    builder.parents(false);
+    builder.require_git(false);
+    builder.filter_entry(|entry| {
+        !matches!(entry.file_name().to_str(), Some(".git") | Some(".claudix"))
+    });
+
+    for entry in builder.build() {
+        let entry = entry?;
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+
+        let absolute_path = entry.into_path();
+        let relative_path = absolute_path
+            .strip_prefix(workdir)
+            .map_err(|error| ClaudixError::Git(error.to_string()))?;
+
+        if is_tracked_artifact(relative_path) {
+            continue;
+        }
+
+        paths.push(RelativePath::from_path(relative_path));
+    }
+
+    Ok(paths)
+}
+
 fn list_untracked_paths(workdir: &Path) -> Result<Vec<RelativePath>> {
     let mut paths = Vec::new();
     let mut builder = WalkBuilder::new(workdir);

@@ -28,7 +28,7 @@ use config::{Config, EmbeddingProvider};
 use embedding::StubProvider;
 use embedding::bundled::{BUNDLED_DIMENSIONS, BUNDLED_MODEL_ID};
 use embedding::{BundledProvider, FallbackProvider, HttpProvider, Provider};
-use enumeration::{EnumeratedFile, FileEnumerator, WatchFilter};
+use enumeration::{EnumeratedFile, FileEnumerator, PathFilters, WatchFilter};
 use error::RecoveryHint;
 use prompts::hints;
 use search::neighbors::neighbors;
@@ -232,8 +232,16 @@ impl Claudix {
 
         let enumerator =
             FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?;
-        let Some(file) =
-            enumerator.enumerate_one_with_bytes(relative_path.clone(), false, preread_bytes)?
+        // Mirror the full-reindex path: an `.indexinclude`d file of an unknown
+        // language (e.g. a `.md` doc) only chunks when force-indexed, so a watch
+        // or hook reindex must compute the same flag instead of hard-coding it.
+        let force_indexed =
+            PathFilters::load(&self.project_root)?.is_force_included(&relative_path);
+        let Some(file) = enumerator.enumerate_one_with_bytes(
+            relative_path.clone(),
+            force_indexed,
+            preread_bytes,
+        )?
         else {
             let stats = self
                 .store

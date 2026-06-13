@@ -89,6 +89,13 @@ impl PathFilters {
             .matched(path.to_path_buf(), false)
             .is_ignore()
     }
+
+    /// Whether any `.indexinclude` rule is in effect. Gates the gitignore-blind
+    /// deep walk: with no re-include rule there is nothing to rescue from an
+    /// ignored subtree, so the enumerator skips the extra walk entirely.
+    pub fn has_includes(&self) -> bool {
+        !self.indexinclude.is_empty()
+    }
 }
 
 fn load_matcher(project_root: &Path, file_name: &str) -> Result<Gitignore> {

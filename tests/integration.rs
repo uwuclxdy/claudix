@@ -290,6 +290,47 @@ async fn indexignore_excludes_skip_indexinclude_reinstates_reinclude() {
     );
 }
 
+// ── f2 ─────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn indexinclude_reincludes_gitignored_docs_end_to_end() {
+    let fixture = TestFixture::new("gitignored_docs");
+    assert!(fixture.is_ok(), "fixture setup failed");
+    let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+    let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+    assert!(claudix.is_ok(), "Claudix::new failed");
+    let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+
+    let stats = claudix.index_full(&mut ()).await;
+    assert!(stats.is_ok(), "index_full failed: {stats:?}");
+    let stats = stats.ok().unwrap_or_else(|| unreachable!());
+    // src/lib.rs + both gitignored docs, all chunked (docs as prose text).
+    assert_eq!(
+        stats.file_count, 3,
+        "expected src/lib.rs + 2 re-included docs, got {}: {stats:?}",
+        stats.file_count
+    );
+    assert!(stats.chunk_count >= 3, "docs produced no chunks: {stats:?}");
+
+    let results = claudix
+        .search(SearchQuery {
+            query: "user guide documentation".to_owned(),
+            top_k: 10,
+            language_filter: None,
+            path_prefix: None,
+            repos: Vec::new(),
+        })
+        .await;
+    assert!(results.is_ok(), "search failed: {results:?}");
+    let results = results.ok().unwrap_or_else(|| unreachable!()).results;
+
+    let from_docs = results
+        .iter()
+        .any(|r| r.chunk.file_path.as_str().starts_with("docs/"));
+    assert!(from_docs, "expected a hit from the docs/ tree: {results:?}");
+}
+
 // ── g ──────────────────────────────────────────────────────────────────────
 
 #[tokio::test]

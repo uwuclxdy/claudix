@@ -1,6 +1,7 @@
 mod filters;
 mod git;
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -40,11 +41,25 @@ impl FileEnumerator {
 
     pub fn enumerate(&self, progress: &mut dyn IndexProgress) -> Result<Vec<EnumeratedFile>> {
         let repo = git::discover_repository(&self.project_root)?;
-        let tracked_and_untracked = git::list_candidate_paths(&repo)?;
         let filters = PathFilters::load(&self.project_root)?;
 
+        let mut candidates: BTreeSet<RelativePath> =
+            git::list_candidate_paths(&repo)?.into_iter().collect();
+
+        // `.indexinclude` can re-include paths the gitignore-aware walk pruned
+        // before any filter saw them (e.g. a gitignored `docs/` tree). Add back
+        // the ones an include rule matches from a gitignore-blind deep walk;
+        // skipped when no include rule exists so the common case pays nothing.
+        if filters.has_includes() {
+            for relative_path in git::list_all_paths(&repo)? {
+                if filters.is_force_included(&relative_path) {
+                    candidates.insert(relative_path);
+                }
+            }
+        }
+
         let mut files = Vec::new();
-        for relative_path in tracked_and_untracked {
+        for relative_path in candidates {
             if !filters.is_included(&relative_path) {
                 progress.file(
                     &relative_path,
@@ -303,6 +318,72 @@ mod tests {
             .find(|f| f.relative_path.as_str() == "src/lib.rs");
         assert!(rs_file.is_some());
         assert!(!rs_file.unwrap_or_else(|| unreachable!()).force_indexed);
+    }
+
+    #[test]
+    fn indexinclude_reincludes_gitignored_directory() {
+        let fixture = TestFixture::new("gitignored_docs");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), Config::default());
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let files = enumerator.enumerate(&mut ());
+        assert!(files.is_ok());
+        let files = files.ok().unwrap_or_else(|| unreachable!());
+
+        let paths: BTreeSet<_> = files
+            .iter()
+            .map(|file| file.relative_path.as_str().to_owned())
+            .collect();
+        // `docs/` is gitignored and untracked; only the root `.indexinclude`
+        // (`docs/**`) rescues it from the gitignore-aware walk.
+        assert!(paths.contains("src/lib.rs"));
+        assert!(
+            paths.contains("docs/guide.md"),
+            "missing docs/guide.md: {paths:?}"
+        );
+        assert!(
+            paths.contains("docs/sub/api.md"),
+            "missing nested doc: {paths:?}"
+        );
+
+        // Unknown-language docs only chunk when force-indexed.
+        let guide = files
+            .iter()
+            .find(|f| f.relative_path.as_str() == "docs/guide.md")
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(guide.language, Language::Unknown);
+        assert!(guide.force_indexed);
+    }
+
+    #[test]
+    fn gitignored_directory_stays_excluded_without_indexinclude() {
+        let fixture = TestFixture::new("gitignored_docs");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        // Drop the re-include rule: the gitignored docs tree must vanish again.
+        assert!(fs::remove_file(fixture.root().join(".indexinclude")).is_ok());
+
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), Config::default());
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let files = enumerator.enumerate(&mut ());
+        assert!(files.is_ok());
+        let files = files.ok().unwrap_or_else(|| unreachable!());
+
+        let paths: BTreeSet<_> = files
+            .iter()
+            .map(|file| file.relative_path.as_str().to_owned())
+            .collect();
+        assert!(paths.contains("src/lib.rs"));
+        assert!(
+            !paths.iter().any(|p| p.starts_with("docs/")),
+            "docs leaked: {paths:?}"
+        );
     }
 
     #[test]
