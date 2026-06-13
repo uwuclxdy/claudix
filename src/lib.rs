@@ -235,8 +235,10 @@ impl Claudix {
         // Mirror the full-reindex path: an `.indexinclude`d file of an unknown
         // language (e.g. a `.md` doc) only chunks when force-indexed, so a watch
         // or hook reindex must compute the same flag instead of hard-coding it.
-        let force_indexed =
-            PathFilters::load(&self.project_root)?.is_force_included(&relative_path);
+        // `for_path` consults only the rule files on this file's ancestor chain,
+        // keeping the per-edit path cheap while honoring nested rules.
+        let force_indexed = PathFilters::for_path(&self.project_root, &relative_path)?
+            .is_force_included(&relative_path);
         let Some(file) = enumerator.enumerate_one_with_bytes(
             relative_path.clone(),
             force_indexed,

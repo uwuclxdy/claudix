@@ -41,22 +41,29 @@ impl FileEnumerator {
 
     pub fn enumerate(&self, progress: &mut dyn IndexProgress) -> Result<Vec<EnumeratedFile>> {
         let repo = git::discover_repository(&self.project_root)?;
-        let filters = PathFilters::load(&self.project_root)?;
+        let tracked = git::list_candidate_paths(&repo)?;
+        let mut candidates: BTreeSet<RelativePath> = tracked.iter().cloned().collect();
 
-        let mut candidates: BTreeSet<RelativePath> =
-            git::list_candidate_paths(&repo)?.into_iter().collect();
-
-        // `.indexinclude` can re-include paths the gitignore-aware walk pruned
-        // before any filter saw them (e.g. a gitignored `docs/` tree). Add back
-        // the ones an include rule matches from a gitignore-blind deep walk;
-        // skipped when no include rule exists so the common case pays nothing.
-        if filters.has_includes() {
-            for relative_path in git::list_all_paths(&repo)? {
-                if filters.is_force_included(&relative_path) {
-                    candidates.insert(relative_path);
+        // Nested `.indexinclude`/`.indexignore` rules — including ones living
+        // inside an otherwise gitignored subtree — only surface from a
+        // gitignore-blind deep walk. Pay for it only when a rule plausibly
+        // exists; otherwise the common no-rule repo keeps the cheap walk alone.
+        let filters = if index_rules_present(&self.project_root, &tracked) {
+            let all_paths = git::list_all_paths(&repo)?;
+            let filters = PathFilters::from_paths(&self.project_root, &all_paths)?;
+            // `.indexinclude` re-includes paths the gitignore-aware walk pruned
+            // before any filter saw them (e.g. a gitignored `docs/` tree).
+            if filters.has_includes() {
+                for relative_path in all_paths {
+                    if filters.is_force_included(&relative_path) {
+                        candidates.insert(relative_path);
+                    }
                 }
             }
-        }
+            filters
+        } else {
+            PathFilters::default()
+        };
 
         let mut files = Vec::new();
         for relative_path in candidates {
@@ -168,6 +175,43 @@ impl FileEnumerator {
     fn max_file_size_bytes(&self) -> u64 {
         self.config.indexing.max_file_size_kb.saturating_mul(1024)
     }
+}
+
+/// Cheap pre-check gating the gitignore-blind deep walk: return true when any
+/// `.indexinclude`/`.indexignore` rule plausibly exists. Catches root rules,
+/// nested rules among tracked files, and a rule at the top of a gitignored
+/// directory (e.g. `docs/.indexinclude`). A rule buried deeper inside a
+/// gitignored subtree with no shallower rule is the one gap — place such a rule
+/// at the gitignored directory's top level or at the repo root.
+fn index_rules_present(project_root: &Path, tracked: &[RelativePath]) -> bool {
+    if project_root.join(".indexinclude").is_file() || project_root.join(".indexignore").is_file() {
+        return true;
+    }
+    if tracked
+        .iter()
+        .any(|path| is_index_rule_file(&path.to_path_buf()))
+    {
+        return true;
+    }
+    let Ok(entries) = fs::read_dir(project_root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            let dir = entry.path();
+            if dir.join(".indexinclude").is_file() || dir.join(".indexignore").is_file() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_index_rule_file(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".indexinclude") | Some(".indexignore")
+    )
 }
 
 fn language_for_path(path: &Path) -> Language {
@@ -383,6 +427,63 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.starts_with("docs/")),
             "docs leaked: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn nested_indexinclude_reincludes_its_subtree() {
+        let fixture = TestFixture::new("nested_indexinclude");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), Config::default());
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let files = enumerator.enumerate(&mut ());
+        assert!(files.is_ok());
+        let files = files.ok().unwrap_or_else(|| unreachable!());
+
+        let paths: BTreeSet<_> = files
+            .iter()
+            .map(|file| file.relative_path.as_str().to_owned())
+            .collect();
+        // No root rule: `docs/.indexinclude` (`*`) alone rescues the gitignored
+        // subtree, patterns relative to its own directory.
+        assert!(paths.contains("src/lib.rs"));
+        assert!(
+            paths.contains("docs/guide.md"),
+            "missing docs/guide.md: {paths:?}"
+        );
+        assert!(
+            paths.contains("docs/sub/api.md"),
+            "missing nested doc: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn nested_indexignore_excludes_its_subtree() {
+        let fixture = TestFixture::new("nested_indexignore");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), Config::default());
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let files = enumerator.enumerate(&mut ());
+        assert!(files.is_ok());
+        let files = files.ok().unwrap_or_else(|| unreachable!());
+
+        let paths: BTreeSet<_> = files
+            .iter()
+            .map(|file| file.relative_path.as_str().to_owned())
+            .collect();
+        // `src/gen/.indexignore` (`*`) applies only to its own subtree.
+        assert!(paths.contains("src/keep.rs"));
+        assert!(
+            !paths.contains("src/gen/gen.rs"),
+            "nested ignore leaked: {paths:?}"
         );
     }
 
