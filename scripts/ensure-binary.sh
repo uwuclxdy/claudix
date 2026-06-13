@@ -164,9 +164,12 @@ fetch_file() {
     return
   fi
   if command -v curl >/dev/null 2>&1; then
-    curl --fail --location --silent --show-error --output "$dest" "$url"
+    curl --fail --location --silent --show-error \
+      --max-time 300 --connect-timeout 30 \
+      --output "$dest" "$url"
   elif command -v wget >/dev/null 2>&1; then
-    wget --quiet --output-document="$dest" "$url"
+    wget --quiet --timeout=30 --read-timeout=270 \
+      --output-document="$dest" "$url"
   else
     fail "curl or wget is required to download the binary"
   fi
