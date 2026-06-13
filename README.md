@@ -90,7 +90,11 @@ similarity_threshold = 0.30         # minimum relevance score
 [hooks]
 intercept_grep = true               # replace grep with semantic search when useful
 auto_reembed_on_edit = true         # re-embed after Write/Edit
-session_start_warmup = true         # ping embedding endpoint on startup
+auto_index_on_session_start = true  # background reindex check on session start
+surface_related_on_edit = true      # surface semantically related files after an edit
+surface_related_on_read = false     # surface related files after a ranged Read (opt-in)
+related_top_k = 5                   # max related-code hits per edit or read
+related_min_similarity = 0.65       # cosine floor for related-code hits (0.0–1.0)
 
 [paths]
 index_dir = ".claudix/index"        # relative to repo root; committed to .gitignore
@@ -165,7 +169,7 @@ Heuristics for passthrough: regex anchors/character classes, explicit file globs
 
 ### MCP Tool: `search_code`
 
-Claude invokes `claudix.search_code(query, language_filter, path_prefix)` directly. Uses hybrid retrieval: dense vector (55%), BM25 (30%), reciprocal rank fusion (15%). Returns ranked list with file location, definition kind, name, line range, and score.
+Claude invokes `claudix.search_code(query, language_filter, path_prefix, repos)` directly. Uses hybrid retrieval: dense vector (55%), BM25 (30%), reciprocal rank fusion (15%). Returns `{ groups: [ { directory, repo, hits: [...] } ], repo_errors: [...] }` — results are grouped by `(repo, directory)`, ordered by the best hit score in each group. Each hit carries file location, definition kind, name, line range, and score.
 
 ## Embedding Backends
 
