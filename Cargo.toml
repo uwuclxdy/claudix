@@ -49,13 +49,15 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # HTTP client (rustls only, no openssl)
-reqwest = { version = "0.13.3", features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13.4", features = ["json", "rustls", "stream"] }
 
 # LanceDB for storage and FTS
-lancedb = "0.27.2"
-arrow = { version = "57.3.0", features = ["prettyprint"] }
-arrow-array = "57.3.0"
-arrow-schema = "57.3.0"
+lancedb = "0.30.0"
+# arrow MUST match the major lancedb/lance re-export (0.30 -> arrow 58); a newer
+# arrow here splits the tree into two majors that don't interop at the lancedb boundary.
+arrow = { version = "58.3.0", features = ["prettyprint"] }
+arrow-array = "58.3.0"
+arrow-schema = "58.3.0"
 
 # Tree-sitter for chunking
 tree-sitter = "0.26.9"
@@ -69,11 +71,11 @@ tree-sitter-c = "0.24.2"
 tree-sitter-cpp = "0.23.4"
 
 # Git enumeration (pure Rust, no C dep)
-gix = { version = "0.83.0", default-features = false, features = ["index"] }
-gix-hash = { version = "0.25.0", features = ["sha1"] }
+gix = { version = "0.84.0", default-features = false, features = ["index"] }
+gix-hash = { version = "0.25.1", features = ["sha1"] }
 
 # File walking with gitignore support
-ignore = "0.4.25"
+ignore = "0.4.26"
 notify = "8.2.0"
 
 # Path helpers
