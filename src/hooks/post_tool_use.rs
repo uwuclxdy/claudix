@@ -37,9 +37,9 @@ pub(super) async fn handle_post_tool_use(
     let tool_name = payload.tool_name.as_deref();
 
     if tool_name == Some("Read")
-        && config
+        && !config
             .as_ref()
-            .is_some_and(|cfg| !cfg.hooks.surface_related_on_read)
+            .is_some_and(|cfg| cfg.hooks.surface_related_on_read)
     {
         return Ok(None);
     }
@@ -58,7 +58,7 @@ pub(super) async fn handle_post_tool_use(
         && !watcher_alive(project_root, cfg)
         && let Some(input) = payload.tool_input.as_ref()
     {
-        let paths = reindex_paths_from_input(input);
+        let paths = reindex_paths_from_input(project_root, input);
         let spawned = paths
             .iter()
             .filter(|p| reindex_target_is_watchable(project_root, p))
@@ -239,9 +239,19 @@ async fn read_surfacing_context(
 }
 
 /// Whether a neighbor's repo-relative file still exists on disk. Guards against
-/// surfacing stale chunks for files deleted since they were indexed.
+/// surfacing stale chunks for files deleted since they were indexed, and rejects
+/// a poisoned/legacy row whose stored path escapes the project root (an absolute
+/// path or `..` traversal) so it never yields a filesystem existence oracle
+/// outside the project or a misleading agent-visible "related code" path.
 fn neighbor_file_exists(project_root: &Path, relative_path: &str) -> bool {
-    project_root.join(relative_path).exists()
+    let relative = RelativePath::new(relative_path);
+    if relative
+        .reject_escape(prompts::hints::READ_INSIDE_PROJECT_DIR)
+        .is_err()
+    {
+        return false;
+    }
+    project_root.join(relative.as_str()).exists()
 }
 
 /// Whether a chunk's inclusive `[chunk_start, chunk_end]` line span overlaps the
@@ -383,7 +393,14 @@ fn reindex_target_is_watchable(project_root: &Path, file_path: &str) -> bool {
 ///
 /// Merges `file_path`, `notebook_path`, and the `files_modified` list (for
 /// MultiEdit-style payloads). Duplicates are dropped; order is preserved.
-fn reindex_paths_from_input(input: &ToolInput) -> Vec<String> {
+///
+/// Dedup keys on a canonical project-relative spelling (separators normalized,
+/// absolute paths stripped to the project root), so the same file arriving as
+/// both an absolute and a project-relative path spawns exactly one reindex
+/// instead of racing two `drop_table`→`add` writers on the chunks table. The
+/// original spelling is preserved in the output — the canonical form is only the
+/// dedup key — so the downstream watchable check still sees what Claude sent.
+fn reindex_paths_from_input(project_root: &Path, input: &ToolInput) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut paths = Vec::new();
 
@@ -401,11 +418,33 @@ fn reindex_paths_from_input(input: &ToolInput) -> Vec<String> {
         .map(String::as_str);
 
     for p in singles.chain(multi) {
-        if seen.insert(p.to_owned()) {
+        if seen.insert(canonical_dedup_key(project_root, p)) {
             paths.push(p.to_owned());
         }
     }
     paths
+}
+
+/// Canonical project-relative dedup key for a tool-input path. Strips an
+/// absolute path to the project root (canonicalizing both sides so a symlinked
+/// prefix still matches) and normalizes separators via [`RelativePath`]. A path
+/// outside the project (or one that fails to strip) keys on its own normalized
+/// spelling — it is never reindexed anyway, so a unique key is harmless.
+fn canonical_dedup_key(project_root: &Path, file_path: &str) -> String {
+    let raw = Path::new(file_path);
+    let relative = if raw.is_absolute() {
+        let raw_canonical = raw.canonicalize();
+        let raw_absolute = raw_canonical.as_deref().unwrap_or(raw);
+        let root_canonical = project_root.canonicalize();
+        let root_absolute = root_canonical.as_deref().unwrap_or(project_root);
+        raw_absolute
+            .strip_prefix(root_absolute)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|_| raw.to_path_buf())
+    } else {
+        raw.to_path_buf()
+    };
+    RelativePath::from_path(&relative).as_str().to_owned()
 }
 
 #[cfg(test)]
@@ -466,14 +505,17 @@ mod tests {
     #[test]
     fn reindex_paths_only_file_path() {
         let input = make_tool_input(Some("src/lib.rs"), None);
-        assert_eq!(reindex_paths_from_input(&input), vec!["src/lib.rs"]);
+        assert_eq!(
+            reindex_paths_from_input(Path::new("/proj"), &input),
+            vec!["src/lib.rs"]
+        );
     }
 
     #[test]
     fn reindex_paths_only_files_modified() {
         let input = make_tool_input(None, Some(vec!["src/lib.rs", "src/main.rs"]));
         assert_eq!(
-            reindex_paths_from_input(&input),
+            reindex_paths_from_input(Path::new("/proj"), &input),
             vec!["src/lib.rs", "src/main.rs"]
         );
     }
@@ -482,14 +524,30 @@ mod tests {
     fn reindex_paths_both_deduped() {
         // file_path appears in files_modified too — must appear exactly once.
         let input = make_tool_input(Some("src/lib.rs"), Some(vec!["src/lib.rs", "src/main.rs"]));
-        let paths = reindex_paths_from_input(&input);
+        let paths = reindex_paths_from_input(Path::new("/proj"), &input);
         assert_eq!(paths, vec!["src/lib.rs", "src/main.rs"]);
     }
 
     #[test]
     fn reindex_paths_neither_field_is_empty() {
         let input = make_tool_input(None, None);
-        assert!(reindex_paths_from_input(&input).is_empty());
+        assert!(reindex_paths_from_input(Path::new("/proj"), &input).is_empty());
+    }
+
+    #[test]
+    fn reindex_paths_abs_and_relative_spelling_dedup_to_one() {
+        // The same file arriving as an absolute path in file_path and a
+        // project-relative path in files_modified must spawn exactly once.
+        let fixture = TestFixture::new("small_rust").unwrap_or_else(|_| unreachable!());
+        let abs = fixture.root().join("src/math.rs");
+        let abs = abs.to_string_lossy().into_owned();
+        let input = make_tool_input(Some(&abs), Some(vec!["src/math.rs"]));
+        let paths = reindex_paths_from_input(fixture.root(), &input);
+        assert_eq!(
+            paths.len(),
+            1,
+            "abs + project-relative spelling of one file must dedup, got: {paths:?}"
+        );
     }
 
     #[tokio::test]
