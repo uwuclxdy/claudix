@@ -164,6 +164,39 @@ impl Store {
             .transpose()
     }
 
+    /// Returns `true` when the on-disk chunks table actually holds the row
+    /// count the manifest claims, or when the manifest claims zero rows.
+    ///
+    /// A process crash between `drop_table` and `add` in `persist_rows` leaves
+    /// the table missing/empty while the manifest still records the previous
+    /// run's full `file_hashes` + `chunk_count`.  The manifest-first fast path
+    /// in `index_full` must check this before early-exiting, or a corrupted
+    /// store permanently blinds search until a manual `force` / `clear`.
+    ///
+    /// The check is cheap: a single `count_rows` call with no vector
+    /// deserialization.  It runs once at the start of every `index_full`
+    /// call and gates both fast-path early-exits.
+    pub async fn table_matches_manifest_chunk_count(&self) -> Result<bool> {
+        let manifest_count = match self.read_manifest()? {
+            Some(m) => m.chunk_count,
+            // No manifest means no fast path anyway — return true to let the
+            // caller's existing manifest guard handle it.
+            None => return Ok(true),
+        };
+
+        // If the manifest claims zero chunks a missing/empty table is correct.
+        if manifest_count == 0 {
+            return Ok(true);
+        }
+
+        let Some(table) = self.open_chunks_table().await? else {
+            // Table missing but manifest says we have rows — corrupted.
+            return Ok(false);
+        };
+        let actual = table.count_rows(None).await.map_err(ClaudixError::from)?;
+        Ok(actual > 0)
+    }
+
     pub async fn read_chunks(&self) -> Result<Vec<StoredChunk>> {
         let Some(table) = self.open_chunks_table().await? else {
             return Ok(Vec::new());
@@ -517,6 +550,22 @@ impl Store {
         self.write_manifest(&manifest)
     }
 
+    /// Drop the chunks table without touching the manifest.
+    ///
+    /// Used by tests to simulate the mid-rewrite crash that leaves the table
+    /// gone while `manifest.json` still records the previous `file_hashes` and
+    /// `chunk_count`.  The LanceDB API path ensures commit-handler state is
+    /// cleaned up consistently (unlike `remove_dir_all` from outside the API),
+    /// so subsequent `open_connection` calls start from a clean slate.
+    #[cfg(test)]
+    pub(crate) async fn drop_chunks_table_for_test(&self) -> Result<()> {
+        let connection = self.open_connection().await?;
+        if self.chunks_table_exists(&connection).await? {
+            connection.drop_table(CHUNKS_TABLE_NAME, &[]).await?;
+        }
+        Ok(())
+    }
+
     pub async fn clear_chunks(&self, config: &Config) -> Result<()> {
         self.stop_index_lock_holder();
         self.ensure_layout()?;
@@ -638,6 +687,22 @@ impl Store {
         };
 
         if manifest.file_hashes.is_empty() {
+            return Ok(file_hashes_from_metadata(metadata));
+        }
+
+        // Guard: if the manifest claims chunk rows exist but the metadata read
+        // from the actual table is empty, the table was truncated or deleted
+        // mid-rewrite (crash between `drop_table` and `add` in `persist_rows`).
+        // Trusting the manifest hashes here would mark every file "Verified"
+        // and produce zero changed_paths, so the rebuild loop never re-embeds
+        // anything.  Fall back to deriving hashes from the actual rows (empty
+        // map) so all current files appear as changed and get re-indexed.
+        //
+        // An empty table is legitimate when the manifest's chunk_count is also
+        // zero (no-chunk files tracked via `note_file_hash`, or an index that
+        // only ever saw unindexable content) — in that case we trust the
+        // manifest hashes so those files stay "Verified" without re-embedding.
+        if metadata.is_empty() && manifest.chunk_count > 0 {
             return Ok(file_hashes_from_metadata(metadata));
         }
 

@@ -136,11 +136,21 @@ impl Claudix {
             .force_included_without_chunks(&force_included)
             .await?;
 
+        // Check once whether the on-disk chunks table actually holds the rows
+        // the manifest claims.  A crash between `drop_table` and `add` in
+        // `persist_rows` leaves the table missing/empty while the manifest
+        // still records the previous run's full file_hashes + chunk_count.
+        // Both fast paths below guard on this result so that neither can
+        // early-exit when the table is corrupt, permanently blinding search
+        // until a manual `force` / `clear`.
+        let table_matches = self.store.table_matches_manifest_chunk_count().await?;
+
         // Fast path: if the manifest already lists exactly these files with the
         // same hashes under the same embedding model — and no force-included
         // file is stuck at zero chunks — skip the LanceDB row read entirely.
         // touch_manifest_if_in_sync handles the timestamp bump.
         if force_recheck.is_empty()
+            && table_matches
             && self
                 .store
                 .manifest_hashes_match(&current_files, self.config.as_ref())?
@@ -159,7 +169,8 @@ impl Claudix {
             .incremental_file_state(&current_files, &force_recheck, &mut *progress)
             .await?;
 
-        if changed_paths.is_empty()
+        if table_matches
+            && changed_paths.is_empty()
             && let Some(stats) = self
                 .store
                 .touch_manifest_if_in_sync(&current_files, self.config.as_ref())?
@@ -1598,6 +1609,60 @@ mod tests {
         assert!(
             !claudix.store.change_neighbors_marker_path().exists(),
             "no marker must be written when surface_related_on_edit = false"
+        );
+        Ok(())
+    }
+
+    /// Regression test for the manifest-vs-table corruption scenario: if the
+    /// process crashes between `drop_table` and `add` in `persist_rows`, the
+    /// chunks table is left missing/empty while `manifest.json` still records
+    /// the previous run's full `file_hashes` + `chunk_count`.  The
+    /// manifest-first fast path must detect this and fall through to a real
+    /// rebuild, not early-exit with an empty search index.
+    #[tokio::test]
+    async fn index_full_rebuilds_after_chunks_table_corruption() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config.clone())?;
+
+        // First index: populates the chunks table and manifest normally.
+        let first = claudix.index_full(&mut ()).await?;
+        assert!(
+            first.chunk_count > 0,
+            "fixture must produce at least one chunk"
+        );
+
+        // Simulate the mid-rewrite crash: use the LanceDB API to drop the
+        // chunks table while leaving manifest.json intact.  This mirrors the
+        // state after `drop_table` completes but before `add` in `persist_rows`
+        // — the exact window where a kill/crash leaves the store corrupted.
+        // Using the API (vs. remove_dir_all) keeps commit-handler state clean
+        // so subsequent connections open without internal inconsistency.
+        claudix.store.drop_chunks_table_for_test().await?;
+
+        // The row-count gate must detect the corruption (table gone, manifest
+        // still claims chunk_count > 0) and return false so the fast path is
+        // bypassed on the next index_full call.
+        let matches = claudix.store.table_matches_manifest_chunk_count().await?;
+        assert!(
+            !matches,
+            "table_matches_manifest_chunk_count must return false when table is dropped"
+        );
+
+        // index_full must detect the mismatch and fall through to a real
+        // rebuild, not early-exit with an empty search index.
+        let second = claudix.index_full(&mut ()).await?;
+        assert_eq!(
+            second.chunk_count, first.chunk_count,
+            "index_full must rebuild to the original chunk count after corruption"
+        );
+
+        // Verify the rows are actually present — not just counted from the manifest.
+        let rows = claudix.store.read_chunks().await?;
+        assert_eq!(
+            rows.len(),
+            second.chunk_count,
+            "stored chunk rows must match the reported chunk_count after rebuild"
         );
         Ok(())
     }
