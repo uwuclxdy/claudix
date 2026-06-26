@@ -94,15 +94,14 @@ pub(super) fn check_index_ready(
 
 /// Build the indexing-failed notice with a pointer to `index.log` and, when
 /// cheap to read, the last error line the failed run left behind. The log path
-/// is shown in the config-relative form (matching the SessionStart hint); the
-/// last error is read from the resolved absolute path.
+/// is shown as the project-root-joined absolute path so the user can open it
+/// from any working directory; the last error is read from that same path.
 fn build_failed_response(project_root: &Path, config: &Config, event_name: &str) -> Value {
-    let display = config.paths.log_dir.join("index.log");
     let absolute = project_root.join(&config.paths.log_dir).join("index.log");
     let last_error = last_index_error(&absolute);
     indexing_failed_response(
         event_name,
-        &display.to_string_lossy(),
+        &absolute.to_string_lossy(),
         last_error.as_deref(),
     )
 }
@@ -285,6 +284,39 @@ mod tests {
         assert!(
             !store.pending_index_marker_path().exists(),
             "marker must be cleaned up after surfacing failure"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_failed_response_uses_absolute_log_path() -> crate::error::Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        let stale_created_at = "2025-01-01T00:00:00Z";
+        let payload = format!("none\n{stale_created_at}\n");
+        fs::write(store.pending_index_marker_path(), payload)?;
+
+        let response = check_index_ready(fixture.root(), &config, "PostToolUse");
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+
+        // The notice must include the project-root-joined absolute path so the
+        // user can open it from any working directory, not just the project root.
+        let expected = fixture
+            .root()
+            .join(&config.paths.log_dir)
+            .join("index.log")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            context.contains(&expected),
+            "failure notice must contain the absolute log path ({expected}), got: {context}"
         );
         Ok(())
     }
