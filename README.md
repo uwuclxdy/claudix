@@ -2,9 +2,9 @@
 
 ![claudix banner](media/claudix.png)
 
-![GitHub Actions Workflow Status](https://img.shields.io/github/actions/workflow/status/uwuclxdy/claudix/.github%2Fworkflows%2Frelease.yml?style=for-the-badge&cacheSeconds=60)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/uwuclxdy/claudix/total?style=for-the-badge&color=%2343ABE5&cacheSeconds=60)
-![Claude Code](https://img.shields.io/badge/Claude%20Code-D97757?style=for-the-badge)
+![GitHub Actions Workflow Status](https://shields.uwuclxdy.dev/github/actions/workflow/status/uwuclxdy/claudix/.github%2Fworkflows%2Frelease.yml?style=for-the-badge&cacheSeconds=60)
+![GitHub Downloads (all assets, all releases)](https://shields.uwuclxdy.dev/github/downloads/uwuclxdy/claudix/total?style=for-the-badge&color=%2343ABE5&cacheSeconds=60)
+![Claude Code](https://shields.uwuclxdy.dev/badge/Claude%20Code-D97757?style=for-the-badge)
 
 # Claude Index: claudix
 
