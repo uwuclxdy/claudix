@@ -258,6 +258,15 @@ impl Claudix {
 
         let (skip_stats, preread_bytes) = self.skip_unchanged_target(&relative_path).await?;
         if let Some(stats) = skip_stats {
+            // Prune chunks for files deleted out-of-band between no-op watch events;
+            // a metadata scan per event is acceptable until watcher throughput matters.
+            let stats = match self.store.prune_missing_files(self.config.as_ref()).await {
+                Ok(Some(pruned)) => IndexStats {
+                    file_count: pruned.file_count,
+                    chunk_count: pruned.chunk_count,
+                },
+                _ => stats,
+            };
             return Ok(stats);
         }
 
@@ -280,6 +289,12 @@ impl Claudix {
                 .store
                 .delete_file_chunks(&relative_path, self.config.as_ref())
                 .await?;
+            // Prune other files deleted out-of-band alongside this explicit delete;
+            // a metadata scan per watch event is acceptable until watcher throughput matters.
+            let stats = match self.store.prune_missing_files(self.config.as_ref()).await {
+                Ok(Some(pruned)) => pruned,
+                _ => stats,
+            };
             return Ok(IndexStats {
                 file_count: stats.file_count,
                 chunk_count: stats.chunk_count,
@@ -1361,6 +1376,33 @@ mod tests {
             rows.iter().any(|row| row.file_path == "src/lib.rs"),
             "the reindexed file's chunks must remain"
         );
+    }
+
+    #[tokio::test]
+    async fn reindex_file_unchanged_prunes_out_of_band_deleted_chunks() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
+
+        claudix.index_full(&mut ()).await?;
+
+        // Delete math.rs out-of-band without touching lib.rs so the next
+        // reindex_file call hits the hash-unchanged skip rather than the normal
+        // replace path. The skip path must still prune the deleted file.
+        fs::remove_file(fixture.root().join("src/math.rs")).await?;
+
+        claudix.reindex_file(Path::new("src/lib.rs")).await?;
+
+        let rows = claudix.store.read_chunks().await?;
+        assert!(
+            rows.iter().all(|row| row.file_path != "src/math.rs"),
+            "the hash-unchanged skip must prune chunks for a file deleted out-of-band"
+        );
+        assert!(
+            rows.iter().any(|row| row.file_path == "src/lib.rs"),
+            "the unchanged reindexed file's chunks must remain"
+        );
+        Ok(())
     }
 
     #[tokio::test]
