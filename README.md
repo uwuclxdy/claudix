@@ -213,6 +213,28 @@ model = "nomic-embed-text"
 
 All three backends return 384-dimensional vectors (for bge-small); other models may differ. Dimension mismatch triggers reindex.
 
+### Choosing a Model
+
+The bundled `bge-small-en-v1.5` is a small general-purpose English text model. It is a fine zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases.
+
+The `http` provider speaks the OpenAI `/v1/embeddings` format and sends no authorization header, so it connects to keyless servers: LM Studio, Ollama, a local vLLM instance, or a local proxy such as LiteLLM. Hosted APIs that require a key (Voyage, OpenAI, Gemini) are reachable only by fronting them with a local proxy that injects the key. Set `dimensions` to the model's output size, or to a smaller Matryoshka size it supports; changing the dimension triggers a full reindex.
+
+| Pick | Model | Dimensions | Context | Access | Why |
+|------|-------|-----------|---------|--------|-----|
+| Best accuracy | `voyage-code-3` | 256 / 512 / 1024 / 2048 | 32K | Voyage API, $0.18 / 1M tokens (200M free) | Code-specialized. Beats OpenAI `text-embedding-3-large` by ~14% across 32 code-retrieval datasets, with int8/binary quantization for cheap storage. Needs a local proxy for the API key. |
+| Best self-hosted | `Qwen3-Embedding` (0.6B / 4B / 8B) | 1024 / 2560 / 4096 | 32K | Apache-2.0, open weights | Runs keyless via Ollama, LM Studio, or vLLM. 0.6B is CPU-viable; 8B sits near the top of MTEB and code retrieval on a GPU. Matryoshka dimensions. |
+| Best lightweight code model | `jina-code-embeddings` (0.5B / 1.5B) | 896 / 1536 | 32K | Open weights | Code-specialized, built on Qwen2.5-Coder. SOTA code retrieval for its size, cheap to self-host. Matryoshka dimensions. |
+
+For a self-hosted default, Qwen3-Embedding 0.6B via Ollama is the easiest upgrade over the bundled model:
+
+```toml
+[embedding]
+provider = "http"
+endpoint = "http://localhost:11434"   # Ollama
+model = "qwen3-embedding"             # use the id your server reports
+dimensions = 1024
+```
+
 ## Building from Source
 
 Requires **Rust 1.91+** and **Cargo**.
