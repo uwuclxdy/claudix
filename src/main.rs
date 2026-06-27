@@ -369,10 +369,15 @@ fn active_project_root() -> Result<std::path::PathBuf> {
 /// Outer fail-open budget for a whole hook handler. Generous over PreToolUse's
 /// internal 1.5 s search budget so legitimate background-spawn paths finish, but
 /// finite so a stalled store/embed/lock can't hang the host on the hook.
+///
+/// The in-process panic guard lives here: `tokio::spawn` turns a panic in the
+/// async hook body into a `JoinError` (the `Ok(Err(_))` arm below), and the sync
+/// `read_stdin_payload` is wrapped in `catch_unwind`. Both need `panic =
+/// "unwind"`; see the release-profile note in Cargo.toml.
 const HOOK_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
 async fn run_hook_command(project_root: &std::path::Path, event: hooks::HookEvent) {
-    let payload = read_stdin_payload();
+    let payload = panic::catch_unwind(read_stdin_payload).unwrap_or_default();
     // Canonicalize so `path.strip_prefix(project_root)` lines up with the
     // canonical paths the watcher and `Store::new` use internally. A raw
     // `CLAUDE_PROJECT_DIR` with symlinks or trailing separators would otherwise

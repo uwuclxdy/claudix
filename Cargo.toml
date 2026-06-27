@@ -114,7 +114,9 @@ opt-level = 3
 # fraction of the link cost.
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# panic = "unwind" (the default) is mandatory: catch_unwind and tokio's
+# JoinError panic capture are both no-ops under panic = "abort", and hooks must
+# fail open in-process. Costs some binary size for unwind tables; worth it.
 
 # Opt-level for the crate under test: 1 avoids most debug-mode overhead while
 # keeping incremental rebuilds fast. Heavy numerical deps get opt-level 3 (ONNX,
