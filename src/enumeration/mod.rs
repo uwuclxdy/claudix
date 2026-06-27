@@ -41,7 +41,7 @@ impl FileEnumerator {
 
     pub fn enumerate(&self, progress: &mut dyn IndexProgress) -> Result<Vec<EnumeratedFile>> {
         let repo = git::discover_repository(&self.project_root)?;
-        let tracked = git::list_candidate_paths(&repo)?;
+        let tracked = git::list_candidate_paths(&repo, self.config.indexing.respect_gitignore)?;
         let mut candidates: BTreeSet<RelativePath> = tracked.iter().cloned().collect();
 
         // Nested `.indexinclude`/`.indexignore` rules — including ones living
@@ -427,6 +427,41 @@ mod tests {
         assert!(
             !paths.iter().any(|p| p.starts_with("docs/")),
             "docs leaked: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn respect_gitignore_false_includes_gitignored_files() {
+        let fixture = TestFixture::new("gitignored_docs");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        // Drop the re-include rule so the docs tree reaches candidates via the
+        // candidate walk itself, not the `.indexinclude` force-include path.
+        assert!(fs::remove_file(fixture.root().join(".indexinclude")).is_ok());
+
+        let mut config = Config::default();
+        config.indexing.respect_gitignore = false;
+
+        let enumerator = FileEnumerator::new(fixture.root().to_path_buf(), config);
+        assert!(enumerator.is_ok());
+        let enumerator = enumerator.ok().unwrap_or_else(|| unreachable!());
+
+        let files = enumerator.enumerate(&mut ());
+        assert!(files.is_ok());
+        let files = files.ok().unwrap_or_else(|| unreachable!());
+
+        let paths: BTreeSet<_> = files
+            .iter()
+            .map(|file| file.relative_path.as_str().to_owned())
+            .collect();
+        assert!(paths.contains("src/lib.rs"));
+        assert!(
+            paths.contains("docs/guide.md"),
+            "docs/guide.md missing with respect_gitignore=false: {paths:?}"
+        );
+        assert!(
+            paths.contains("docs/sub/api.md"),
+            "docs/sub/api.md missing with respect_gitignore=false: {paths:?}"
         );
     }
 

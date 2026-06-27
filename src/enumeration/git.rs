@@ -12,7 +12,10 @@ pub fn discover_repository(project_root: &Path) -> Result<Repository> {
     gix::discover(project_root).map_err(|error| ClaudixError::Git(error.to_string()))
 }
 
-pub fn list_candidate_paths(repo: &Repository) -> Result<Vec<RelativePath>> {
+pub fn list_candidate_paths(
+    repo: &Repository,
+    respect_gitignore: bool,
+) -> Result<Vec<RelativePath>> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| ClaudixError::Git("bare repositories are not supported".into()))?;
@@ -25,7 +28,7 @@ pub fn list_candidate_paths(repo: &Repository) -> Result<Vec<RelativePath>> {
         paths.insert(RelativePath::new(path.to_string()));
     }
 
-    for relative_path in list_untracked_paths(workdir)? {
+    for relative_path in list_untracked_paths(workdir, respect_gitignore)? {
         paths.insert(relative_path);
     }
 
@@ -80,14 +83,14 @@ pub fn list_all_paths(repo: &Repository) -> Result<Vec<RelativePath>> {
     Ok(paths)
 }
 
-fn list_untracked_paths(workdir: &Path) -> Result<Vec<RelativePath>> {
+fn list_untracked_paths(workdir: &Path, respect_gitignore: bool) -> Result<Vec<RelativePath>> {
     let mut paths = Vec::new();
     let mut builder = WalkBuilder::new(workdir);
     builder.hidden(false);
-    builder.git_ignore(true);
-    builder.git_exclude(true);
-    builder.git_global(true);
-    builder.parents(true);
+    builder.git_ignore(respect_gitignore);
+    builder.git_exclude(respect_gitignore);
+    builder.git_global(respect_gitignore);
+    builder.parents(respect_gitignore);
 
     for entry in builder.build() {
         let entry = entry?;
