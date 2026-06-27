@@ -96,8 +96,7 @@ ndarray = "0.17.2"
 # Tempfile for tests
 tempfile = "3.27.0"
 
-# MCP server (hand-rolled JSON-RPC fallback if rmcp API is unstable)
-# We start with hand-rolled JSON-RPC since rmcp is very new
+# MCP server: hand-rolled JSON-RPC (rmcp skipped; too new/unstable when built)
 async-trait = "0.1.89"
 
 [dev-dependencies]
