@@ -51,6 +51,10 @@ pub struct SearchResults {
     pub repo_errors: Vec<RepoError>,
 }
 
+/// Warn when a full search (embed + rank + staleness) exceeds this. Fires at the
+/// default `warn` level so a slow index read or oversized corpus surfaces.
+const QUERY_BUDGET_WARN_MS: u64 = 200;
+
 #[derive(Clone)]
 pub struct Searcher {
     project_root: PathBuf,
@@ -75,6 +79,7 @@ impl Searcher {
     }
 
     pub async fn search(&self, query: SearchQuery) -> Result<SearchResults> {
+        let search_start = std::time::Instant::now();
         let limit = effective_top_k(query.top_k, self.config.top_k);
         if limit == 0 || query.query.trim().is_empty() {
             return Ok(SearchResults {
@@ -86,6 +91,16 @@ impl Searcher {
         let mut found = self.search_all(query).await?;
         found.results = deduplicate_by_file_path(found.results);
         found.results.truncate(limit);
+
+        let elapsed = search_start.elapsed();
+        if elapsed.as_millis() as u64 > QUERY_BUDGET_WARN_MS {
+            tracing::warn!(
+                elapsed_ms = elapsed.as_millis(),
+                budget_ms = QUERY_BUDGET_WARN_MS,
+                "search exceeded budget"
+            );
+        }
+
         Ok(found)
     }
 

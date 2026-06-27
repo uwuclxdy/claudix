@@ -99,6 +99,17 @@ async fn main() {
         eprintln!("claudix panic: {panic_info}");
     }));
 
+    // Stderr only: stdout is the MCP JSON-RPC channel. Default `warn` so budget
+    // overruns surface without `RUST_LOG`; `try_init` stays quiet if a host
+    // already installed a subscriber.
+    let _ = tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .try_init();
+
     if let Err(err) = run().await {
         if let Some(hint) = err
             .downcast_ref::<ClaudixError>()
@@ -376,7 +387,16 @@ fn active_project_root() -> Result<std::path::PathBuf> {
 /// "unwind"`; see the release-profile note in Cargo.toml.
 const HOOK_COMMAND_TIMEOUT_MS: u64 = 5_000;
 
+/// Warn threshold for the whole hook handler. Fast paths finish well under it;
+/// the PreToolUse intercept legitimately runs up to its 1.5 s search budget, so
+/// this catches real stalls (NFS hang, lock contention) before the hard timeout.
+const HOOK_BUDGET_WARN_MS: u64 = 3_000;
+
+// The warn must fire before the hard timeout, else it can never surface.
+const _: () = assert!(HOOK_BUDGET_WARN_MS < HOOK_COMMAND_TIMEOUT_MS);
+
 async fn run_hook_command(project_root: &std::path::Path, event: hooks::HookEvent) {
+    let hook_start = std::time::Instant::now();
     let payload = panic::catch_unwind(read_stdin_payload).unwrap_or_default();
     // Canonicalize so `path.strip_prefix(project_root)` lines up with the
     // canonical paths the watcher and `Store::new` use internally. A raw
@@ -415,6 +435,16 @@ async fn run_hook_command(project_root: &std::path::Path, event: hooks::HookEven
         Err(_) => {
             eprintln!("claudix hook timed out and failed open");
         }
+    }
+
+    let elapsed = hook_start.elapsed();
+    if elapsed.as_millis() as u64 > HOOK_BUDGET_WARN_MS {
+        tracing::warn!(
+            event = ?event,
+            elapsed_ms = elapsed.as_millis(),
+            budget_ms = HOOK_BUDGET_WARN_MS,
+            "hook handler exceeded budget"
+        );
     }
 }
 
