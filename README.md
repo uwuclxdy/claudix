@@ -75,7 +75,7 @@ batch_size = 32
 timeout_ms = 30000
 
 [indexing]
-respect_gitignore = true
+respect_gitignore = true            # set false to also index gitignored files
 follow_symlinks = false
 max_file_size_kb = 512              # skip files larger than this
 chunk_overlap_lines = 5             # lines overlapped between chunks
