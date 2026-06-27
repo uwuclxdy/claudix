@@ -337,6 +337,46 @@ mod tests {
         FileHash(xxhash_rust::xxh3::xxh3_128(content.as_bytes()).to_be_bytes())
     }
 
+    #[test]
+    fn chunk_overlap_lines_only_affects_the_fallback_chunker() {
+        // Tree-sitter languages chunk semantically and ignore the overlap param;
+        // only the sliding-window fallback (Java, C, C++, force-indexed unknown)
+        // honors it. Guards the README's "fallback chunks only" wording.
+        let no_overlap = MultiLanguageChunker::with_fallback_params(10, 0);
+        let with_overlap = MultiLanguageChunker::with_fallback_params(10, 4);
+
+        let rs = "fn a() {}\nfn b() {}\nfn c() {}\n";
+        let rs_no = no_overlap
+            .chunk(&RelativePath::new("t.rs"), Language::Rust, hash_for(rs), rs)
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        let rs_ov = with_overlap
+            .chunk(&RelativePath::new("t.rs"), Language::Rust, hash_for(rs), rs)
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            rs_no.len(),
+            rs_ov.len(),
+            "tree-sitter chunk count must not change with overlap"
+        );
+
+        let c = "int f() {}\n".repeat(30);
+        let c_no = no_overlap
+            .chunk(&RelativePath::new("t.c"), Language::C, hash_for(&c), &c)
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        let c_ov = with_overlap
+            .chunk(&RelativePath::new("t.c"), Language::C, hash_for(&c), &c)
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        assert!(
+            c_ov.len() > c_no.len(),
+            "fallback overlap must add chunks: no={}, ov={}",
+            c_no.len(),
+            c_ov.len()
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Rust
     // -----------------------------------------------------------------------
