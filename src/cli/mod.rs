@@ -1186,6 +1186,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_index_clears_dimension_mismatch_and_reindexes() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+        let claude_dir = fixture.root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        let config_text = toml::to_string(&config);
+        assert!(config_text.is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                config_text.ok().unwrap_or_default(),
+            )
+            .is_ok()
+        );
+
+        let store = Store::new(fixture.root(), &config);
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+        // Same model, wrong dimensions: only the dimension check fires.
+        let stale_manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions * 2);
+        assert!(store.write_manifest(&stale_manifest).is_ok());
+
+        let output = run_index(fixture.root(), false).await;
+        assert!(
+            output.is_ok(),
+            "run_index must auto-clear and reindex on dimension mismatch: {:?}",
+            output.err()
+        );
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+        assert!(output.chunk_count > 0);
+
+        let manifest = store.read_manifest();
+        assert!(manifest.is_ok());
+        let manifest = manifest.ok().unwrap_or_else(|| unreachable!());
+        let manifest = manifest.unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            manifest.dimensions, config.embedding.dimensions,
+            "dimensions must match config after the clean reindex"
+        );
+    }
+
+    #[tokio::test]
     async fn run_status_reports_manifest_and_counts() {
         let harness = cli_harness().await;
         assert!(harness.is_ok());
