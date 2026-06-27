@@ -1207,7 +1207,8 @@ mod tests {
         assert!(store.is_ok());
         let store = store.ok().unwrap_or_else(|| unreachable!());
         // Same model, wrong dimensions: only the dimension check fires.
-        let stale_manifest = Manifest::new(&config.embedding.model, config.embedding.dimensions * 2);
+        let stale_manifest =
+            Manifest::new(&config.embedding.model, config.embedding.dimensions * 2);
         assert!(store.write_manifest(&stale_manifest).is_ok());
 
         let output = run_index(fixture.root(), false).await;

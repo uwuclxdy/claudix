@@ -65,7 +65,10 @@ mod tests {
     async fn tokio_spawn_surfaces_hook_panic_as_join_error() {
         let handle = tokio::spawn(async { panic!("synthetic hook panic") });
         let result = handle.await;
-        assert!(result.is_err(), "panicking spawn must return Err(JoinError)");
+        assert!(
+            result.is_err(),
+            "panicking spawn must return Err(JoinError)"
+        );
         let is_panic = result.err().map(|error| error.is_panic()).unwrap_or(false);
         assert!(is_panic, "JoinError must report is_panic() = true");
     }
