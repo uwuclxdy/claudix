@@ -91,6 +91,9 @@ pub enum ClaudixError {
     #[error("store error: {0}")]
     Store(String),
 
+    #[error("mcp server error: {0}")]
+    Mcp(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
@@ -141,6 +144,9 @@ impl ClaudixError {
             Self::TreeSitter(_) => Some(hints::TREE_SITTER_REINDEX),
             // JSON serialization errors are not user-actionable; no hint.
             Self::Serialization(_) => None,
+            // A failed MCP serve/transport is environmental (stdio closed, init
+            // refused), not fixable via a recovery hint.
+            Self::Mcp(_) => None,
         }
     }
 

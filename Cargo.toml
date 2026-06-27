@@ -96,8 +96,16 @@ ndarray = "0.17.2"
 # Tempfile for tests
 tempfile = "3.27.0"
 
-# MCP server: hand-rolled JSON-RPC (rmcp skipped; too new/unstable when built)
+# Async trait support for embedding provider traits
 async-trait = "0.1.89"
+
+# MCP server. schemars (must stay 1.x to match rmcp) derives the tool-arg schemas
+# the #[tool] macro requires. The `local` feature drops the `Send` bound on tool
+# handlers — the lancedb/moka search pipeline holds `!Send` state across awaits,
+# so the service is driven single-threaded inside a `LocalSet` (fine for one
+# stdio client); handlers still use the multi-thread runtime for spawn_blocking.
+rmcp = { version = "1.8.0", features = ["server", "macros", "transport-io", "schemars", "local"] }
+schemars = "1"
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

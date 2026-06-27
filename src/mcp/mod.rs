@@ -1,18 +1,30 @@
-use std::path::Path;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{
+    CallToolResult, Content, Implementation, JsonObject, ListToolsResult, PaginatedRequestParams,
+    ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::transport::io::stdio;
+use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
 
 use crate::cli;
-use crate::error::{ClaudixError, RecoveryHint, Result};
+use crate::error::{ClaudixError, RecoveryHint};
 use crate::prompts::hints;
 
-const JSONRPC_VERSION: &str = "2.0";
-const PROTOCOL_VERSION: &str = "2024-11-05";
+/// What every `#[tool]` handler returns. The `Ok` always carries a
+/// `CallToolResult`; a failed tool run is an `Ok(CallToolResult::error(..))`, not
+/// an `Err`, so the message reaches the caller instead of being rendered opaque.
+type ToolOutcome = std::result::Result<CallToolResult, ErrorData>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct SearchCodeRequest {
     pub query: String,
     #[serde(default)]
@@ -25,19 +37,19 @@ pub struct SearchCodeRequest {
     pub repos: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema, Default)]
 struct ReindexRequest {
     #[serde(default)]
     force: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema, Default)]
 struct OverviewRequest {
     #[serde(default)]
     path_prefix: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema, Default)]
 struct FindDuplicatesRequest {
     #[serde(default)]
     min_similarity: Option<f32>,
@@ -47,346 +59,222 @@ struct FindDuplicatesRequest {
     repos: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 struct ReindexFileRequest {
     path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct JsonRpcRequest {
-    jsonrpc: String,
-    #[serde(default)]
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Value,
+/// The claudix MCP server. Holds the active project root and the generated tool
+/// router; each `#[tool]` handler validates then delegates to the same
+/// `cli::run_*` function the CLI uses.
+#[derive(Clone)]
+pub struct ClaudixServer {
+    project_root: PathBuf,
+    tool_router: ToolRouter<Self>,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-struct CallToolRequest {
-    name: String,
-    #[serde(default)]
-    arguments: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct TextContent {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    text: String,
-}
-
-pub async fn run(project_root: impl AsRef<Path>) -> Result<()> {
-    let project_root = project_root.as_ref().to_path_buf();
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut lines = BufReader::new(stdin).lines();
-    let mut writer = stdout;
-
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        if let Some(response) = handle_line(&project_root, &line).await? {
-            write_message(&mut writer, &response).await?;
+#[tool_router]
+impl ClaudixServer {
+    fn new(project_root: PathBuf) -> Self {
+        Self {
+            project_root,
+            tool_router: Self::tool_router(),
         }
     }
 
-    Ok(())
-}
-
-async fn handle_line(project_root: &Path, line: &str) -> Result<Option<Value>> {
-    let request: JsonRpcRequest = match serde_json::from_str(line) {
-        Ok(request) => request,
-        Err(error) => {
-            return Ok(Some(error_response(
-                None,
-                -32700,
-                format!("parse error: {error}"),
-                None,
-            )));
+    /// Semantic code search over the active project plus optional cross-repos.
+    #[tool(name = "search_code")]
+    async fn search_code(&self, Parameters(request): Parameters<SearchCodeRequest>) -> ToolOutcome {
+        if request.query.trim().is_empty() {
+            return Ok(error_result(ClaudixError::ConfigInvalid {
+                message: "query cannot be empty".to_owned(),
+                recovery: RecoveryHint(hints::QUERY_NON_EMPTY),
+            }));
         }
-    };
-
-    // Notifications have no id and must receive no response.
-    if request.id.is_none() {
-        return Ok(None);
+        let outcome = cli::run_search(
+            &self.project_root,
+            request.query,
+            request.top_k.map(|value| value as usize),
+            request.language_filter,
+            request.path_prefix,
+            request.repos,
+        )
+        .await
+        .and_then(to_value);
+        Ok(into_result(outcome))
     }
 
-    if request.jsonrpc != JSONRPC_VERSION {
-        return Ok(Some(error_response(
-            request.id,
-            -32600,
-            "jsonrpc must be 2.0".to_owned(),
-            None,
-        )));
+    /// Chunk count, file count, model, and staleness for the active index.
+    #[tool(name = "get_index_status")]
+    async fn get_index_status(&self) -> ToolOutcome {
+        let outcome = cli::run_status(&self.project_root).await.and_then(to_value);
+        Ok(into_result(outcome))
     }
 
-    let id = request.id.clone();
-    let response = match request.method.as_str() {
-        "initialize" => success_response(id, initialize_result(&request.params)),
-        "tools/list" => success_response(id, tools_list_result()),
-        "tools/call" => handle_tools_call(project_root, id, request.params).await?,
-        _ => error_response(
-            id,
-            -32601,
-            format!("method not found: {}", request.method),
-            None,
-        ),
-    };
+    /// Rebuild the active project index; `force` wipes before rebuilding.
+    #[tool(name = "reindex")]
+    async fn reindex(&self, Parameters(request): Parameters<ReindexRequest>) -> ToolOutcome {
+        let outcome = async {
+            if request.force {
+                cli::run_clear_index(&self.project_root).await?;
+            }
+            let output = cli::run_index(&self.project_root, false).await?;
+            to_value(output)
+        }
+        .await;
+        Ok(into_result(outcome))
+    }
 
-    Ok(Some(response))
+    /// Delete all stored chunks and the manifest for the active project.
+    #[tool(name = "clear_index")]
+    async fn clear_index(&self) -> ToolOutcome {
+        let outcome = cli::run_clear_index(&self.project_root)
+            .await
+            .and_then(to_value);
+        Ok(into_result(outcome))
+    }
+
+    /// Re-embed one file in the active project without touching other chunks.
+    #[tool(name = "reindex_file")]
+    async fn reindex_file(
+        &self,
+        Parameters(request): Parameters<ReindexFileRequest>,
+    ) -> ToolOutcome {
+        if request.path.trim().is_empty() {
+            return Ok(error_result(ClaudixError::ConfigInvalid {
+                message: "path cannot be empty".to_owned(),
+                recovery: RecoveryHint(hints::PATH_NON_EMPTY),
+            }));
+        }
+        let outcome = cli::run_reindex_file(&self.project_root, Path::new(&request.path))
+            .await
+            .and_then(to_value);
+        Ok(into_result(outcome))
+    }
+
+    /// Per-directory map of the indexed repo.
+    #[tool(name = "overview")]
+    async fn overview(&self, Parameters(request): Parameters<OverviewRequest>) -> ToolOutcome {
+        let outcome = cli::run_overview(&self.project_root, request.path_prefix)
+            .await
+            .and_then(to_value);
+        Ok(into_result(outcome))
+    }
+
+    /// Near-identical code chunks across files using stored embeddings.
+    #[tool(name = "find_duplicates")]
+    async fn find_duplicates(
+        &self,
+        Parameters(request): Parameters<FindDuplicatesRequest>,
+    ) -> ToolOutcome {
+        let outcome = cli::run_find_duplicates(
+            &self.project_root,
+            request.min_similarity,
+            request.limit.map(|value| value as usize),
+            request.repos,
+        )
+        .await
+        .and_then(to_value);
+        Ok(into_result(outcome))
+    }
 }
 
-async fn handle_tools_call(project_root: &Path, id: Option<Value>, params: Value) -> Result<Value> {
-    let call: CallToolRequest = match serde_json::from_value(params) {
-        Ok(call) => call,
-        Err(error) => {
-            return Ok(error_response(
-                id,
-                -32602,
-                format!("invalid tools/call params: {error}"),
-                None,
-            ));
-        }
-    };
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for ClaudixServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION")),
+        )
+    }
 
-    let tool_result = match call.name.as_str() {
-        "search_code" => match search_code(project_root, call.arguments).await {
-            Ok(result) => tool_result_or_error(result),
-            Err(error) => tool_error_result(error),
-        },
-        "get_index_status" => match get_index_status(project_root).await {
-            Ok(result) => tool_result_or_error(result),
-            Err(error) => tool_error_result(error),
-        },
-        "reindex" => match reindex(project_root, call.arguments).await {
-            Ok(result) => tool_result_or_error(result),
-            Err(error) => tool_error_result(error),
-        },
-        "clear_index" => match clear_index(project_root).await {
-            Ok(result) => tool_result_or_error(result),
-            Err(error) => tool_error_result(error),
-        },
-        "reindex_file" => match reindex_file(project_root, call.arguments).await {
-            Ok(result) => tool_result_or_error(result),
-            Err(error) => tool_error_result(error),
-        },
-        "overview" => match overview(project_root, call.arguments).await {
-            Ok(result) => tool_result_or_error(result),
-            Err(error) => tool_error_result(error),
-        },
-        "find_duplicates" => match find_duplicates(project_root, call.arguments).await {
-            Ok(result) => tool_result_or_error(result),
-            Err(error) => tool_error_result(error),
-        },
-        _ => {
-            return Ok(error_response(
-                id,
-                -32602,
-                format!("unknown tool: {}", call.name),
-                None,
-            ));
-        }
-    };
-
-    Ok(success_response(id, tool_result))
+    /// Serve the centralized catalog from `prompts::mcp`, not the macro-derived
+    /// per-tool schemas, so descriptions and order stay the single source.
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListToolsResult, ErrorData> {
+        Ok(ListToolsResult::with_all_items(tool_catalog()?))
+    }
 }
 
-fn to_value<T: Serialize>(value: T) -> Result<Value> {
+/// The served tool catalog, built from `prompts::mcp` in declared order. Single
+/// source of truth for `tools/list`; the macro-derived per-tool schemas are not
+/// served.
+fn tool_catalog() -> std::result::Result<Vec<Tool>, ErrorData> {
+    crate::prompts::mcp::tool_definitions()
+        .into_iter()
+        .map(tool_from_definition)
+        .collect()
+}
+
+pub async fn run(project_root: impl AsRef<Path>) -> crate::error::Result<()> {
+    let server = ClaudixServer::new(project_root.as_ref().to_path_buf());
+    // The service driver is spawned with `spawn_local` under the `local` feature,
+    // so it must run inside a `LocalSet`.
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async move {
+            let running = server
+                .serve(stdio())
+                .await
+                .map_err(|error| ClaudixError::Mcp(error.to_string()))?;
+            running
+                .waiting()
+                .await
+                .map_err(|error| ClaudixError::Mcp(error.to_string()))?;
+            Ok(())
+        })
+        .await
+}
+
+/// Convert one `prompts::mcp` JSON tool definition into an rmcp `Tool`. Keeps
+/// rmcp model types out of the prompts module.
+fn tool_from_definition(definition: Value) -> std::result::Result<Tool, ErrorData> {
+    let name = definition
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ErrorData::internal_error("tool definition missing name", None))?
+        .to_owned();
+    let description = definition
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    let input_schema: JsonObject = match definition.get("inputSchema") {
+        Some(Value::Object(map)) => map.clone(),
+        _ => JsonObject::new(),
+    };
+    Ok(Tool::new(
+        Cow::Owned(name),
+        Cow::Owned(description),
+        Arc::new(input_schema),
+    ))
+}
+
+fn to_value<T: serde::Serialize>(value: T) -> crate::error::Result<Value> {
     serde_json::to_value(value).map_err(ClaudixError::from)
 }
 
-async fn search_code(project_root: &Path, arguments: Value) -> Result<Value> {
-    let request: SearchCodeRequest =
-        parse_tool_arguments(arguments, "search_code", hints::SEARCH_CODE_ARGS)?;
-    if request.query.trim().is_empty() {
-        return Err(ClaudixError::ConfigInvalid {
-            message: "query cannot be empty".to_owned(),
-            recovery: RecoveryHint(hints::QUERY_NON_EMPTY),
-        });
-    }
-    let output = cli::run_search(
-        project_root,
-        request.query,
-        request.top_k.map(|value| value as usize),
-        request.language_filter,
-        request.path_prefix,
-        request.repos,
-    )
-    .await?;
-    to_value(output)
-}
-
-async fn get_index_status(project_root: &Path) -> Result<Value> {
-    let output = cli::run_status(project_root).await?;
-    to_value(output)
-}
-
-async fn reindex(project_root: &Path, arguments: Value) -> Result<Value> {
-    let request: ReindexRequest = parse_tool_arguments(arguments, "reindex", hints::REINDEX_ARGS)?;
-    if request.force {
-        cli::run_clear_index(project_root).await?;
-    }
-    let output = cli::run_index(project_root, false).await?;
-    to_value(output)
-}
-
-async fn clear_index(project_root: &Path) -> Result<Value> {
-    let output = cli::run_clear_index(project_root).await?;
-    to_value(output)
-}
-
-async fn reindex_file(project_root: &Path, arguments: Value) -> Result<Value> {
-    let request: ReindexFileRequest =
-        parse_tool_arguments(arguments, "reindex_file", hints::REINDEX_FILE_PATH_ARG)?;
-    if request.path.trim().is_empty() {
-        return Err(ClaudixError::ConfigInvalid {
-            message: "path cannot be empty".to_owned(),
-            recovery: RecoveryHint(hints::PATH_NON_EMPTY),
-        });
-    }
-    let output = cli::run_reindex_file(project_root, Path::new(&request.path)).await?;
-    to_value(output)
-}
-
-async fn overview(project_root: &Path, arguments: Value) -> Result<Value> {
-    let request: OverviewRequest =
-        parse_tool_arguments(arguments, "overview", hints::OVERVIEW_ARGS)?;
-    let output = cli::run_overview(project_root, request.path_prefix).await?;
-    to_value(output)
-}
-
-async fn find_duplicates(project_root: &Path, arguments: Value) -> Result<Value> {
-    let request: FindDuplicatesRequest =
-        parse_tool_arguments(arguments, "find_duplicates", hints::FIND_DUPLICATES_ARGS)?;
-    let output = cli::run_find_duplicates(
-        project_root,
-        request.min_similarity,
-        request.limit.map(|n| n as usize),
-        request.repos,
-    )
-    .await?;
-    to_value(output)
-}
-
-fn parse_tool_arguments<T>(
-    arguments: Value,
-    tool_name: &'static str,
-    recovery: &'static str,
-) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let arguments = match arguments {
-        Value::Null => Value::Object(Map::new()),
-        value => value,
-    };
-
-    serde_json::from_value(arguments).map_err(|error| ClaudixError::ConfigInvalid {
-        message: format!("invalid arguments for {tool_name}: {error}"),
-        recovery: RecoveryHint(recovery),
-    })
-}
-
-fn initialize_result(_params: &Value) -> Value {
-    json!({
-        "protocolVersion": PROTOCOL_VERSION,
-        "capabilities": {
-            "tools": {}
-        },
-        "serverInfo": {
-            "name": env!("CARGO_PKG_NAME"),
-            "version": env!("CARGO_PKG_VERSION")
-        }
-    })
-}
-
-fn tools_list_result() -> Value {
-    json!({
-        "tools": tool_definitions()
-    })
-}
-
-fn tool_definitions() -> Vec<Value> {
-    crate::prompts::mcp::tool_definitions()
-}
-
-fn success_response(id: Option<Value>, result: Value) -> Value {
-    json!({
-        "jsonrpc": JSONRPC_VERSION,
-        "id": id.unwrap_or(Value::Null),
-        "result": result,
-    })
-}
-
-fn error_response(id: Option<Value>, code: i64, message: String, data: Option<Value>) -> Value {
-    let mut error = Map::new();
-    error.insert("code".to_owned(), Value::Number(code.into()));
-    error.insert("message".to_owned(), Value::String(message));
-
-    if let Some(data) = data {
-        error.insert("data".to_owned(), data);
-    }
-
-    Value::Object(Map::from_iter([
-        (
-            "jsonrpc".to_owned(),
-            Value::String(JSONRPC_VERSION.to_owned()),
-        ),
-        ("id".to_owned(), id.unwrap_or(Value::Null)),
-        ("error".to_owned(), Value::Object(error)),
-    ]))
-}
-
-fn tool_success_result(payload: Value) -> Result<Value> {
-    let text = serde_json::to_string(&payload).map_err(ClaudixError::from)?;
-
-    Ok(json!({
-        "content": [TextContent { kind: "text", text }],
-        "structuredContent": payload,
-    }))
-}
-
-/// Serialize a successful tool payload, degrading a serialize failure into a
-/// tool-level error instead of propagating it out of `handle_tools_call` (which
-/// would kill the server loop). `to_string` on a `Value` won't realistically
-/// fail, but the success arm must never be able to take down the server.
-fn tool_result_or_error(payload: Value) -> Value {
-    match tool_success_result(payload) {
-        Ok(result) => result,
-        Err(error) => tool_error_result(error),
+/// Successful payload → structured content; error → a tool-level error result the
+/// caller can read. A serialize failure for the payload degrades to an error
+/// result rather than tearing down the server loop.
+fn into_result(outcome: crate::error::Result<Value>) -> CallToolResult {
+    match outcome {
+        Ok(payload) => CallToolResult::structured(payload),
+        Err(error) => error_result(error),
     }
 }
 
-fn tool_error_result(error: ClaudixError) -> Value {
+/// Map a `ClaudixError` to a tool-level error result, embedding the recovery hint
+/// as `"{message}. Recovery: {hint}"` (no suffix when the error carries no hint).
+fn error_result(error: ClaudixError) -> CallToolResult {
     let message = error.to_string();
-    let recovery = error.recovery_hint();
-    let text = match recovery {
+    let text = match error.recovery_hint() {
         Some(recovery) => format!("{message}. Recovery: {recovery}"),
-        None => message.clone(),
+        None => message,
     };
-
-    let mut structured = Map::new();
-    structured.insert("error".to_owned(), Value::String(message));
-    if let Some(recovery) = recovery {
-        structured.insert("recovery".to_owned(), Value::String(recovery.to_owned()));
-    }
-
-    json!({
-        "content": [TextContent { kind: "text", text }],
-        "structuredContent": Value::Object(structured),
-        "isError": true,
-    })
-}
-
-async fn write_message(writer: &mut io::Stdout, response: &Value) -> Result<()> {
-    let encoded = serde_json::to_vec(response).map_err(ClaudixError::from)?;
-    writer.write_all(&encoded).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-    Ok(())
+    CallToolResult::error(vec![Content::text(text)])
 }
 
 #[cfg(test)]
@@ -394,24 +282,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn initialize_result_advertises_server_info() {
-        let result = initialize_result(&Value::Null);
+    fn get_info_advertises_server_info() {
+        let info = ClaudixServer::new(PathBuf::from(".")).get_info();
 
-        assert_eq!(result["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(result["serverInfo"]["name"], env!("CARGO_PKG_NAME"));
-        assert_eq!(result["serverInfo"]["version"], env!("CARGO_PKG_VERSION"));
-        assert!(result["capabilities"]["tools"].is_object());
+        assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert!(info.capabilities.tools.is_some());
     }
 
     #[test]
-    fn tools_list_returns_documented_tool_names() {
-        let tools = tools_list_result()["tools"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+    fn list_tools_returns_documented_tool_names_in_order() {
+        let tools = tool_catalog().unwrap_or_default();
         let names = tools
             .iter()
-            .filter_map(|tool| tool["name"].as_str())
+            .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -429,59 +313,40 @@ mod tests {
     }
 
     #[test]
-    fn tool_error_result_includes_recovery_hint() {
-        let result = tool_error_result(ClaudixError::PathTraversal {
+    fn error_result_embeds_recovery_hint_with_is_error() {
+        let result = error_result(ClaudixError::PathTraversal {
             path: "../escape.rs".into(),
             recovery: RecoveryHint("Use a path inside $CLAUDE_PROJECT_DIR"),
         });
 
-        assert_eq!(result["isError"], Value::Bool(true));
-        assert_eq!(
-            result["structuredContent"]["recovery"],
-            Value::String("Use a path inside $CLAUDE_PROJECT_DIR".to_owned())
-        );
+        assert_eq!(result.is_error, Some(true));
+        let text = result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
+            .collect::<String>();
+        assert!(text.contains("Use a path inside $CLAUDE_PROJECT_DIR"));
+        assert!(text.contains("Recovery:"));
     }
 
     #[tokio::test]
     async fn reindex_file_rejects_empty_path() {
-        let response = handle_line(
-            Path::new("."),
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"reindex_file","arguments":{"path":"   "}}}"#,
-        )
-        .await;
+        let server = ClaudixServer::new(PathBuf::from("."));
+        let outcome = server
+            .reindex_file(Parameters(ReindexFileRequest {
+                path: "   ".to_owned(),
+            }))
+            .await;
+        assert!(outcome.is_ok());
+        let result = outcome.unwrap_or_else(|_| CallToolResult::success(vec![]));
 
-        assert!(response.is_ok());
-        let response = response.ok().flatten().unwrap_or(Value::Null);
-        assert_eq!(response["result"]["isError"], Value::Bool(true));
-        assert_eq!(
-            response["result"]["structuredContent"]["recovery"],
-            Value::String("Pass a non-empty path to reindex_file".to_owned())
-        );
-    }
-
-    #[tokio::test]
-    async fn notifications_initialized_produces_no_response() {
-        let response = handle_line(
-            Path::new("."),
-            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-        )
-        .await;
-
-        assert!(response.is_ok());
-        assert!(response.ok().flatten().is_none());
-    }
-
-    #[tokio::test]
-    async fn unknown_tool_returns_protocol_error() {
-        let response = handle_line(
-            Path::new("."),
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"nope","arguments":{}}}"#,
-        )
-        .await;
-
-        assert!(response.is_ok());
-        let response = response.ok().flatten().unwrap_or(Value::Null);
-        assert_eq!(response["error"]["code"], Value::Number((-32602).into()));
+        assert_eq!(result.is_error, Some(true));
+        let text = result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
+            .collect::<String>();
+        assert!(text.contains("Pass a non-empty path to reindex_file"));
     }
 
     #[test]

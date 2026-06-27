@@ -106,7 +106,11 @@ fn search_code_returns_fixture_hit_over_stdio() -> Result<(), Box<dyn std::error
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {}
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "test-client", "version": "0.0.0" }
+            }
         })
     )?;
     let initialize = next_response(&mut reader)?;
