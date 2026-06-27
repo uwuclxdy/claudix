@@ -14,7 +14,7 @@ Copilot's Codebase Index but for Claude Code. Automatically indexes your repo, e
 
 ## What It Does
 
-claudix is a Claude Code plugin that gives the agent local semantic search over any repository. A single Rust binary acts as MCP server, hook handler, and CLI. When Claude Code starts, claudix warmly bootstraps the index if missing. When you edit files, chunks are re-embedded automatically. When grep would be less useful than semantic search, the plugin intercepts and uses dense vectors instead. Configuration lives next to `settings.json` with optional per-project overrides. First-class language support includes Python, JavaScript, Java, C, C++, C#, SQL, Rust, TypeScript, and Go.
+claudix is a Claude Code plugin that gives the agent local semantic search over any repository. A single Rust binary acts as MCP server, hook handler, and CLI. When Claude Code starts, claudix warmly bootstraps the index if missing. When you edit files, chunks are re-embedded automatically. When grep would be less useful than semantic search, the plugin intercepts and uses dense vectors instead. Configuration lives next to `settings.json` with optional per-project overrides. First-class language support covers Rust, Python, JavaScript, TypeScript, Go, Java, C and C++.
 
 Core design goal: never break the session, always recover gracefully.
 
@@ -85,7 +85,9 @@ reindex_after_hours = 24            # background reindex interval
 top_k = 10                          # results per search
 hybrid_weights = { dense = 0.55, bm25 = 0.30, rrf = 0.15 }  # hybrid retrieval weights
 identifier_boost = 1.4              # boost exact identifier matches
-similarity_threshold = 0.30         # minimum relevance score
+similarity_threshold = 0.30         # minimum cosine similarity to keep a candidate
+min_score = 0.05                    # minimum fused score to return a hit
+cross_repos = []                    # extra already-indexed repo paths to search (read-only)
 
 [hooks]
 intercept_grep = true               # replace grep with semantic search when useful
@@ -98,7 +100,7 @@ related_min_similarity = 0.65       # cosine floor for related-code hits (0.0–
 
 [paths]
 index_dir = ".claudix/index"        # relative to repo root; committed to .gitignore
-log_dir = "~/.claude/claudix/logs"
+log_dir = ".claudix/logs"           # relative to repo root
 ```
 
 Configuration is validated at every entry point (MCP, hook, CLI). Invalid config exits early with field-level error messages.
@@ -114,6 +116,8 @@ All commands are available as `/claudix:<name>`:
 | `/claudix:status` | Show index metadata | (none) |
 | `/claudix:doctor` | Diagnose health | (none) |
 | `/claudix:reindex-file` | Re-embed one file | `<path>` |
+| `/claudix:overview` | Map the repo by directory | `[--path-prefix src/]` |
+| `/claudix:find-duplicates` | Find near-duplicate chunks | `[--min-similarity N] [--limit N]` |
 | `/claudix:clear` | Delete index | (none) |
 
 ### Search Example
@@ -277,7 +281,7 @@ If using LM Studio or Ollama:
 SessionStart hook exits 0 even on error. Check logs:
 
 ```bash
-tail -f ~/.claude/claudix/logs/claudix.log
+tail -f .claudix/logs/index.log
 ```
 
 Logs are created on first run. Enable debug logging:
