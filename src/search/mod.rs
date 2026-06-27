@@ -227,13 +227,21 @@ fn rank_rows(
         return Ok(Vec::new());
     }
 
-    // Single pass: compute dense + BM25 scores and fill RowScore structs.
+    // Build document stats for the whole filtered corpus once, so BM25 IDF is
+    // computed against real document frequency rather than a degenerate n=1
+    // corpus that treats every token as equally rare.
+    let docs: Vec<DocumentStats> = filtered_rows
+        .iter()
+        .map(|(_, row)| DocumentStats::from_content(&row.content))
+        .collect();
+    let bm25_per_row = bm25_scores(&docs, &query_tokens);
+
+    // Single pass: dense scores zipped with the pre-computed cross-corpus BM25.
     let mut scores: Vec<RowScore> = filtered_rows
         .iter()
-        .map(|(_, row)| {
-            let doc = DocumentStats::from_content(&row.content);
+        .zip(bm25_per_row)
+        .map(|((_, row), bm25)| {
             let dense = cosine_similarity(&query_vector, &row.vector).max(0.0);
-            let bm25 = bm25_scores_single(&doc, &query_tokens);
             RowScore {
                 dense,
                 bm25,
@@ -296,37 +304,6 @@ fn rank_rows(
 
     sort_results(&mut results);
     Ok(results)
-}
-
-/// BM25 score for a single document against the query tokens.
-fn bm25_scores_single(doc: &DocumentStats, query_tokens: &[String]) -> f32 {
-    // Caller computes per-document IDF against a single-document corpus (n=1).
-    // This is a degenerate case but preserves the relative ordering that matters
-    // for hybrid ranking; the absolute values are normalised before use anyway.
-    const K1: f32 = 1.2;
-    const B: f32 = 0.75;
-
-    if query_tokens.is_empty() || doc.length == 0 {
-        return 0.0;
-    }
-
-    let unique_tokens = query_tokens.iter().collect::<HashSet<_>>();
-    let length = doc.length as f32;
-
-    unique_tokens
-        .iter()
-        .map(|token| {
-            let tf = *doc.term_frequencies.get(*token).unwrap_or(&0) as f32;
-            if tf == 0.0 {
-                return 0.0;
-            }
-            // IDF for a single-document corpus is a small constant; use 1.0 so
-            // all matching tokens contribute equally (normalised downstream).
-            let numerator = tf * (K1 + 1.0);
-            let denominator = tf + K1 * (1.0 - B + B * length);
-            numerator / denominator
-        })
-        .sum()
 }
 
 /// `rank_positions` variant that reads scores from a `RowScore` slice via a
@@ -485,7 +462,6 @@ fn apply_filters(
         .collect()
 }
 
-#[cfg(test)]
 fn bm25_scores(documents: &[DocumentStats], query_tokens: &[String]) -> Vec<f32> {
     const K1: f32 = 1.2;
     const B: f32 = 0.75;
@@ -754,6 +730,31 @@ mod tests {
             "handle_session_start should match 'session start'"
         );
         assert_eq!(scores[1], 0.0, "with_fallback_params should not match");
+    }
+
+    #[test]
+    fn bm25_rare_term_outranks_common_term() {
+        // 9 docs contain only "foo" (common, df = 9/10); 1 contains only
+        // "zygote" (rare, df = 1/10). For query "foo zygote" the rare-term doc
+        // must win on IDF — which a hardcoded IDF = 1.0 could never produce.
+        let mut docs: Vec<DocumentStats> = (0..9)
+            .map(|_| DocumentStats::from_content("foo bar"))
+            .collect();
+        docs.push(DocumentStats::from_content("zygote baz"));
+
+        let scores = bm25_scores(&docs, &tokenize("foo zygote"));
+        let rare_score = scores[9];
+        let common_score = scores[0];
+
+        assert!(rare_score > 0.0, "rare-term doc must score its query token");
+        assert!(
+            common_score > 0.0,
+            "common-term doc must score its query token"
+        );
+        assert!(
+            rare_score > common_score,
+            "rare term (high IDF) must outscore common term (low IDF): rare={rare_score}, common={common_score}"
+        );
     }
 
     /// Wrap raw `StoredChunk`s with a fake repo label for `rank_rows` tests.
