@@ -34,6 +34,11 @@ pub(super) async fn handle_session_start(
     let store = config
         .as_ref()
         .and_then(|config| Store::new(project_root, config).ok());
+    // New session → forget which related-code pairs were already surfaced so the
+    // post-edit dedup ledger starts clean. Fail-open.
+    if let Some(store) = store.as_ref() {
+        let _ = std::fs::remove_file(store.change_neighbors_seen_path());
+    }
     let manifest = store
         .as_ref()
         .and_then(|store| store.read_manifest().ok().flatten());

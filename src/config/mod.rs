@@ -131,7 +131,7 @@ impl Default for Config {
                 surface_related_on_edit: true,
                 surface_related_on_read: false,
                 related_top_k: 5,
-                related_min_similarity: 0.65,
+                related_min_similarity: 0.72,
             },
             paths: PathsConfig {
                 index_dir: PathBuf::from(".claudix/index"),

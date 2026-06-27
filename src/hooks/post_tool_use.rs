@@ -283,11 +283,28 @@ pub(super) fn take_change_neighbors_context(
     let marker_path = store.change_neighbors_marker_path();
     let marker = change_neighbors::read_and_remove(&marker_path)?;
 
+    // Per-session dedup: suppress an (edited file → neighbor) pair already
+    // surfaced this session so re-editing the same file doesn't repeat the same
+    // related code. The ledger is reset on SessionStart. Fail-open: an unreadable
+    // ledger reads as empty, so nothing is wrongly suppressed.
+    let seen_path = store.change_neighbors_seen_path();
+    let seen = change_neighbors::read_seen(&seen_path);
+
+    let mut fresh_keys: Vec<String> = Vec::new();
     let hits: Vec<String> = marker
         .neighbors
         .iter()
         .filter(|n| n.file_path != marker.edited_path)
         .filter(|n| neighbor_file_exists(project_root, &n.file_path))
+        .filter(|n| {
+            let key =
+                change_neighbors::seen_key(&marker.edited_path, &n.file_path, n.name.as_deref());
+            if seen.contains(&key) {
+                return false;
+            }
+            fresh_keys.push(key);
+            true
+        })
         .map(|n| {
             prompts::hooks::edit_neighbor_line(
                 &n.file_path,
@@ -302,6 +319,9 @@ pub(super) fn take_change_neighbors_context(
     if hits.is_empty() {
         return None;
     }
+
+    // Record only the pairs actually surfaced.
+    change_neighbors::append_seen(&seen_path, &fresh_keys);
 
     let context = prompts::hooks::edit_related_context(&marker.edited_path, &hits);
 
@@ -869,6 +889,101 @@ mod tests {
         assert!(
             !context.contains("src/lib.rs:"),
             "edited file must not appear as a hit in context, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_neighbor_pair_is_suppressed() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // First take surfaces the (src/lib.rs → src/math.rs) pair.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = response.unwrap_or(serde_json::Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("src/math.rs"),
+            "first take must surface the neighbor, got: {context}"
+        );
+
+        // read_and_remove deletes the marker on each take, so re-write the SAME
+        // marker before the second take.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        assert!(
+            response.is_none(),
+            "identical (edited → neighbor) pair already surfaced this session must be suppressed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_neighbor_via_different_edited_file_still_surfaces() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // First: edited=src/lib.rs → src/math.rs, surfaces and records the key.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+        let _ = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+
+        // Same neighbor, different edited file → different dedup key → surfaces.
+        write_neighbors_marker(
+            &store,
+            "src/other.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = response.unwrap_or(serde_json::Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("src/math.rs"),
+            "same neighbor via a different edited file must still surface, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_start_clears_seen_ledger() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Seed a dummy key into the per-session dedup ledger.
+        let seen_path = store.change_neighbors_seen_path();
+        fs::write(&seen_path, "src/lib.rs\tsrc/math.rs\tadd\n")?;
+        assert!(seen_path.exists(), "ledger must exist before SessionStart");
+
+        run(fixture.root(), HookEvent::SessionStart, "{}").await?;
+
+        assert!(
+            !seen_path.exists(),
+            "SessionStart must reset the dedup ledger"
         );
         Ok(())
     }

@@ -11,6 +11,7 @@
 //! `PostToolUse` or `UserPromptSubmit` event. If it does not exist the hook
 //! produces no neighbors output.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
@@ -52,4 +53,44 @@ pub(crate) fn read_and_remove(marker_path: &Path) -> Option<ChangeNeighborsMarke
     let marker = read(marker_path)?;
     let _ = fs::remove_file(marker_path);
     Some(marker)
+}
+
+/// Per-session dedup key for a surfaced (edited file → neighbor) pair. Keyed on
+/// edited path + neighbor file + symbol so re-editing the same file won't repeat
+/// the same neighbor, while a different edited file still can.
+pub(crate) fn seen_key(
+    edited_path: &str,
+    neighbor_file: &str,
+    neighbor_name: Option<&str>,
+) -> String {
+    format!(
+        "{edited_path}\t{neighbor_file}\t{}",
+        neighbor_name.unwrap_or("")
+    )
+}
+
+/// Read the "already surfaced this session" ledger into a key set. Absent or
+/// unreadable → empty set (fail-open).
+pub(crate) fn read_seen(seen_path: &Path) -> HashSet<String> {
+    fs::read_to_string(seen_path)
+        .map(|content| content.lines().map(str::to_owned).collect())
+        .unwrap_or_default()
+}
+
+/// Append newly-surfaced keys to the ledger (one per line). Best-effort: a write
+/// failure just means a pair may surface again (fail-open).
+pub(crate) fn append_seen(seen_path: &Path, keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(seen_path)
+    {
+        for key in keys {
+            let _ = writeln!(file, "{key}");
+        }
+    }
 }

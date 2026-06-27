@@ -118,6 +118,12 @@ impl Store {
         self.paths.state_dir.join("change-neighbors")
     }
 
+    /// Path to the per-session change-neighbors dedup ledger. Sibling of the
+    /// marker; reset on SessionStart so related-code surfaces fresh each session.
+    pub fn change_neighbors_seen_path(&self) -> PathBuf {
+        self.paths.state_dir.join("change-neighbors-seen")
+    }
+
     pub fn state_dir_path(&self) -> &Path {
         &self.paths.state_dir
     }
