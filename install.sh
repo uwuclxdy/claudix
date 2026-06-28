@@ -21,13 +21,16 @@ else
 fi
 
 # Prime the binary cache from the local checkout so the first session
-# does not stall on download. Uses the documented plugin-data path,
-# avoiding any dependency on `node` or `jq`.
+# does not stall on download. The runtime bootstrap is node, so priming uses
+# node too; if it is not on PATH here the first session primes it via Claude
+# Code's node instead.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 plugin_data="${HOME}/.claude/plugins/data/claudix-claudix"
 mkdir -p "$plugin_data"
-CLAUDE_PLUGIN_ROOT="$script_dir" CLAUDE_PLUGIN_DATA="$plugin_data" \
-  bash "$script_dir/scripts/ensure-binary.sh" --install >/dev/null \
-  || printf 'claudix: binary install will retry on first session\n' >&2
+if command -v node >/dev/null 2>&1; then
+  CLAUDE_PLUGIN_ROOT="$script_dir" CLAUDE_PLUGIN_DATA="$plugin_data" \
+    node "$script_dir/bin/claudix-bootstrap.js" --install >/dev/null \
+    || printf 'claudix: binary install will retry on first session\n' >&2
+fi
 
 printf '\nclaudix installed. Restart Claude Code to activate.\n'

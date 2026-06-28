@@ -71,14 +71,12 @@ async fn install_plugin_assets(project_root: &Path, plugin_root: &Path) -> Resul
     .await?;
     changed |= copy_plugin_asset(
         project_root,
-        "bin/claudix",
-        plugin_root.join("bin").join("claudix"),
+        "bin/claudix-bootstrap.js",
+        plugin_root.join("bin").join("claudix-bootstrap.js"),
     )
     .await?;
-    make_executable(&plugin_root.join("bin").join("claudix")).await?;
     changed |=
         copy_plugin_directory(project_root, "commands", plugin_root.join("commands")).await?;
-    changed |= copy_plugin_directory(project_root, "scripts", plugin_root.join("scripts")).await?;
     Ok(changed)
 }
 
@@ -358,25 +356,23 @@ mod tests {
         let plugin_manifest = plugin_manifest.ok().unwrap_or_default();
         assert!(plugin_manifest.contains("\"name\": \"claudix\""));
         assert!(plugin_manifest.contains("\"mcpServers\""));
-        assert!(plugin_manifest.contains("\"command\": \"bash\""));
+        assert!(plugin_manifest.contains("\"command\": \"node\""));
         assert!(plugin_manifest.contains("\"mcp\""));
+        assert!(plugin_manifest.contains("claudix-bootstrap.js"));
 
         let hooks_manifest = fs::read_to_string(plugin_root.join("hooks").join("hooks.json")).await;
         assert!(hooks_manifest.is_ok());
-        assert!(
-            hooks_manifest
-                .ok()
-                .unwrap_or_default()
-                .contains("scripts/session-start.sh")
-        );
+        let hooks_manifest = hooks_manifest.ok().unwrap_or_default();
+        assert!(hooks_manifest.contains("bin/claudix-bootstrap.js"));
+        assert!(hooks_manifest.contains("hook SessionStart"));
 
-        let wrapper = fs::read_to_string(plugin_root.join("bin").join("claudix")).await;
-        assert!(wrapper.is_ok());
+        let bootstrap =
+            fs::read_to_string(plugin_root.join("bin").join("claudix-bootstrap.js")).await;
+        assert!(bootstrap.is_ok());
+        let bootstrap = bootstrap.ok().unwrap_or_default();
         assert!(
-            wrapper
-                .ok()
-                .unwrap_or_default()
-                .contains("ensure-binary.sh")
+            bootstrap.contains("readWantedVersion"),
+            "bootstrap source missing"
         );
 
         let search_command =
@@ -386,12 +382,14 @@ mod tests {
         assert!(search_command.contains("!`claudix search"));
         assert!(!search_command.contains("CLAUDE_PLUGIN_ROOT"));
 
-        let ensure_script =
-            fs::read_to_string(plugin_root.join("scripts").join("ensure-binary.sh")).await;
-        assert!(ensure_script.is_ok());
-        let ensure_script = ensure_script.ok().unwrap_or_default();
-        assert!(ensure_script.contains("github.com"));
-        assert!(ensure_script.contains("CLAUDE_PLUGIN_DATA"));
+        // scripts/ is no longer an install asset (bash wrappers deleted).
+        let scripts_copied = fs::try_exists(plugin_root.join("scripts"))
+            .await
+            .unwrap_or(false);
+        assert!(
+            !scripts_copied,
+            "scripts/ must not be copied into the plugin root"
+        );
     }
 
     #[test]

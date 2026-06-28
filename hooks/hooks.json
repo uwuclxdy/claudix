@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/session-start.sh\""
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/claudix-bootstrap.js\" hook SessionStart"
           }
         ]
       }
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/post-tool-use.sh\""
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/claudix-bootstrap.js\" hook PostToolUse"
           }
         ]
       }
@@ -27,7 +27,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/pre-tool-use.sh\""
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/claudix-bootstrap.js\" hook PreToolUse"
           }
         ]
       }
@@ -37,7 +37,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-submit.sh\""
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/bin/claudix-bootstrap.js\" hook UserPromptSubmit"
           }
         ]
       }

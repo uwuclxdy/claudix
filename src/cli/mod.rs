@@ -158,7 +158,7 @@ pub struct DoctorOutput {
     /// True when the stored index model differs from the active config model.
     /// Distinct from `embedding_healthy = false` caused by the server being unreachable.
     pub embedding_model_mismatch: bool,
-    /// Dev-only flag from config: when on, `scripts/ensure-binary.sh` runs the
+    /// Dev-only flag from config: when on, `bin/claudix-bootstrap.js` runs the
     /// `cargo install` binary instead of the downloaded release.
     pub development_mode: bool,
     /// Absolute path of the binary serving this command, so it is unambiguous

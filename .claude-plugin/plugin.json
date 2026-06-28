@@ -10,8 +10,8 @@
   "minClaudeCodeVersion": "2.0.12",
   "mcpServers": {
     "claudix": {
-      "command": "bash",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/claudix", "mcp"]
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/claudix-bootstrap.js", "mcp"]
     }
   }
 }

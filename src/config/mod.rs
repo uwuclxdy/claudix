@@ -81,7 +81,7 @@ pub struct PathsConfig {
 pub struct Config {
     pub watch: bool,
     /// Dev-only: resolve the binary from `cargo install` (`~/.cargo/bin/claudix`)
-    /// instead of the downloaded release. Read by `scripts/ensure-binary.sh`;
+    /// instead of the downloaded release. Read by `bin/claudix-bootstrap.js`;
     /// the running binary cannot change which binary launched it, so this field
     /// exists to be a recognized, doctor-visible key, not to drive resolution.
     pub development_mode: bool,
