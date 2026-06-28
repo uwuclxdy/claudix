@@ -63,6 +63,41 @@ fn stdout_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn write_manifest(plugin_root: &Path, version: &str) {
+    let dir = plugin_root.join(".claude-plugin");
+    assert!(fs::create_dir_all(&dir).is_ok());
+    let body = format!(
+        "{{\n  \"name\": \"claudix\",\n  \"version\": \"{}\"\n}}\n",
+        version
+    );
+    assert!(fs::write(dir.join("plugin.json"), body).is_ok());
+}
+
+/// Run `ensure-binary.sh --install` with an isolated HOME, plugin root, cargo
+/// home, and symlink dir so the real environment is never touched. Forces a
+/// deterministic platform so the cached-binary path is stable on any unix host.
+fn run_install(
+    home: &Path,
+    project_dir: &Path,
+    cargo_home: &Path,
+    plugin_root: &Path,
+    local_bin: &Path,
+) -> Output {
+    let output = Command::new("bash")
+        .arg(script_path())
+        .arg("--install")
+        .env("HOME", home)
+        .env("CLAUDE_PROJECT_DIR", project_dir)
+        .env("CARGO_HOME", cargo_home)
+        .env("CLAUDE_PLUGIN_ROOT", plugin_root)
+        .env("CLAUDE_PLUGIN_DATA", home.join("cache"))
+        .env("CLAUDIX_LOCAL_BIN", local_bin)
+        .env("CLAUDIX_PLATFORM_OVERRIDE", "linux-x86_64")
+        .output();
+    assert!(output.is_ok());
+    output.ok().unwrap_or_else(|| unreachable!())
+}
+
 #[test]
 fn development_mode_resolves_cargo_binary() {
     let temp = temp_dir();
@@ -189,5 +224,93 @@ fn commented_development_mode_key_is_ignored() {
     assert!(
         !stderr_of(&output).contains("cargo install --path ."),
         "commented key wrongly triggered the dev branch"
+    );
+}
+
+#[test]
+fn install_relinks_cached_binary_on_fast_path() {
+    let temp = temp_dir();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    let cargo_home = temp.path().join("cargo");
+    let plugin_root = temp.path().join("plugin");
+    let local_bin = temp.path().join("bin");
+    assert!(fs::create_dir_all(&project).is_ok());
+
+    write_manifest(&plugin_root, "0.1.6");
+
+    // a cached release binary for the wanted version + platform — the fast-path
+    // hit. `--install` must repoint the symlink even when nothing is downloaded.
+    let cache_bin = home
+        .join("cache")
+        .join("bin")
+        .join("claudix-v0.1.6-linux-x86_64");
+    write_executable(&cache_bin, "#!/bin/sh\nexit 0\n");
+
+    let output = run_install(&home, &project, &cargo_home, &plugin_root, &local_bin);
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        stderr_of(&output)
+    );
+
+    let target = fs::read_link(local_bin.join("claudix"));
+    assert!(
+        target.is_ok(),
+        "expected ~/.local/bin/claudix symlink on cache-hit, stderr: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        target
+            .ok()
+            .unwrap_or_else(|| unreachable!())
+            .to_string_lossy(),
+        cache_bin.to_string_lossy()
+    );
+}
+
+#[test]
+fn install_leaves_intentional_cargo_binary_in_place() {
+    let temp = temp_dir();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    let cargo_home = temp.path().join("cargo");
+    let plugin_root = temp.path().join("plugin");
+    let local_bin = temp.path().join("bin");
+    assert!(fs::create_dir_all(&project).is_ok());
+
+    write_manifest(&plugin_root, "0.1.6");
+
+    // cached release binary for the wanted version — release wins on the fast path.
+    let cache_bin = home
+        .join("cache")
+        .join("bin")
+        .join("claudix-v0.1.6-linux-x86_64");
+    write_executable(&cache_bin, "#!/bin/sh\nexit 0\n");
+
+    // a cargo-installed claudix at a different version — intentionally installed,
+    // must be left in place (warned, not deleted).
+    let cargo_bin = cargo_home.join("bin").join("claudix");
+    write_executable(
+        &cargo_bin,
+        "#!/bin/sh\n[ \"$1\" = \"-V\" ] && echo \"claudix 0.1.5\" || true\n",
+    );
+
+    let output = run_install(&home, &project, &cargo_home, &plugin_root, &local_bin);
+    assert!(
+        output.status.success(),
+        "expected success, stderr: {}",
+        stderr_of(&output)
+    );
+
+    assert!(
+        cargo_bin.exists(),
+        "cargo-installed claudix was deleted; stderr: {}",
+        stderr_of(&output)
+    );
+    assert!(
+        stderr_of(&output).contains("left in place"),
+        "expected left-in-place warning, stderr: {}",
+        stderr_of(&output)
     );
 }

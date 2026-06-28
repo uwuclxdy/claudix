@@ -206,23 +206,22 @@ gc_old_versions() {
   done <<< "$victims"
 }
 
-# drop a cargo-installed claudix so it isn't installed twice next to the
-# release binary; prefer `cargo uninstall`, fall back to removing the file
-remove_cargo_install() {
-  local cb
+# a stray cargo-installed claudix can shadow the symlink on PATH. warn but do
+# not delete it — it may be an intentional dev / standalone install the user
+# wants to keep (the release symlink still wins when ~/.local/bin precedes
+# ~/.cargo/bin on PATH).
+warn_cargo_duplicate() {
+  local release="$1" cb cb_version
   cb="$(cargo_bin_path)"
-  [[ -e "$cb" ]] || return 0
-  if command -v cargo >/dev/null 2>&1 \
-      && cargo uninstall "$PLUGIN_NAME" --quiet 2>/dev/null; then
-    log "removed duplicate cargo install of ${PLUGIN_NAME}"
-    return 0
-  fi
-  rm -f "$cb" 2>/dev/null && log "removed duplicate cargo binary ${cb}"
+  [[ -x "$cb" ]] || return 0
+  [[ "$cb" -ef "$release" ]] && return 0
+  cb_version="$("$cb" -V 2>/dev/null | awk '{print $2}')"
+  log "found cargo-installed ${PLUGIN_NAME} at ${cb} (v${cb_version:-unknown}); left in place, remove with 'cargo uninstall ${PLUGIN_NAME}' if undesired"
 }
 
 # point ${LOCAL_BIN}/claudix at the cached binary so `claudix` runs from a
-# shell, then drop any cargo duplicate. unix only — windows symlinks need
-# privileges and PATH works differently there.
+# shell. unix only — windows symlinks need privileges and PATH works differently
+# there. a cargo-installed claudix is left in place (warned), not deleted.
 expose_command() {
   local binary="$1" platform="$2"
   [[ "$platform" == windows-* ]] && return 0
@@ -232,7 +231,7 @@ expose_command() {
   ln -sf "$binary" "$link" 2>/dev/null || return 0
   log "linked ${link} -> $(basename "$binary")"
 
-  remove_cargo_install
+  warn_cargo_duplicate "$binary"
 
   case ":${PATH}:" in
     *":${LOCAL_BIN}:"*) ;;
@@ -289,6 +288,7 @@ do_install() {
 
   # re-check after lock: another invocation may have finished while we waited
   if binary="$(installed_path 2>/dev/null)"; then
+    expose_command "$binary" "$platform"
     printf '%s\n' "$binary"
     return 0
   fi
@@ -335,6 +335,8 @@ case "$MODE" in
     ;;
   install)
     if binary="$(installed_path 2>/dev/null)"; then
+      platform="$(detect_platform 2>/dev/null || true)"
+      [[ -n "$platform" ]] && expose_command "$binary" "$platform"
       printf '%s\n' "$binary"
       exit 0
     fi
