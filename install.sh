@@ -9,10 +9,16 @@ if ! command -v claude >/dev/null 2>&1; then
   exit 0
 fi
 
-claude plugin uninstall claudix@claudix || true
-claude plugin marketplace rm claudix || true
-claude plugin marketplace add uwuclxdy/claudix
-claude plugin install claudix@claudix
+# refresh the marketplace source (add if missing, update if present), then
+# install or update without uninstalling an existing install — preserves
+# plugin-local state instead of nuking + reinstalling on every run.
+claude plugin marketplace add uwuclxdy/claudix 2>/dev/null \
+  || claude plugin marketplace update claudix 2>/dev/null || true
+if claude plugin list 2>/dev/null | grep -q 'claudix@claudix'; then
+  claude plugin update claudix@claudix || true
+else
+  claude plugin install claudix@claudix
+fi
 
 # Prime the binary cache from the local checkout so the first session
 # does not stall on download. Uses the documented plugin-data path,
