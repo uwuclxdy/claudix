@@ -14,7 +14,7 @@ Copilot's Codebase Index but for Claude Code. Automatically indexes your repo, e
 
 ## What It Does
 
-claudix is a Claude Code plugin that gives the agent local semantic search over any repository. A single Rust binary acts as MCP server, hook handler, and CLI. When Claude Code starts, claudix warmly bootstraps the index if missing. When you edit files, chunks are re-embedded automatically. When grep would be less useful than semantic search, the plugin intercepts and uses dense vectors instead. Configuration lives next to `settings.json` with optional per-project overrides. First-class language support covers Rust, Python, JavaScript, TypeScript, Go, Java, C and C++.
+claudix is a Claude Code plugin that gives the agent local semantic search over any repository. A single Rust binary acts as MCP server, hook handler, and CLI. When Claude Code starts, claudix warmly bootstraps the index if missing. When you edit files, chunks are re-embedded automatically. When grep would be less useful than semantic search, the plugin intercepts and uses dense vectors instead. Configuration lives next to `settings.json` with optional per-project overrides. First-class language support covers Rust, Python, JavaScript, TypeScript, Go, Java, C, C++, C# and SQL.
 
 Core design goal: never break the session, always recover gracefully.
 
