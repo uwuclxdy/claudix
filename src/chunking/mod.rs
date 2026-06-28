@@ -1,6 +1,8 @@
+mod csharp;
 mod go;
 mod python;
 mod rust;
+mod sql;
 mod typescript;
 
 use tree_sitter::{Node, Parser};
@@ -71,6 +73,8 @@ impl MultiLanguageChunker {
                 typescript::chunk(path, language, file_hash, content)
             }
             Language::Go => go::chunk(path, file_hash, content),
+            Language::CSharp => csharp::chunk(path, file_hash, content),
+            Language::Sql => sql::chunk(path, file_hash, content),
             Language::Java | Language::C | Language::Cpp => chunk_fallback(
                 path,
                 language,
@@ -84,9 +88,14 @@ impl MultiLanguageChunker {
     }
 }
 
+/// Resolves a chunk node's symbol name from the source. Most grammars expose a
+/// `name` field (see `default_name`); SQL doesn't, so it supplies its own.
+type NameFn = fn(Node<'_>, &str) -> Option<String>;
+
 /// Generic tree-sitter chunker shell. Per-language modules call this with
 /// their grammar and kind classifier; the parse-and-walk machinery is
-/// identical across grammars so it lives here in one place.
+/// identical across grammars so it lives here in one place. Name resolution
+/// defaults to the `name` field; use `chunk_with_grammar_named` to override it.
 pub(super) fn chunk_with_grammar(
     grammar: tree_sitter::Language,
     grammar_name: &'static str,
@@ -95,6 +104,31 @@ pub(super) fn chunk_with_grammar(
     file_hash: FileHash,
     content: &str,
     kind_fn: fn(Node<'_>) -> Option<ChunkKind>,
+) -> Result<Vec<Chunk>> {
+    chunk_with_grammar_named(
+        grammar,
+        grammar_name,
+        path,
+        language,
+        file_hash,
+        content,
+        kind_fn,
+        default_name,
+    )
+}
+
+/// Like `chunk_with_grammar`, but with a custom name resolver for grammars
+/// whose declaration nodes don't carry a `name` field.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn chunk_with_grammar_named(
+    grammar: tree_sitter::Language,
+    grammar_name: &'static str,
+    path: &RelativePath,
+    language: Language,
+    file_hash: FileHash,
+    content: &str,
+    kind_fn: fn(Node<'_>) -> Option<ChunkKind>,
+    name_fn: NameFn,
 ) -> Result<Vec<Chunk>> {
     let mut parser = Parser::new();
     parser
@@ -114,9 +148,18 @@ pub(super) fn chunk_with_grammar(
         content,
         &mut chunks,
         kind_fn,
+        name_fn,
     )?;
     chunks.sort_by_key(|chunk| (chunk.byte_range.start, chunk.byte_range.end));
     Ok(chunks)
+}
+
+/// Default name resolver: the node's `name` field, read as UTF-8. Grammars that
+/// place the symbol name elsewhere (SQL) pass their own `NameFn`.
+fn default_name(node: Node<'_>, content: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|child| child.utf8_text(content.as_bytes()).ok())
+        .map(str::to_owned)
 }
 
 /// Split `content` into overlapping line-based chunks. Used for languages
@@ -208,6 +251,7 @@ pub fn chunk_fallback(
     Ok(chunks)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_chunks(
     node: Node<'_>,
     path: &RelativePath,
@@ -216,19 +260,25 @@ fn collect_chunks(
     content: &str,
     chunks: &mut Vec<Chunk>,
     kind_fn: fn(Node<'_>) -> Option<ChunkKind>,
+    name_fn: NameFn,
 ) -> Result<()> {
     if let Some(kind) = kind_fn(node) {
-        chunks.push(build_chunk(path, language, file_hash, content, node, kind)?);
+        chunks.push(build_chunk(
+            path, language, file_hash, content, node, kind, name_fn,
+        )?);
     }
 
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_chunks(child, path, language, file_hash, content, chunks, kind_fn)?;
+        collect_chunks(
+            child, path, language, file_hash, content, chunks, kind_fn, name_fn,
+        )?;
     }
 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_chunk(
     path: &RelativePath,
     language: Language,
@@ -236,6 +286,7 @@ fn build_chunk(
     content: &str,
     node: Node<'_>,
     kind: ChunkKind,
+    name_fn: NameFn,
 ) -> Result<Chunk> {
     // Rust doc-comments above a function/struct aren't inside the node, so
     // extend the start byte upward to capture them. Other grammars place
@@ -259,10 +310,7 @@ fn build_chunk(
         end: inclusive_end_line(content, start, end),
     };
 
-    let name = node
-        .child_by_field_name("name")
-        .and_then(|child| child.utf8_text(content.as_bytes()).ok())
-        .map(str::to_owned);
+    let name = name_fn(node, content);
 
     let chunk_content = content
         .get(start..end)
@@ -751,6 +799,176 @@ mod tests {
 
         let iface = chunks.iter().find(|c| c.kind == ChunkKind::Interface);
         assert!(iface.is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // C#
+    // -----------------------------------------------------------------------
+
+    fn csharp_chunks(source: &str) -> Vec<Chunk> {
+        MultiLanguageChunker::default()
+            .chunk(
+                &RelativePath::new("App.cs"),
+                Language::CSharp,
+                hash_for(source),
+                source,
+            )
+            .ok()
+            .unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn csharp_chunker_empty_returns_empty() {
+        assert!(csharp_chunks("").is_empty());
+    }
+
+    #[test]
+    fn csharp_chunker_extracts_class_and_method() {
+        let source = "public class User {\n    public void Rename(string name) {\n        Name = name;\n    }\n}\n";
+        let chunks = csharp_chunks(source);
+
+        let class_chunk = chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Class)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(class_chunk.name.as_deref(), Some("User"));
+
+        let method = chunks
+            .iter()
+            .find(|c| c.kind == ChunkKind::Method)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(method.name.as_deref(), Some("Rename"));
+    }
+
+    #[test]
+    fn csharp_chunker_extracts_interface_struct_enum() {
+        let source = "interface IRepo {\n    void Save();\n}\nstruct Point {\n    public int X;\n}\nenum Color { Red, Green }\n";
+        let chunks = csharp_chunks(source);
+
+        assert_eq!(
+            chunks
+                .iter()
+                .find(|c| c.kind == ChunkKind::Interface)
+                .and_then(|c| c.name.as_deref()),
+            Some("IRepo")
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .find(|c| c.kind == ChunkKind::Struct)
+                .and_then(|c| c.name.as_deref()),
+            Some("Point")
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .find(|c| c.kind == ChunkKind::Enum)
+                .and_then(|c| c.name.as_deref()),
+            Some("Color")
+        );
+    }
+
+    #[test]
+    fn csharp_chunker_block_namespace_is_module_file_scoped_is_skipped() {
+        let block = "namespace App.Services {\n    public class Svc {}\n}\n";
+        let module = csharp_chunks(block)
+            .into_iter()
+            .find(|c| c.kind == ChunkKind::Module)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(module.name.as_deref(), Some("App.Services"));
+
+        // File-scoped namespace has no body; it must not produce a chunk.
+        let file_scoped = "namespace App;\npublic class Svc {}\n";
+        assert!(
+            csharp_chunks(file_scoped)
+                .iter()
+                .all(|c| c.kind != ChunkKind::Module),
+            "file-scoped namespace must not be chunked"
+        );
+    }
+
+    #[test]
+    fn csharp_chunker_record_is_class_and_property_is_method() {
+        let source = "public record Money(decimal Amount);\npublic class Account {\n    public string Owner { get; set; }\n}\n";
+        let chunks = csharp_chunks(source);
+
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.kind == ChunkKind::Class && c.name.as_deref() == Some("Money")),
+            "record should chunk as Class"
+        );
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.kind == ChunkKind::Method && c.name.as_deref() == Some("Owner")),
+            "property should chunk as Method"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SQL
+    // -----------------------------------------------------------------------
+
+    fn sql_chunks(source: &str) -> Vec<Chunk> {
+        MultiLanguageChunker::default()
+            .chunk(
+                &RelativePath::new("schema.sql"),
+                Language::Sql,
+                hash_for(source),
+                source,
+            )
+            .ok()
+            .unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn sql_chunker_empty_returns_empty() {
+        assert!(sql_chunks("").is_empty());
+    }
+
+    #[test]
+    fn sql_chunker_extracts_table_with_qualified_name() {
+        let source =
+            "CREATE TABLE public.users (\n    id INT PRIMARY KEY,\n    email TEXT NOT NULL\n);\n";
+        let table = sql_chunks(source)
+            .into_iter()
+            .find(|c| c.kind == ChunkKind::Table)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(table.name.as_deref(), Some("public.users"));
+    }
+
+    #[test]
+    fn sql_chunker_extracts_view_and_function() {
+        // The function's qualified return type `app.amount` is a second
+        // `object_reference`; the name resolver must still pick the first (`add`).
+        let source = "CREATE VIEW active_users AS SELECT id FROM users WHERE active;\nCREATE FUNCTION add(a INT, b INT) RETURNS app.amount AS $$ SELECT a + b $$ LANGUAGE sql;\n";
+        let chunks = sql_chunks(source);
+
+        assert_eq!(
+            chunks
+                .iter()
+                .find(|c| c.kind == ChunkKind::View)
+                .and_then(|c| c.name.as_deref()),
+            Some("active_users")
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .find(|c| c.kind == ChunkKind::Function)
+                .and_then(|c| c.name.as_deref()),
+            Some("add")
+        );
+    }
+
+    #[test]
+    fn sql_chunker_extracts_trigger_name_not_table() {
+        let source = "CREATE TRIGGER audit_ins AFTER INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION log_change();\n";
+        let trigger = sql_chunks(source)
+            .into_iter()
+            .find(|c| c.kind == ChunkKind::Trigger)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(trigger.name.as_deref(), Some("audit_ins"));
     }
 
     // -----------------------------------------------------------------------

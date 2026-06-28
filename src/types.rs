@@ -152,6 +152,8 @@ pub enum Language {
     Java,
     C,
     Cpp,
+    CSharp,
+    Sql,
     Unknown,
 }
 
@@ -166,6 +168,8 @@ impl Language {
             "java" => Self::Java,
             "c" | "h" => Self::C,
             "cpp" | "cc" | "cxx" | "hpp" | "hxx" => Self::Cpp,
+            "cs" => Self::CSharp,
+            "sql" => Self::Sql,
             _ => Self::Unknown,
         }
     }
@@ -182,6 +186,8 @@ impl Language {
             "java" => Self::Java,
             "c" => Self::C,
             "cpp" => Self::Cpp,
+            "csharp" => Self::CSharp,
+            "sql" => Self::Sql,
             _ => Self::Unknown,
         }
     }
@@ -198,6 +204,8 @@ impl Language {
             "java" => Some(Self::Java),
             "c" => Some(Self::C),
             "cpp" | "c++" => Some(Self::Cpp),
+            "csharp" | "c#" | "cs" => Some(Self::CSharp),
+            "sql" => Some(Self::Sql),
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
@@ -213,6 +221,8 @@ impl Language {
             Self::Java => "java",
             Self::C => "c",
             Self::Cpp => "cpp",
+            Self::CSharp => "csharp",
+            Self::Sql => "sql",
             Self::Unknown => "unknown",
         }
     }
@@ -238,6 +248,9 @@ pub enum ChunkKind {
     Module,
     Impl,
     Macro,
+    Table,
+    View,
+    Trigger,
     Other,
 }
 
@@ -254,6 +267,9 @@ impl ChunkKind {
             Self::Module => "module",
             Self::Impl => "impl",
             Self::Macro => "macro",
+            Self::Table => "table",
+            Self::View => "view",
+            Self::Trigger => "trigger",
             Self::Other => "other",
         }
     }
@@ -272,6 +288,9 @@ impl ChunkKind {
             "module" => Self::Module,
             "impl" => Self::Impl,
             "macro" => Self::Macro,
+            "table" => Self::Table,
+            "view" => Self::View,
+            "trigger" => Self::Trigger,
             _ => Self::Other,
         }
     }
@@ -350,7 +369,26 @@ mod tests {
         assert_eq!(Language::from_extension("rs"), Language::Rust);
         assert_eq!(Language::from_extension("tsx"), Language::TypeScript);
         assert_eq!(Language::from_extension("hpp"), Language::Cpp);
+        assert_eq!(Language::from_extension("cs"), Language::CSharp);
+        assert_eq!(Language::from_extension("sql"), Language::Sql);
         assert_eq!(Language::from_extension("unknown"), Language::Unknown);
+    }
+
+    #[test]
+    fn csharp_and_sql_round_trip_through_storage_and_filters() {
+        for lang in [Language::CSharp, Language::Sql] {
+            assert_eq!(Language::from_storage(lang.as_str()), lang);
+        }
+        assert_eq!(Language::from_filter_input("c#"), Some(Language::CSharp));
+        assert_eq!(
+            Language::from_filter_input("csharp"),
+            Some(Language::CSharp)
+        );
+        assert_eq!(Language::from_filter_input("sql"), Some(Language::Sql));
+
+        for kind in [ChunkKind::Table, ChunkKind::View, ChunkKind::Trigger] {
+            assert_eq!(ChunkKind::from_storage(kind.as_str()), kind);
+        }
     }
 
     #[test]
