@@ -1,3 +1,5 @@
+use std::fs;
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{ClaudixError, RecoveryHint, Result};
@@ -128,9 +130,52 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
         .and_then(|value| value.checked_sub(719_468))
 }
 
+/// Last line starting with `error:` in a log file, if any. Scans from the end of a
+/// typically-small log (tens of KB). Surfaces a recorded failure (background index,
+/// binary download) without re-running the failed work. None when the log is missing
+/// or records no error.
+pub fn last_error_line(log_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(log_path).ok()?;
+    text.lines()
+        .rev()
+        .find(|line| line.starts_with("error:"))
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn last_error_line_returns_last_error_in_log() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let temp = temp.ok().unwrap_or_else(|| unreachable!());
+        let log = temp.path().join("install.log");
+        assert!(
+            fs::write(
+                &log,
+                "downloading claudix-linux-x86_64 v0.1.6\nok progress\nerror: checksum mismatch\n",
+            )
+            .is_ok()
+        );
+
+        assert_eq!(
+            last_error_line(&log),
+            Some("error: checksum mismatch".to_owned())
+        );
+    }
+
+    #[test]
+    fn last_error_line_none_when_no_error_or_missing() {
+        let temp = tempfile::tempdir();
+        assert!(temp.is_ok());
+        let temp = temp.ok().unwrap_or_else(|| unreachable!());
+        let log = temp.path().join("install.log");
+        assert!(fs::write(&log, "downloading...\ninstalled\n").is_ok());
+        assert_eq!(last_error_line(&log), None);
+        assert_eq!(last_error_line(&temp.path().join("missing.log")), None);
+    }
 
     #[test]
     fn format_and_parse_round_trip() {

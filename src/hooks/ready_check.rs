@@ -106,16 +106,11 @@ fn build_failed_response(project_root: &Path, config: &Config, event_name: &str)
     )
 }
 
-/// Last `error:` line a failed index appended to `index.log`, if any. Cheap: the
-/// log is one short line per file (tens of KB even for large repos). Benign
+/// Last `error:` line a failed index appended to `index.log`, if any. Benign
 /// progress lines (`indexed …`/`verified …`) are ignored so only a real error
-/// is surfaced.
+/// is surfaced. Delegates to the shared log scanner in `util`.
 fn last_index_error(log_path: &Path) -> Option<String> {
-    let text = fs::read_to_string(log_path).ok()?;
-    text.lines()
-        .rev()
-        .find(|line| line.starts_with("error:"))
-        .map(str::to_owned)
+    crate::util::last_error_line(log_path)
 }
 
 #[cfg(test)]

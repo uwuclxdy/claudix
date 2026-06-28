@@ -277,6 +277,16 @@ async fn run() -> Result<()> {
             if !output.index_present {
                 eprintln!("\nindex not built — run `claudix index` to index the repository.");
             }
+            if let Some(reason) = &output.install_error {
+                eprintln!("\nbinary install failed (recorded in install.log):");
+                eprintln!("  {reason}");
+                if let Some(path) = &output.install_log_path {
+                    eprintln!("  see {path}");
+                }
+                eprintln!(
+                    "Fix: check the release/network, then restart Claude Code to retry the download."
+                );
+            }
         }
         Command::Overview { path_prefix } => {
             let output = cli::run_overview(&project_root, path_prefix).await?;

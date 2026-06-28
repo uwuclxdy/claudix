@@ -164,6 +164,13 @@ pub struct DoctorOutput {
     /// Absolute path of the binary serving this command, so it is unambiguous
     /// which build is running (cargo vs. cached release) during development.
     pub binary_path: String,
+    /// Last `error:` line the node bootstrap recorded in install.log when a binary
+    /// download/verify failed, so a permanently-dead MCP has a visible cause instead
+    /// of failing silently across sessions. None when no install.log or no error.
+    pub install_error: Option<String>,
+    /// Absolute path to the bootstrap's install.log, if resolvable, for the agent
+    /// to open and inspect. None when `CLAUDE_PLUGIN_DATA` is unset (manual shell run).
+    pub install_log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -756,6 +763,11 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
         Err(error) => (false, false, Some(error.to_string())),
     };
 
+    let install_log = install_data_dir().map(|dir| dir.join("install.log"));
+    let install_error = install_log
+        .as_ref()
+        .and_then(|path| crate::util::last_error_line(path));
+
     Ok(DoctorOutput {
         project_root: project_root.display().to_string(),
         index_present: status.chunk_count > 0 || status.model.is_some(),
@@ -774,7 +786,28 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
         binary_path: std::env::current_exe()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "<unknown>".to_owned()),
+        install_error,
+        install_log_path: install_log.map(|path| path.display().to_string()),
     })
+}
+
+/// Resolve the claudix binary cache dir from the environment, mirroring
+/// `bin/claudix-bootstrap.js`'s resolution so `/doctor` reads the same
+/// `install.log` the bootstrap writes. `None` when no env hints a cache dir
+/// (e.g. `claudix doctor` run manually from a shell).
+fn install_data_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("CLAUDE_PLUGIN_DATA").map(PathBuf::from) {
+        return Some(dir);
+    }
+    if let Some(dir) = std::env::var_os("CLAUDIX_HOME").map(PathBuf::from) {
+        return Some(dir);
+    }
+    let base = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
+    let base = match base {
+        Some(base) => base,
+        None => dirs::home_dir()?.join(".local").join("share"),
+    };
+    Some(base.join("claudix"))
 }
 
 pub async fn run_clear_index(project_root: impl AsRef<Path>) -> Result<ClearOutput> {
