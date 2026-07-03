@@ -1,5 +1,8 @@
+mod c;
+mod cpp;
 mod csharp;
 mod go;
+mod java;
 mod python;
 mod rust;
 mod sql;
@@ -75,14 +78,9 @@ impl MultiLanguageChunker {
             Language::Go => go::chunk(path, file_hash, content),
             Language::CSharp => csharp::chunk(path, file_hash, content),
             Language::Sql => sql::chunk(path, file_hash, content),
-            Language::Java | Language::C | Language::Cpp => chunk_fallback(
-                path,
-                language,
-                file_hash,
-                content,
-                self.fallback_chunk_lines,
-                self.fallback_overlap_lines,
-            ),
+            Language::Java => java::chunk(path, file_hash, content),
+            Language::C => c::chunk(path, file_hash, content),
+            Language::Cpp => cpp::chunk(path, file_hash, content),
             Language::Unknown => Ok(Vec::new()),
         }
     }
@@ -388,8 +386,9 @@ mod tests {
     #[test]
     fn chunk_overlap_lines_only_affects_the_fallback_chunker() {
         // Tree-sitter languages chunk semantically and ignore the overlap param;
-        // only the sliding-window fallback (Java, C, C++, force-indexed unknown)
-        // honors it. Guards the README's "fallback chunks only" wording.
+        // only the sliding-window fallback (force-indexed files via
+        // `chunk_as_text`, unknown types) honors it. Guards the README's
+        // "fallback chunks only" wording.
         let no_overlap = MultiLanguageChunker::with_fallback_params(10, 0);
         let with_overlap = MultiLanguageChunker::with_fallback_params(10, 4);
 
@@ -408,20 +407,32 @@ mod tests {
             "tree-sitter chunk count must not change with overlap"
         );
 
-        let c = "int f() {}\n".repeat(30);
-        let c_no = no_overlap
-            .chunk(&RelativePath::new("t.c"), Language::C, hash_for(&c), &c)
+        // Force-indexed content routes through the sliding window, where overlap
+        // adds chunks.
+        let text = "line\n".repeat(30);
+        let text_no = no_overlap
+            .chunk_as_text(
+                &RelativePath::new("notes.txt"),
+                Language::Unknown,
+                hash_for(&text),
+                &text,
+            )
             .ok()
             .unwrap_or_else(|| unreachable!());
-        let c_ov = with_overlap
-            .chunk(&RelativePath::new("t.c"), Language::C, hash_for(&c), &c)
+        let text_ov = with_overlap
+            .chunk_as_text(
+                &RelativePath::new("notes.txt"),
+                Language::Unknown,
+                hash_for(&text),
+                &text,
+            )
             .ok()
             .unwrap_or_else(|| unreachable!());
         assert!(
-            c_ov.len() > c_no.len(),
+            text_ov.len() > text_no.len(),
             "fallback overlap must add chunks: no={}, ov={}",
-            c_no.len(),
-            c_ov.len()
+            text_no.len(),
+            text_ov.len()
         );
     }
 
@@ -1096,46 +1107,179 @@ mod tests {
         );
     }
 
-    #[test]
-    fn java_language_falls_back_to_sliding_window() {
-        let chunker = MultiLanguageChunker::default();
-        let source = "public class Hello {\n    public static void main(String[] args) {\n        System.out.println(\"Hello\");\n    }\n}\n";
+    // -----------------------------------------------------------------------
+    // Java
+    // -----------------------------------------------------------------------
 
-        let chunks = chunker
+    fn java_chunks(source: &str) -> Vec<Chunk> {
+        MultiLanguageChunker::default()
             .chunk(
-                &RelativePath::new("Hello.java"),
+                &RelativePath::new("App.java"),
                 Language::Java,
                 hash_for(source),
                 source,
             )
             .ok()
-            .unwrap_or_else(|| unreachable!());
+            .unwrap_or_else(|| unreachable!())
+    }
 
-        assert!(
-            !chunks.is_empty(),
-            "Java should fall back to sliding-window chunker"
-        );
-        assert_eq!(chunks[0].kind, ChunkKind::Other);
+    fn find_named(chunks: &[Chunk], kind: ChunkKind, name: &str) -> bool {
+        chunks
+            .iter()
+            .any(|c| c.kind == kind && c.name.as_deref() == Some(name))
     }
 
     #[test]
-    fn c_language_falls_back_to_sliding_window() {
-        let chunker = MultiLanguageChunker::default();
-        let source = "int add(int a, int b) { return a + b; }\n";
+    fn java_chunker_empty_returns_empty() {
+        assert!(java_chunks("").is_empty());
+    }
 
-        let chunks = chunker
+    #[test]
+    fn java_chunker_extracts_class_and_method() {
+        let source = "public class Hello {\n    public static void main(String[] args) {\n        System.out.println(\"Hello\");\n    }\n}\n";
+        let chunks = java_chunks(source);
+
+        assert!(
+            find_named(&chunks, ChunkKind::Class, "Hello"),
+            "class should be symbol-anchored, not a window"
+        );
+        assert!(find_named(&chunks, ChunkKind::Method, "main"));
+        assert!(
+            chunks.iter().all(|c| c.kind != ChunkKind::Other),
+            "no sliding-window fallback chunks expected"
+        );
+    }
+
+    #[test]
+    fn java_chunker_interface_enum_and_record() {
+        let source = "interface Greeter {\n    String greet();\n}\nenum Color { RED, GREEN }\npublic record Point(int x, int y) {}\n";
+        let chunks = java_chunks(source);
+
+        assert!(find_named(&chunks, ChunkKind::Interface, "Greeter"));
+        assert!(find_named(&chunks, ChunkKind::Enum, "Color"));
+        // A record is a class-like reference type.
+        assert!(find_named(&chunks, ChunkKind::Class, "Point"));
+    }
+
+    #[test]
+    fn java_chunker_extracts_nested_classes() {
+        // Inner types are the same node kinds inside a class body; the recursive
+        // walk must chunk both the outer and inner class plus their methods.
+        let source = "public class Outer {\n    private int value;\n    public class Inner {\n        public int get() { return value; }\n    }\n    public void run() {}\n}\n";
+        let chunks = java_chunks(source);
+
+        assert!(find_named(&chunks, ChunkKind::Class, "Outer"));
+        assert!(find_named(&chunks, ChunkKind::Class, "Inner"));
+        assert!(find_named(&chunks, ChunkKind::Method, "get"));
+        assert!(find_named(&chunks, ChunkKind::Method, "run"));
+    }
+
+    // -----------------------------------------------------------------------
+    // C
+    // -----------------------------------------------------------------------
+
+    fn c_chunks(source: &str) -> Vec<Chunk> {
+        MultiLanguageChunker::default()
             .chunk(
-                &RelativePath::new("math.c"),
+                &RelativePath::new("app.c"),
                 Language::C,
                 hash_for(source),
                 source,
             )
             .ok()
-            .unwrap_or_else(|| unreachable!());
+            .unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn c_chunker_empty_returns_empty() {
+        assert!(c_chunks("").is_empty());
+    }
+
+    #[test]
+    fn c_chunker_extracts_function_and_struct() {
+        let source = "struct Point {\n    int x;\n    int y;\n};\nint add(int a, int b) {\n    return a + b;\n}\n";
+        let chunks = c_chunks(source);
 
         assert!(
-            !chunks.is_empty(),
-            "C should fall back to sliding-window chunker"
+            find_named(&chunks, ChunkKind::Function, "add"),
+            "function name lives in a nested declarator, must still resolve"
+        );
+        assert!(find_named(&chunks, ChunkKind::Struct, "Point"));
+        assert!(chunks.iter().all(|c| c.kind != ChunkKind::Other));
+    }
+
+    #[test]
+    fn c_chunker_pointer_return_function_name_resolves() {
+        // The name sits under a `pointer_declarator`, one level deeper.
+        let source = "char *dup(const char *s) {\n    return 0;\n}\n";
+        assert!(find_named(&c_chunks(source), ChunkKind::Function, "dup"));
+    }
+
+    #[test]
+    fn c_chunker_handles_preprocessor_heavy_source() {
+        // Macros, includes and #ifdef guards must not derail symbol anchoring:
+        // the guarded struct and the function still chunk, and macros chunk too.
+        let source = "#include <stdio.h>\n#define MAX 100\n#define SQUARE(x) ((x) * (x))\n\n#ifdef FEATURE\nstruct Config {\n    int level;\n};\n#endif\n\nint compute(int n) {\n    return SQUARE(n) + MAX;\n}\n";
+        let chunks = c_chunks(source);
+
+        assert!(find_named(&chunks, ChunkKind::Function, "compute"));
+        assert!(
+            find_named(&chunks, ChunkKind::Struct, "Config"),
+            "struct inside #ifdef must still be chunked"
+        );
+        assert!(find_named(&chunks, ChunkKind::Macro, "SQUARE"));
+        assert!(find_named(&chunks, ChunkKind::Macro, "MAX"));
+    }
+
+    // -----------------------------------------------------------------------
+    // C++
+    // -----------------------------------------------------------------------
+
+    fn cpp_chunks(source: &str) -> Vec<Chunk> {
+        MultiLanguageChunker::default()
+            .chunk(
+                &RelativePath::new("app.cpp"),
+                Language::Cpp,
+                hash_for(source),
+                source,
+            )
+            .ok()
+            .unwrap_or_else(|| unreachable!())
+    }
+
+    #[test]
+    fn cpp_chunker_empty_returns_empty() {
+        assert!(cpp_chunks("").is_empty());
+    }
+
+    #[test]
+    fn cpp_chunker_class_with_inline_method() {
+        let source = "class Widget {\npublic:\n    void draw() {}\n};\nvoid render() {}\n";
+        let chunks = cpp_chunks(source);
+
+        assert!(find_named(&chunks, ChunkKind::Class, "Widget"));
+        // Inline member function is a method; the free function is a function.
+        assert!(find_named(&chunks, ChunkKind::Method, "draw"));
+        assert!(find_named(&chunks, ChunkKind::Function, "render"));
+        assert!(chunks.iter().all(|c| c.kind != ChunkKind::Other));
+    }
+
+    #[test]
+    fn cpp_chunker_handles_templates_and_namespaces() {
+        // Templates wrap the class/function node and namespaces nest them; the
+        // walk must still reach every symbol with its name and kind.
+        let source = "namespace geo {\ntemplate <typename T>\nclass Point {\npublic:\n    T norm() const { return T(); }\n};\n\ntemplate <typename T>\nT dot(Point<T> a, Point<T> b) { return T(); }\n}\n";
+        let chunks = cpp_chunks(source);
+
+        assert!(find_named(&chunks, ChunkKind::Module, "geo"));
+        assert!(find_named(&chunks, ChunkKind::Class, "Point"));
+        assert!(
+            find_named(&chunks, ChunkKind::Method, "norm"),
+            "templated member function must chunk as a method"
+        );
+        assert!(
+            find_named(&chunks, ChunkKind::Function, "dot"),
+            "templated free function must chunk as a function"
         );
     }
 }
