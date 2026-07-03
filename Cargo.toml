@@ -2,7 +2,7 @@
 name = "claudix"
 version = "0.1.6"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 description = "Local semantic search plugin for Claude Code"
 homepage = "https://github.com/uwuclxdy/claudix"
 repository = "https://github.com/uwuclxdy/claudix"
