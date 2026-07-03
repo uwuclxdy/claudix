@@ -78,7 +78,7 @@ timeout_ms = 30000
 respect_gitignore = true            # set false to also index gitignored files
 follow_symlinks = false
 max_file_size_kb = 512              # skip files larger than this
-chunk_overlap_lines = 5             # overlap for fallback chunks only (Java, C, C++, unknown)
+chunk_overlap_lines = 5             # overlap for fallback chunks only (force-indexed & unknown file types)
 reindex_after_hours = 24            # background reindex interval
 
 [search]
