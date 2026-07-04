@@ -1,0 +1,18 @@
+# claudix supply-chain policy for cargo-audit.
+# cargo.sh runs bare `cargo audit`, which auto-discovers this file.
+
+[advisories]
+ignore = [
+    # DoS-only quick-xml reader bugs (NsReader namespace-decl allocation,
+    # quadratic duplicate-attribute check). Both require attacker-controlled
+    # XML fed to the parser.
+    #
+    # quick-xml reaches claudix only through
+    #   lancedb -> lance-testing -> pprof -> inferno -> quick-xml
+    # where inferno writes flamegraph SVGs and never ingests untrusted XML,
+    # and claudix itself has no XML parsing. lance-testing is a test-utility
+    # crate leaking into lancedb's runtime dep graph; it can't be dropped or
+    # bumped until a lancedb release past 0.31.0. Revisit on the next lancedb bump.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
