@@ -5,7 +5,7 @@ use std::sync::Arc;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, Implementation, JsonObject, ListToolsResult, PaginatedRequestParams,
+    CallToolResult, ContentBlock, Implementation, JsonObject, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
@@ -274,7 +274,7 @@ fn error_result(error: ClaudixError) -> CallToolResult {
         Some(recovery) => format!("{message}. Recovery: {recovery}"),
         None => message,
     };
-    CallToolResult::error(vec![Content::text(text)])
+    CallToolResult::error(vec![ContentBlock::text(text)])
 }
 
 #[cfg(test)]

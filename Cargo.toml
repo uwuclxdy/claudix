@@ -107,7 +107,7 @@ async-trait = "0.1.89"
 # handlers — the lancedb/moka search pipeline holds `!Send` state across awaits,
 # so the service is driven single-threaded inside a `LocalSet` (fine for one
 # stdio client); handlers still use the multi-thread runtime for spawn_blocking.
-rmcp = { version = "1.8.0", features = ["server", "macros", "transport-io", "schemars", "local"] }
+rmcp = { version = "2.1", features = ["server", "macros", "transport-io", "schemars", "local"] }
 schemars = "1"
 
 [dev-dependencies]
