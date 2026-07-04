@@ -415,19 +415,30 @@ async fn run_hook_command(project_root: &std::path::Path, event: hooks::HookEven
     let project_root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.to_path_buf());
-    let handle = tokio::spawn(async move { hooks::run(&project_root, event, &payload).await });
-
     // Hooks must fail open: a stalled handler (slow store on NFS, a slow embed,
     // a poisoned mutex) is as fatal to the session as a panic, because the host
     // waits on the hook. Cap the whole handler with an outer budget consistent
     // with PreToolUse's internal one, but generous enough that the legitimate
     // background-spawn paths (which return promptly) never trip it. On elapse we
-    // emit no JSON and exit normally — the session continues.
-    let outcome = tokio::time::timeout(
-        std::time::Duration::from_millis(HOOK_COMMAND_TIMEOUT_MS),
-        handle,
-    )
-    .await;
+    // emit no JSON and exit normally; the session continues.
+    //
+    // The hook body calls into the same lancedb/moka search pipeline the MCP
+    // driver serves. That pipeline is `!Send` since lancedb 0.31's uring-reader
+    // cache, so run it on a `LocalSet` like the MCP driver. `spawn_local` still
+    // yields a `JoinError` on panic, preserving the fail-open contract below.
+    let local = tokio::task::LocalSet::new();
+    let outcome = local
+        .run_until(async move {
+            let handle = tokio::task::spawn_local(async move {
+                hooks::run(&project_root, event, &payload).await
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_millis(HOOK_COMMAND_TIMEOUT_MS),
+                handle,
+            )
+            .await
+        })
+        .await;
 
     match outcome {
         Ok(Ok(Ok(Some(response)))) => {

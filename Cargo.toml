@@ -52,9 +52,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 reqwest = { version = "0.13.4", features = ["json", "rustls", "stream"] }
 
 # LanceDB for storage and FTS
-lancedb = "0.30.0"
-# arrow MUST match the major lancedb/lance re-export (0.30 -> arrow 58); a newer
-# arrow here splits the tree into two majors that don't interop at the lancedb boundary.
+lancedb = "0.31.0"
+# arrow MUST match the major lancedb/lance re-export (lancedb 0.31 still re-exports
+# arrow 58; a newer arrow here splits the tree into two majors that don't interop
+# at the lancedb boundary).
 arrow = { version = "58.3.0", features = ["prettyprint"] }
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
