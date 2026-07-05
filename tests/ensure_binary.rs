@@ -7,6 +7,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 fn bootstrap_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -131,6 +132,53 @@ fn run_install(
         .env("CLAUDE_PLUGIN_DATA", home.join("cache"))
         .env("CLAUDIX_LOCAL_BIN", local_bin)
         .env("CLAUDIX_PLATFORM_OVERRIDE", "linux-x86_64")
+        .output();
+    assert!(output.is_ok());
+    output.ok().unwrap_or_else(|| unreachable!())
+}
+
+/// Local fake release server. Serves `claudix-linux-x86_64` with HTTP 404 for the
+/// first `miss` requests, then the stub bytes; always serves a matching SHA256SUMS.
+/// node argv: [2]=binary path, [3]=miss count, [4]=port file ([0]=exe, [1]=script).
+const SERVER_SRC: &str = r#"const http=require('http'),crypto=require('crypto'),fs=require('fs');
+const bin=fs.readFileSync(process.argv[2]);
+const miss=parseInt(process.argv[3],10);
+const sum=crypto.createHash('sha256').update(bin).digest('hex');
+let n=0;
+const srv=http.createServer((q,r)=>{
+  const u=q.url||'';
+  if(u.endsWith('/claudix-linux-x86_64')){
+    if(n<miss){n++;r.statusCode=404;r.end('nope');return;}
+    r.end(bin);
+  }else if(u.endsWith('/SHA256SUMS')){r.end(sum+'  claudix-linux-x86_64\n');}
+  else{r.statusCode=404;r.end();}
+});
+srv.listen(0,'127.0.0.1',()=>fs.writeFileSync(process.argv[4],String(srv.address().port)));
+"#;
+
+/// `run_install` pointed at a fake release URL with a short retry interval so the
+/// bootstrap's transient-failure retry is exercised, not the real 3 min default.
+fn run_install_from(
+    home: &Path,
+    project_dir: &Path,
+    cargo_home: &Path,
+    plugin_root: &Path,
+    local_bin: &Path,
+    base_url: &str,
+) -> Output {
+    let output = Command::new("node")
+        .arg(bootstrap_path())
+        .arg("--install")
+        .env("HOME", home)
+        .env("CLAUDE_PROJECT_DIR", project_dir)
+        .env("CARGO_HOME", cargo_home)
+        .env("CLAUDE_PLUGIN_ROOT", plugin_root)
+        .env("CLAUDE_PLUGIN_DATA", home.join("cache"))
+        .env("CLAUDIX_LOCAL_BIN", local_bin)
+        .env("CLAUDIX_PLATFORM_OVERRIDE", "linux-x86_64")
+        .env("CLAUDIX_RELEASE_BASE_URL", base_url)
+        .env("CLAUDIX_RELEASE_WAIT_MS", "10000")
+        .env("CLAUDIX_RELEASE_RETRY_MS", "200")
         .output();
     assert!(output.is_ok());
     output.ok().unwrap_or_else(|| unreachable!())
@@ -372,6 +420,75 @@ fn install_leaves_intentional_cargo_binary_in_place() {
         stderr_of(&output).contains("left in place"),
         "expected left-in-place warning, stderr: {}",
         stderr_of(&output)
+    );
+}
+
+#[test]
+fn install_retries_until_release_asset_publishes() {
+    if !node_available() {
+        return;
+    }
+    let temp = temp_dir();
+    let home = temp.path().join("home");
+    let project = temp.path().join("project");
+    let cargo_home = temp.path().join("cargo");
+    let plugin_root = temp.path().join("plugin");
+    let local_bin = temp.path().join("bin");
+    let version = committed_plugin_version().expect("committed plugin.json version");
+    assert!(fs::create_dir_all(&project).is_ok());
+    write_manifest(&plugin_root, &version);
+
+    // stub binary the fake release serves; the server hashes the same bytes.
+    let bin_path = temp.path().join("stub-bin");
+    write_executable(&bin_path, "#!/bin/sh\nexit 0\n");
+    let port_file = temp.path().join("port");
+    let server_js = temp.path().join("server.js");
+    assert!(fs::write(&server_js, SERVER_SRC).is_ok());
+
+    let mut server = Command::new("node")
+        .arg(&server_js)
+        .arg(&bin_path)
+        .arg("2")
+        .arg(&port_file)
+        .spawn()
+        .expect("node spawn");
+    let started = Instant::now();
+    let port = loop {
+        if let Ok(s) = fs::read_to_string(&port_file) {
+            if let Ok(p) = s.trim().parse::<u16>() {
+                break p;
+            }
+        }
+        if Instant::now().duration_since(started) > Duration::from_secs(3) {
+            let _ = server.kill();
+            panic!("fake release server did not bind");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let base = format!("http://127.0.0.1:{port}");
+    let output = run_install_from(
+        &home,
+        &project,
+        &cargo_home,
+        &plugin_root,
+        &local_bin,
+        &base,
+    );
+    let _ = server.kill();
+    assert!(
+        output.status.success(),
+        "expected retry-then-success, stderr: {}",
+        stderr_of(&output)
+    );
+
+    let cached = home
+        .join("cache")
+        .join("bin")
+        .join(format!("claudix-v{version}-linux-x86_64"));
+    assert!(
+        cached.exists(),
+        "cached release binary missing after install"
     );
 }
 
