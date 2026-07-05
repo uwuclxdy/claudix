@@ -25,7 +25,6 @@ const crypto = require('crypto');
 const https = require('https');
 const http = require('http');
 const { spawn } = require('child_process');
-const { pipeline } = require('stream');
 
 const PLUGIN_NAME = 'claudix';
 const GITHUB_REPO = process.env.CLAUDIX_GITHUB_REPO || 'uwuclxdy/claudix';
@@ -181,7 +180,7 @@ async function resolveDevBinary() {
 // --- download + verify ---
 async function sha256File(p) {
   const h = crypto.createHash('sha256');
-  await pipeline(fs.createReadStream(p), h);
+  for await (const chunk of fs.createReadStream(p)) h.update(chunk);
   return h.digest('hex');
 }
 function fetchFile(url, dest) {
