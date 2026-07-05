@@ -83,6 +83,34 @@ fn write_manifest(plugin_root: &Path, version: &str) {
     assert!(fs::write(dir.join("plugin.json"), body).is_ok());
 }
 
+fn manifest_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// The version the bootstrap will actually request. Bootstrap ignores the temp
+/// plugin root the test sets (no `bin/claudix-bootstrap.js` under it) and reads the
+/// committed manifest instead, so the test stub's version is not what gets fetched.
+fn committed_plugin_version() -> Option<String> {
+    let plugin_json = manifest_dir()
+        .join(".claude-plugin")
+        .join("plugin.json")
+        .to_string_lossy()
+        .into_owned();
+    let out = Command::new("node")
+        .args([
+            "-e",
+            "console.log(require(process.argv[1]).version)",
+            &plugin_json,
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() { None } else { Some(v) }
+}
+
 /// Run `node claudix-bootstrap.js --install` with an isolated HOME, plugin root, cargo
 /// home, and symlink dir so the real environment is never touched. Forces a
 /// deterministic platform so the cached-binary path is stable on any unix host.
@@ -261,14 +289,18 @@ fn install_relinks_cached_binary_on_fast_path() {
     let local_bin = temp.path().join("bin");
     assert!(fs::create_dir_all(&project).is_ok());
 
-    write_manifest(&plugin_root, "0.1.6");
+    // bootstrap ignores the temp plugin root (no `bin/claudix-bootstrap.js` under
+    // it) and reads the committed manifest, so the cache file must match that
+    // version or this turns into a download instead of a fast-path hit.
+    let version = committed_plugin_version().expect("committed plugin.json version");
+    write_manifest(&plugin_root, &version);
 
     // a cached release binary for the wanted version + platform — the fast-path
     // hit. `--install` must repoint the symlink even when nothing is downloaded.
     let cache_bin = home
         .join("cache")
         .join("bin")
-        .join("claudix-v0.1.6-linux-x86_64");
+        .join(format!("claudix-v{version}-linux-x86_64"));
     write_executable(&cache_bin, "#!/bin/sh\nexit 0\n");
 
     let output = run_install(&home, &project, &cargo_home, &plugin_root, &local_bin);
@@ -306,13 +338,14 @@ fn install_leaves_intentional_cargo_binary_in_place() {
     let local_bin = temp.path().join("bin");
     assert!(fs::create_dir_all(&project).is_ok());
 
-    write_manifest(&plugin_root, "0.1.6");
+    let version = committed_plugin_version().expect("committed plugin.json version");
+    write_manifest(&plugin_root, &version);
 
     // cached release binary for the wanted version — release wins on the fast path.
     let cache_bin = home
         .join("cache")
         .join("bin")
-        .join("claudix-v0.1.6-linux-x86_64");
+        .join(format!("claudix-v{version}-linux-x86_64"));
     write_executable(&cache_bin, "#!/bin/sh\nexit 0\n");
 
     // a cargo-installed claudix at a different version — intentionally installed,
