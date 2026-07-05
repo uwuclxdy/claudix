@@ -92,6 +92,8 @@ cross_repos = []                    # extra already-indexed repo paths to search
 [hooks]
 intercept_grep = true               # replace grep with semantic search when useful
 auto_reembed_on_edit = true         # re-embed after Write/Edit
+reindex_debounce_secs = 10          # watch=false: coalesce rapid edits, reindex after N idle secs
+reindex_max_wait_secs = 60          # hard cap so a continuously-edited file still reindexes
 auto_index_on_session_start = true  # background reindex check on session start
 surface_related_on_edit = true      # surface semantically related files after an edit
 surface_related_on_read = false     # surface related files after a ranged Read (opt-in)
