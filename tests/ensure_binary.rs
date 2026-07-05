@@ -555,3 +555,34 @@ fn bootstrap_source_never_corrupts_mcp_stdio() {
         "bootstrap reads process.stdin (MCP handshake corruption risk)"
     );
 }
+
+#[test]
+fn dll_not_found_exit_maps_to_vcredist_hint() {
+    // The windows loader kills the MSVC-built binary with 0xC0000135
+    // (STATUS_DLL_NOT_FOUND) before `main` when the VC++ redistributable is absent.
+    // That spawn path is windows-only, so unit-test the pure decision by requiring
+    // the bootstrap as a module (require.main guard keeps main() from running).
+    if !node_available() {
+        return;
+    }
+    let bootstrap = bootstrap_path().to_string_lossy().into_owned();
+    // The code arrives unsigned (0xC0000135) or as its signed int32 form; a normal
+    // exit (0) or any other non-zero must NOT be read as the loader failure.
+    let script = "const {dllNotFoundHint}=require(process.argv[1]);\
+                  const u=dllNotFoundHint(0xc0000135), s=dllNotFoundHint(0xc0000135-0x100000000);\
+                  if(!u||!/vc_redist\\.x64\\.exe/.test(u))process.exit(11);\
+                  if(!s||!/vc_redist\\.x64\\.exe/.test(s))process.exit(12);\
+                  if(dllNotFoundHint(0)!==null)process.exit(13);\
+                  if(dllNotFoundHint(1)!==null)process.exit(14);\
+                  process.exit(0);";
+    let output = Command::new("node")
+        .args(["-e", script, &bootstrap])
+        .output()
+        .expect("node spawn");
+    assert!(
+        output.status.success(),
+        "dllNotFoundHint mapping wrong (exit {:?}): {}",
+        output.status.code(),
+        stderr_of(&output)
+    );
+}

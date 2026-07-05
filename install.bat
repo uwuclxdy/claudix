@@ -33,6 +33,14 @@ if errorlevel 1 (
     goto :done
 )
 
+REM The MSVC-built binary needs the Visual C++ 2015-2022 x64 runtime to load; a
+REM stock Windows box may lack it, giving a silent 0xC0000135 at launch. Warn early.
+if not exist "%SystemRoot%\System32\vcruntime140.dll" (
+    echo claudix: Visual C++ 2015-2022 x64 redistributable not detected.
+    echo   the claudix binary needs it to run. install it from:
+    echo   https://aka.ms/vs/17/release/vc_redist.x64.exe
+)
+
 REM Prime the binary cache from the local checkout so the first session
 REM does not stall on download.
 set "SCRIPT_DIR=%~dp0"

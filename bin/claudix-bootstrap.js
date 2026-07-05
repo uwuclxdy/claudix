@@ -31,6 +31,10 @@ const GITHUB_REPO = process.env.CLAUDIX_GITHUB_REPO || 'uwuclxdy/claudix';
 const PREBUILT = new Set(['linux-x86_64', 'darwin-aarch64', 'windows-x86_64']);
 const GC_KEEP = 2;
 const MAX_REDIRECTS = 5;
+// windows loader failure STATUS_DLL_NOT_FOUND: the MSVC-built binary can't find a
+// required system DLL, almost always the VC++ 2015-2022 runtime a stock windows box
+// lacks. node surfaces the code as this unsigned value or its signed int32 form.
+const STATUS_DLL_NOT_FOUND = 0xc0000135;
 // a freshly tagged release's binary asset isn't uploaded until release.yml finishes
 // building; retry transient failures so an install in that window doesn't hard-fail.
 const RELEASE_WAIT_MS = parseInt(process.env.CLAUDIX_RELEASE_WAIT_MS || '180000', 10);
@@ -491,6 +495,16 @@ async function cleanupStale() {
   }
 }
 
+// a windows loader DLL-not-found exit dies before main(), so the bootstrap is the
+// only layer that can diagnose it. map it to an actionable redistributable hint.
+function dllNotFoundHint(code) {
+  if (code !== STATUS_DLL_NOT_FOUND && code !== STATUS_DLL_NOT_FOUND - 0x100000000) return null;
+  return (
+    'windows binary failed to load (0xC0000135, missing system DLL); install the ' +
+    'Visual C++ 2015-2022 x64 redistributable: https://aka.ms/vs/17/release/vc_redist.x64.exe'
+  );
+}
+
 // --- spawn the resolved native binary with the caller's args ---
 function spawnNative(binary, forwardArgs, hook) {
   const child = spawn(binary, forwardArgs, {
@@ -508,6 +522,15 @@ function spawnNative(binary, forwardArgs, hook) {
   });
   child.on('error', () => process.exit(hook ? 0 : 1));
   child.on('exit', (code) => {
+    const hint = dllNotFoundHint(code);
+    if (hint) {
+      log(hint);
+      try {
+        fs.appendFileSync(INSTALL_LOG, 'error: ' + hint + '\n');
+      } catch {
+        /* install.log is best-effort */
+      }
+    }
     // hooks ALWAYS succeed (fail-open); mcp propagates the native exit code
     process.exit(hook ? 0 : code == null ? 1 : code);
   });
@@ -610,6 +633,11 @@ function failTop(err) {
   }
   process.exit(isHook ? 0 : 1);
 }
-process.on('uncaughtException', failTop);
-process.on('unhandledRejection', failTop);
-main().catch(failTop);
+// requiring this file (tests) must not run main(); expose the pure helper instead.
+if (require.main === module) {
+  process.on('uncaughtException', failTop);
+  process.on('unhandledRejection', failTop);
+  main().catch(failTop);
+} else {
+  module.exports = { dllNotFoundHint };
+}
