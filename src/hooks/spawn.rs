@@ -141,11 +141,37 @@ pub(super) fn spawn_background_watch(project_root: &Path, config: &Config) -> bo
     true
 }
 
-pub(super) fn spawn_background_reindex_file(project_root: &Path, file_path: &str) {
-    spawn_detached_claudix(
-        project_root,
-        [OsStr::new("reindex-file"), OsStr::new(file_path)],
-    );
+/// Ensure the single no-watcher reindex drain worker is running.
+///
+/// Mirrors [`spawn_background_watch`] but claims the DRAIN marker and spawns the
+/// internal `drain-reindex-queue` subcommand. Claim-or-skip: safe to call after
+/// every enqueue — it no-ops when a worker already owns the marker. Returns
+/// `false` (and cleans up the marker) when already claimed or the spawn fails.
+pub(super) fn spawn_background_drain_worker(project_root: &Path, config: &Config) -> bool {
+    if config.watch || !config.hooks.auto_reembed_on_edit {
+        return false;
+    }
+    let Ok(store) = Store::new(project_root, config) else {
+        return false;
+    };
+    if store.ensure_layout().is_err() {
+        return false;
+    }
+    let marker_path = store.reindex_drain_marker_path();
+    let stale_after = Duration::from_secs(WATCH_MARKER_STALE_SECS);
+    if crate::store::marker::try_claim(&marker_path, stale_after).is_err() {
+        return false;
+    }
+
+    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("drain-reindex-queue")])
+    else {
+        let _ = fs::remove_file(&marker_path);
+        return false;
+    };
+    // Replace our (parent) pid with the spawned child PID so concurrent hooks
+    // see the worker as live before the child finishes booting.
+    let _ = fs::write(&marker_path, child_pid.to_string());
+    true
 }
 
 #[cfg(unix)]
@@ -264,6 +290,29 @@ mod tests {
                 Duration::from_secs(WATCH_MARKER_STALE_SECS)
             ),
             "watch marker with dead PID must be reclaimable"
+        );
+    }
+
+    #[test]
+    fn drain_marker_with_dead_pid_is_reclaimable() {
+        // A crashed drain worker leaves a dead pid in the drain marker; the next
+        // edit's claim must reclaim it so a burst never gets stuck without a
+        // worker.
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let store = crate::store::Store::new(dir.path(), &Config::default())
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        let marker_path = store.reindex_drain_marker_path();
+        assert!(store.ensure_layout().is_ok());
+        fs::write(&marker_path, "9999999\n").unwrap_or_else(|_| unreachable!());
+
+        let marker = crate::store::marker::PidMarker::install(marker_path.clone());
+        assert!(marker.is_ok(), "dead-pid drain marker must be reclaimable");
+        let stored = fs::read_to_string(&marker_path).ok();
+        assert_eq!(
+            stored.as_deref().map(str::trim),
+            Some(std::process::id().to_string().as_str()),
+            "reclaiming worker must own the marker"
         );
     }
 

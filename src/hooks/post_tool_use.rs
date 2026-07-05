@@ -14,8 +14,9 @@ use crate::types::RelativePath;
 
 use super::payload::{HookPayload, ToolInput};
 use super::ready_check::check_index_ready;
-use super::spawn::spawn_background_reindex_file;
+use super::spawn::spawn_background_drain_worker;
 use crate::store::marker::WATCH_MARKER_STALE_SECS;
+use crate::store::marker::reindex_queue;
 
 /// Fail-open budget for the read-time surfacing load + cosine scan. The `Read`
 /// hook must not stall the session, so the whole-corpus read and O(n²) scan are
@@ -44,13 +45,17 @@ pub(super) async fn handle_post_tool_use(
         return Ok(None);
     }
 
-    // Spawn a background reindex only when an edit tool fired on a real file.
-    // The ready-check and neighbor-surfacing runs on every PostToolUse event
-    // regardless of whether a spawn happened.
+    // Coalesce the no-watcher reindex path. The ready-check and
+    // neighbor-surfacing run on every PostToolUse event regardless.
     //
-    // Multi-file payloads (MultiEdit-style tools) may carry `files_modified`
-    // in addition to or instead of `file_path`. Collect all distinct paths,
-    // dedupe, and spawn one reindex per watchable file.
+    // Multi-file payloads (MultiEdit-style tools) may carry `files_modified` in
+    // addition to or instead of `file_path`. Collect all distinct paths, dedupe,
+    // and append each watchable file to the on-disk reindex queue, then ensure a
+    // single drain worker owns the debounce loop. Rapid edits to the same file
+    // pile up as queue lines that collapse to one reindex.
+    //
+    // When the live watcher owns reindexing (`watcher_alive`) or auto-reembed is
+    // off, this whole branch is skipped and nothing touches the queue.
     let read_input = if let Some(name) = tool_name
         && matches!(name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
         && let Some(cfg) = config.as_ref()
@@ -58,16 +63,11 @@ pub(super) async fn handle_post_tool_use(
         && !watcher_alive(project_root, cfg)
         && let Some(input) = payload.tool_input.as_ref()
     {
-        let paths = reindex_paths_from_input(project_root, input);
-        let spawned = paths
-            .iter()
-            .filter(|p| reindex_target_is_watchable(project_root, p))
-            .inspect(|p| spawn_background_reindex_file(project_root, p))
-            .count();
-        // Preserve tool_input for read-surfacing only when nothing was spawned
-        // (no watchable paths found). When we did spawn, pass None so the
-        // read-surfacing branch correctly skips (it only acts on Read events).
-        if spawned > 0 {
+        let enqueued = enqueue_watchable_edits(project_root, cfg, input);
+        // Append-before-ensure-worker: the worker must see the entry when it
+        // reads the queue. Claim-or-skip, so calling it every time is safe.
+        if enqueued > 0 {
+            spawn_background_drain_worker(project_root, cfg);
             None
         } else {
             payload.tool_input
@@ -409,6 +409,30 @@ fn reindex_target_is_watchable(project_root: &Path, file_path: &str) -> bool {
     }
 }
 
+/// Append every watchable edited path to the reindex queue, returning how many
+/// were enqueued. Fail-open: a store/layout/append failure enqueues fewer (or
+/// none) — the miss is caught by the next edit to that file or a manifest-age
+/// full reindex — and never breaks the hook.
+///
+/// Paths are keyed on their canonical project-relative spelling (via
+/// [`canonical_dedup_key`]) so the same file arriving as an absolute path in one
+/// edit and a project-relative path in another coalesces to a single queue path,
+/// and the drain worker's `reindex_file` consumes the relative spelling directly.
+fn enqueue_watchable_edits(project_root: &Path, config: &Config, input: &ToolInput) -> usize {
+    let Ok(store) = Store::new(project_root, config) else {
+        return 0;
+    };
+    if store.ensure_layout().is_err() {
+        return 0;
+    }
+    let queue_path = store.reindex_queue_path();
+    reindex_paths_from_input(project_root, input)
+        .into_iter()
+        .filter(|p| reindex_target_is_watchable(project_root, p))
+        .filter(|p| reindex_queue::append(&queue_path, &canonical_dedup_key(project_root, p)))
+        .count()
+}
+
 /// Collect the distinct file paths that a tool input targets for reindexing.
 ///
 /// Merges `file_path`, `notebook_path`, and the `files_modified` list (for
@@ -571,11 +595,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn post_tool_use_spawns_background_reindex_and_returns_none() {
+    async fn post_tool_use_enqueues_reindex_and_returns_none() {
         let fixture = TestFixture::new("small_rust");
         assert!(fixture.is_ok());
         let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        write_config(fixture.root(), &stub_config());
+        let config = stub_config();
+        write_config(fixture.root(), &config);
 
         let payload = json!({
             "tool_name": "Write",
@@ -586,6 +611,42 @@ mod tests {
         let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
         assert!(response.is_ok());
         assert!(response.ok().unwrap_or_else(|| unreachable!()).is_none());
+
+        // The edited file must land in the queue under its project-relative
+        // spelling, ready for the drain worker.
+        let store = Store::new(fixture.root(), &config).unwrap_or_else(|_| unreachable!());
+        let entries =
+            reindex_queue::parse_entries(&reindex_queue::read_content(&store.reindex_queue_path()));
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(paths, vec!["src/math.rs"]);
+    }
+
+    #[tokio::test]
+    async fn repeated_edits_coalesce_to_one_queue_path() {
+        let fixture = TestFixture::new("small_rust").unwrap_or_else(|_| unreachable!());
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+
+        let payload = json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/math.rs") }
+        });
+        // Three rapid edits to the same file.
+        for _ in 0..3 {
+            let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
+            assert!(response.is_ok());
+        }
+
+        let store = Store::new(fixture.root(), &config).unwrap_or_else(|_| unreachable!());
+        let entries =
+            reindex_queue::parse_entries(&reindex_queue::read_content(&store.reindex_queue_path()));
+        let windows = reindex_queue::collapse(&entries);
+        assert_eq!(
+            windows.len(),
+            1,
+            "three edits of one file must collapse to a single queued reindex"
+        );
+        assert!(windows.contains_key("src/math.rs"));
     }
 
     #[test]
@@ -664,6 +725,37 @@ mod tests {
         let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await;
         assert!(response.is_ok());
         assert!(response.ok().unwrap_or_else(|| unreachable!()).is_none());
+
+        // auto_reembed_on_edit = false must not touch the queue at all.
+        let store = Store::new(fixture.root(), &config).unwrap_or_else(|_| unreachable!());
+        assert!(
+            reindex_queue::read_content(&store.reindex_queue_path()).is_empty(),
+            "disabled auto-reembed must enqueue nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_alive_bypasses_the_queue() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+        // A live watch marker (our own pid) means the watcher owns reindexing;
+        // the hook must not append to the queue.
+        fs::write(store.watch_marker_path(), std::process::id().to_string())?;
+
+        let payload = json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/math.rs") }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(response.is_none());
+        assert!(
+            reindex_queue::read_content(&store.reindex_queue_path()).is_empty(),
+            "a live watcher must bypass the queue entirely"
+        );
+        Ok(())
     }
 
     #[tokio::test]

@@ -92,6 +92,10 @@ pub struct PartialHooksConfig {
     pub related_top_k: Option<usize>,
     #[serde(default)]
     pub related_min_similarity: Option<f32>,
+    #[serde(default)]
+    pub reindex_debounce_secs: Option<u64>,
+    #[serde(default)]
+    pub reindex_max_wait_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -180,6 +184,8 @@ impl PartialHooksConfig {
                 .or(self.surface_related_on_read),
             related_top_k: other.related_top_k.or(self.related_top_k),
             related_min_similarity: other.related_min_similarity.or(self.related_min_similarity),
+            reindex_debounce_secs: other.reindex_debounce_secs.or(self.reindex_debounce_secs),
+            reindex_max_wait_secs: other.reindex_max_wait_secs.or(self.reindex_max_wait_secs),
         }
     }
 }

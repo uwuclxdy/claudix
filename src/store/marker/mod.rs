@@ -6,6 +6,7 @@
 
 pub(crate) mod change_neighbors;
 pub(crate) mod pending_index;
+pub(crate) mod reindex_queue;
 
 use std::fs;
 use std::io::Write;

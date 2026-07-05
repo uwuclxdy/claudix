@@ -114,6 +114,19 @@ impl Store {
         self.paths.state_dir.join("watch.pid")
     }
 
+    /// Append-only queue of edited paths awaiting a debounced no-watcher
+    /// reindex. Hooks append; the single drain worker reads, reindexes, and
+    /// rewrites it. See [`marker::reindex_queue`].
+    pub fn reindex_queue_path(&self) -> PathBuf {
+        self.paths.state_dir.join("reindex-queue")
+    }
+
+    /// Pid marker claimed by the single drain worker so a burst of edits never
+    /// spawns a second one. Same liveness/stale-reclaim rules as the watcher.
+    pub fn reindex_drain_marker_path(&self) -> PathBuf {
+        self.paths.state_dir.join("reindex-drain.pid")
+    }
+
     pub fn change_neighbors_marker_path(&self) -> PathBuf {
         self.paths.state_dir.join("change-neighbors")
     }

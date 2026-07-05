@@ -42,6 +42,12 @@ pub const SET_REINDEX_AFTER_HOURS: &str =
 pub const SET_RELATED_TOP_K: &str = "Set [hooks].related_top_k to a positive integer";
 pub const SET_RELATED_MIN_SIMILARITY: &str =
     "Set [hooks].related_min_similarity to a value in [0, 1]";
+pub const SET_REINDEX_DEBOUNCE_SECS: &str =
+    "Set [hooks].reindex_debounce_secs to a positive integer";
+pub const SET_REINDEX_MAX_WAIT_SECS: &str =
+    "Set [hooks].reindex_max_wait_secs to a positive integer";
+pub const REINDEX_MAX_WAIT_GTE_DEBOUNCE: &str =
+    "Set [hooks].reindex_max_wait_secs to at least [hooks].reindex_debounce_secs";
 pub const SET_SEARCH_TOP_K: &str = "Set [search].top_k to a positive integer";
 pub const SET_SIMILARITY_THRESHOLD: &str = "Set [search].similarity_threshold to a value in [0, 1]";
 pub const SET_MIN_SCORE: &str = "Set [search].min_score to a value in [0, 1]";

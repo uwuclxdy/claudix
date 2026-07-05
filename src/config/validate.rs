@@ -103,6 +103,29 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    if config.hooks.reindex_debounce_secs == 0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "hooks.reindex_debounce_secs must be > 0".into(),
+            recovery: RecoveryHint(hints::SET_REINDEX_DEBOUNCE_SECS),
+        });
+    }
+
+    if config.hooks.reindex_max_wait_secs == 0 {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "hooks.reindex_max_wait_secs must be > 0".into(),
+            recovery: RecoveryHint(hints::SET_REINDEX_MAX_WAIT_SECS),
+        });
+    }
+
+    // max_wait below debounce would fire the hard cap before the idle window
+    // ever elapses, defeating the sliding-debounce semantics entirely.
+    if config.hooks.reindex_max_wait_secs < config.hooks.reindex_debounce_secs {
+        return Err(ClaudixError::ConfigInvalid {
+            message: "hooks.reindex_max_wait_secs must be >= hooks.reindex_debounce_secs".into(),
+            recovery: RecoveryHint(hints::REINDEX_MAX_WAIT_GTE_DEBOUNCE),
+        });
+    }
+
     if config.search.top_k == 0 {
         return Err(ClaudixError::ConfigInvalid {
             message: "search.top_k must be > 0".into(),

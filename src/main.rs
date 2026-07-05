@@ -54,6 +54,11 @@ enum Command {
     },
     #[command(about = "Watch saved files and re-embed changed files when watch = true")]
     Watch,
+    #[command(
+        hide = true,
+        about = "Internal: drain the debounced no-watcher reindex queue"
+    )]
+    DrainReindexQueue,
     #[command(about = "Drop the entire index dataset")]
     Clear,
     #[command(about = "Handle a Claude Code hook event (SessionStart | PostToolUse | PreToolUse)")]
@@ -232,6 +237,9 @@ async fn run() -> Result<()> {
         }
         Command::Watch => {
             cli::run_watch(&project_root).await?;
+        }
+        Command::DrainReindexQueue => {
+            cli::run_drain_reindex_queue(&project_root).await?;
         }
         Command::Clear => {
             let output = cli::run_clear_index(&project_root).await?;

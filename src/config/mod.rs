@@ -69,6 +69,13 @@ pub struct HooksConfig {
     pub related_top_k: usize,
     /// Cosine similarity floor for related-code hits (0.0–1.0).
     pub related_min_similarity: f32,
+    /// Idle window (seconds) before a debounced no-watcher reindex fires. Each
+    /// new edit to a file resets this timer; the file reindexes after this many
+    /// seconds with no further edits.
+    pub reindex_debounce_secs: u64,
+    /// Hard cap (seconds) since a file's first pending edit after which it
+    /// reindexes even under continuous edits, so a hot file never starves.
+    pub reindex_max_wait_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +139,8 @@ impl Default for Config {
                 surface_related_on_read: false,
                 related_top_k: 5,
                 related_min_similarity: 0.72,
+                reindex_debounce_secs: 10,
+                reindex_max_wait_secs: 60,
             },
             paths: PathsConfig {
                 index_dir: PathBuf::from(".claudix/index"),
@@ -367,6 +376,14 @@ impl Config {
                     .hooks
                     .related_min_similarity
                     .unwrap_or(defaults.hooks.related_min_similarity),
+                reindex_debounce_secs: partial
+                    .hooks
+                    .reindex_debounce_secs
+                    .unwrap_or(defaults.hooks.reindex_debounce_secs),
+                reindex_max_wait_secs: partial
+                    .hooks
+                    .reindex_max_wait_secs
+                    .unwrap_or(defaults.hooks.reindex_max_wait_secs),
             },
             paths: PathsConfig {
                 index_dir: path_from_partial(partial.paths.index_dir, defaults.paths.index_dir),
@@ -571,6 +588,53 @@ index_dir = ".claudix/custom-index"
                 .map(|cfg| cfg.paths.index_dir.to_string_lossy().into_owned()),
             Some(".claudix/custom-index".to_owned())
         );
+    }
+
+    #[test]
+    fn reindex_debounce_and_max_wait_default_valid() {
+        let config = Config::default();
+        assert_eq!(config.hooks.reindex_debounce_secs, 10);
+        assert_eq!(config.hooks.reindex_max_wait_secs, 60);
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn reject_zero_reindex_debounce_secs() {
+        let mut config = Config::default();
+        config.hooks.reindex_debounce_secs = 0;
+        assert!(matches!(
+            validate(&config),
+            Err(ClaudixError::ConfigInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn reject_zero_reindex_max_wait_secs() {
+        let mut config = Config::default();
+        config.hooks.reindex_max_wait_secs = 0;
+        assert!(matches!(
+            validate(&config),
+            Err(ClaudixError::ConfigInvalid { .. })
+        ));
+    }
+
+    #[test]
+    fn reject_reindex_max_wait_below_debounce() {
+        let mut config = Config::default();
+        config.hooks.reindex_debounce_secs = 30;
+        config.hooks.reindex_max_wait_secs = 10;
+        assert!(
+            matches!(validate(&config), Err(ClaudixError::ConfigInvalid { .. })),
+            "max_wait below debounce defeats the sliding window and must be rejected"
+        );
+    }
+
+    #[test]
+    fn accept_reindex_max_wait_equal_to_debounce() {
+        let mut config = Config::default();
+        config.hooks.reindex_debounce_secs = 15;
+        config.hooks.reindex_max_wait_secs = 15;
+        assert!(validate(&config).is_ok());
     }
 
     #[test]

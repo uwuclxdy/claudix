@@ -1,3 +1,4 @@
+mod drain;
 mod input;
 mod install;
 mod watch;
@@ -38,6 +39,7 @@ pub(crate) const DEFAULT_DUPLICATE_LIMIT: usize = 50;
 /// Beyond this the scan is skipped and a notice is surfaced instead.
 pub(crate) const MAX_DUPLICATE_CORPUS_CHUNKS: usize = 50_000;
 
+pub use drain::run_drain_reindex_queue;
 pub use install::{run_install, setup_state};
 pub use watch::run_watch;
 
