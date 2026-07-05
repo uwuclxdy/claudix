@@ -53,6 +53,12 @@ jobs:
       - name: Build
         shell: bash
         run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Smoke test binary
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/claudix"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then binary="${binary}.exe"; fi
+          "$binary" --version
       - name: Stage asset
         shell: bash
         run: |

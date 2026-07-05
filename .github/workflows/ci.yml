@@ -25,3 +25,22 @@ jobs:
 
       - name: test
         run: cargo test --release --all-targets --all-features
+
+  windows-smoke:
+    name: windows smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Windows dependencies
+        shell: pwsh
+        run: choco install protoc --no-progress
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --release --locked
+      # Asserts the built binary loads and runs on the runner. The runner already
+      # has the VC++ redistributable, so this catches a broken build but not the
+      # missing-redistributable failure a stock user box hits (documented tradeoff).
+      - name: smoke --version
+        shell: bash
+        run: ./target/release/claudix.exe --version
