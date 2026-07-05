@@ -22,8 +22,8 @@ Core design goal: never break the session, always recover gracefully.
 
 - **macOS 11+ (Apple Silicon)** or **Linux x86_64** (glibc 2.28+ or musl) or **Windows 10+ x86_64**
 - **Rust 1.91+**
-- **Optional**: LM Studio or Ollama for custom embedding backends (
-  - bundled `bge-small-en-v1.5` requires `libonnxruntime` or `onnxruntime.dll`)
+- **Windows**: the [Visual C++ 2015-2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). The MSVC-built prebuilt binary won't launch without it; a stock box may not have it preinstalled.
+- **Optional**: LM Studio or Ollama for a custom embedding backend. The bundled `bge-small-en-v1.5` embedder is statically linked into the binary, so no separate ONNX runtime is needed.
 
 ## Installation
 
