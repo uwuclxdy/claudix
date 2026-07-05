@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   # Release page exists the moment the tag lands; notes are NOT auto-generated
-  # (the release script writes them), assets attach as jobs finish.
+  # (the release script writes them). Each build leg attaches its own binary as
+  # it finishes; the checksums job attaches SHA256SUMS last.
   create-release:
     name: create release
     runs-on: ubuntu-latest
@@ -20,21 +21,28 @@ jobs:
           generate_release_notes: false
 
   build:
-    name: build ${{ matrix.asset }}
-    runs-on: ${{ matrix.runner }}
+    name: build ${{ matrix.asset_name }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash  # windows-latest ships Git Bash; keeps cp + forward-slash paths uniform across OSes
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            asset: claudix-linux-x86_64
+            os: ubuntu-latest
+            asset_name: claudix-linux-x86_64
+            ext: ""
           - target: aarch64-apple-darwin
-            runner: macos-latest
-            asset: claudix-darwin-aarch64
+            os: macos-latest
+            asset_name: claudix-darwin-aarch64
+            ext: ""
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            asset: claudix-windows-x86_64.exe
+            os: windows-latest
+            asset_name: claudix-windows-x86_64
+            ext: .exe
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -49,46 +57,42 @@ jobs:
       - name: Install Windows dependencies
         if: runner.os == 'Windows'
         shell: pwsh
-        run: choco install protoc --no-progress
+        run: choco install protoc -y
       - name: Build
-        shell: bash
         run: cargo build --release --locked --target "${{ matrix.target }}"
       - name: Smoke test binary
-        shell: bash
-        run: |
-          binary="target/${{ matrix.target }}/release/claudix"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then binary="${binary}.exe"; fi
-          "$binary" --version
+        run: "target/${{ matrix.target }}/release/claudix${{ matrix.ext }} --version"
       - name: Stage asset
-        shell: bash
-        run: |
-          mkdir -p dist
-          binary="target/${{ matrix.target }}/release/claudix"
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
-            binary="${binary}.exe"
-          fi
-          cp "$binary" "dist/${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.asset }}
-          path: dist/${{ matrix.asset }}
-
-  publish:
-    name: publish release
-    runs-on: ubuntu-latest
-    needs: [build, create-release]
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Generate checksums
-        run: |
-          cd dist
-          sha256sum claudix-* > SHA256SUMS
-      - name: Publish GitHub release
+        run: cp "target/${{ matrix.target }}/release/claudix${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
+      - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
-          files: |
-            dist/claudix-*
-            dist/SHA256SUMS
+          files: ${{ matrix.asset_name }}${{ matrix.ext }}
+      - name: Upload artifact for checksum job
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset_name }}${{ matrix.ext }}
+          path: ${{ matrix.asset_name }}${{ matrix.ext }}
+          if-no-files-found: error
+
+  checksums:
+    name: checksums
+    needs: [build]
+    # Run even when a build leg fails so the binaries that DID ship always have a
+    # matching sums file covering exactly what was published.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum claudix-* > ../SHA256SUMS
+      - name: Upload SHA256SUMS to release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: SHA256SUMS
