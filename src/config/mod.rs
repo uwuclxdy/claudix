@@ -138,7 +138,7 @@ impl Default for Config {
                 surface_related_on_edit: true,
                 surface_related_on_read: false,
                 related_top_k: 5,
-                related_min_similarity: 0.72,
+                related_min_similarity: 0.80,
                 reindex_debounce_secs: 10,
                 reindex_max_wait_secs: 60,
             },
