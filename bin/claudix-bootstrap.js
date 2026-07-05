@@ -31,6 +31,10 @@ const GITHUB_REPO = process.env.CLAUDIX_GITHUB_REPO || 'uwuclxdy/claudix';
 const PREBUILT = new Set(['linux-x86_64', 'darwin-aarch64', 'windows-x86_64']);
 const GC_KEEP = 2;
 const MAX_REDIRECTS = 5;
+// a freshly tagged release's binary asset isn't uploaded until release.yml finishes
+// building; retry transient failures so an install in that window doesn't hard-fail.
+const RELEASE_WAIT_MS = parseInt(process.env.CLAUDIX_RELEASE_WAIT_MS || '180000', 10);
+const RELEASE_RETRY_MS = parseInt(process.env.CLAUDIX_RELEASE_RETRY_MS || '5000', 10);
 
 const argv = process.argv.slice(2);
 const isHook = argv[0] === 'hook';
@@ -232,6 +236,30 @@ function fetchFile(url, dest) {
   });
 }
 
+// transient = the asset may land shortly (release still publishing, rate-limit,
+// server hiccup). ENOENT from a file:// fixture or a 4xx auth error won't resolve.
+function isTransientNetError(err) {
+  const m = String((err && err.message) || err);
+  if (/^HTTP (404|408|429|5\d\d)\b/.test(m)) return true;
+  return /timed out|ECONNRESET|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|ECONNABORTED|socket hang up/i.test(
+    m
+  );
+}
+async function fetchFileWithRetry(label, url, dest) {
+  if (!/^https?:/i.test(url)) return fetchFile(url, dest);
+  const deadline = Date.now() + RELEASE_WAIT_MS;
+  for (;;) {
+    try {
+      await fetchFile(url, dest);
+      return;
+    } catch (err) {
+      if (!isTransientNetError(err) || Date.now() >= deadline) throw err;
+      log(label + ' not ready (' + (err.message || err) + '); retrying...');
+      await new Promise((r) => setTimeout(r, RELEASE_RETRY_MS));
+    }
+  }
+}
+
 async function gcOldVersions(platform) {
   let entries;
   try {
@@ -320,8 +348,8 @@ async function installFromRelease(version, platform) {
   try {
     log('downloading ' + asset + ' v' + version);
     await logAppend('downloading ' + asset + ' v' + version);
-    await fetchFile(baseUrl + '/' + asset, assetPath);
-    await fetchFile(baseUrl + '/SHA256SUMS', sumsPath);
+    await fetchFileWithRetry(asset, baseUrl + '/' + asset, assetPath);
+    await fetchFileWithRetry('SHA256SUMS', baseUrl + '/SHA256SUMS', sumsPath);
     const sums = await fs.promises.readFile(sumsPath, 'utf8');
     let expected = null;
     for (const line of sums.split('\n')) {
