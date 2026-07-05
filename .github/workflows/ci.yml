@@ -14,7 +14,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Install Linux dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang lld
       - uses: Swatinem/rust-cache@v2
 
       - name: fmt --check

@@ -1,0 +1,7 @@
+# lld (via clang) slashes link time, which dominates every incremental rebuild
+# against the lance/datafusion/arrow static libs. Gated to linux-gnu; macOS and
+# Windows keep their default linkers. Requires clang + lld on PATH (CI installs
+# them in .github/workflows). Emits a standard portable ELF, no runtime lld dep.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

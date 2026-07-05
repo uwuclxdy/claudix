@@ -48,15 +48,17 @@ anyhow = "1.0.102"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-# HTTP client (rustls only, no openssl)
-reqwest = { version = "0.13.4", features = ["json", "rustls", "stream"] }
+# HTTP client. Pinned to 0.12 to dedupe with lancedb's transitive reqwest; a
+# newer major here recompiles the whole hyper/http stack twice. Bump alongside
+# lancedb when it moves to the next reqwest major. rustls only, no openssl.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # LanceDB for storage and FTS
 lancedb = "0.31.0"
 # arrow MUST match the major lancedb/lance re-export (lancedb 0.31 still re-exports
 # arrow 58; a newer arrow here splits the tree into two majors that don't interop
 # at the lancedb boundary).
-arrow = { version = "58.3.0", features = ["prettyprint"] }
+arrow = { version = "58.3.0" }
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
 
@@ -89,11 +91,10 @@ shell-words = "1.1.1"
 
 # Hashing
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-sha2 = "0.11.0"
 
 # ONNX inference for bundled embedder
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
-tokenizers = { version = "0.23.1", default-features = false, features = ["http", "fancy-regex"] }
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 ndarray = "0.17.2"
 
 # Tempfile for tests
@@ -134,6 +135,11 @@ codegen-units = 1
 # inference and query planning aren't 10-50x slower in test runs.
 [profile.test]
 opt-level = 1
+
+# Line-tables-only debuginfo: trims dev + test compile and link time while
+# keeping file:line in panic backtraces. test inherits this from dev.
+[profile.dev]
+debug = 1
 
 [profile.dev.package.ort]
 opt-level = 3
