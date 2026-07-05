@@ -5,26 +5,68 @@ on:
     branches: [mommy]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
-  check:
+  fmt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - name: Install Linux dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang lld
-      - uses: Swatinem/rust-cache@v2
-
+          components: rustfmt
       - name: fmt --check
         run: cargo fmt --all -- --check
 
-      - name: clippy
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang lld
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy (-D warnings)
         run: cargo clippy --all-targets --all-features --release -- -D warnings
 
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang lld
+      - uses: Swatinem/rust-cache@v2
       - name: test
         run: cargo test --release --all-targets --all-features
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: taiki-e/install-action@cargo-audit
+      - name: cargo audit
+        run: cargo audit
 
   windows-smoke:
     name: windows smoke
