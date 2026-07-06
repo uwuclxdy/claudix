@@ -6,8 +6,15 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output};
 use std::time::{Duration, Instant};
+
+// reap the fake release server so clippy::zombie_processes is satisfied and
+// no node process leaks out of the test into the runner
+fn kill_wait(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 fn bootstrap_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -424,6 +431,7 @@ fn install_leaves_intentional_cargo_binary_in_place() {
 }
 
 #[test]
+#[allow(clippy::panic)] // test-only timeout abort; assert!(false) trips assertions_on_constants
 fn install_retries_until_release_asset_publishes() {
     if !node_available() {
         return;
@@ -454,13 +462,13 @@ fn install_retries_until_release_asset_publishes() {
         .expect("node spawn");
     let started = Instant::now();
     let port = loop {
-        if let Ok(s) = fs::read_to_string(&port_file) {
-            if let Ok(p) = s.trim().parse::<u16>() {
-                break p;
-            }
+        if let Ok(s) = fs::read_to_string(&port_file)
+            && let Ok(p) = s.trim().parse::<u16>()
+        {
+            break p;
         }
         if Instant::now().duration_since(started) > Duration::from_secs(3) {
-            let _ = server.kill();
+            kill_wait(&mut server);
             panic!("fake release server did not bind");
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -475,7 +483,7 @@ fn install_retries_until_release_asset_publishes() {
         &local_bin,
         &base,
     );
-    let _ = server.kill();
+    kill_wait(&mut server);
     assert!(
         output.status.success(),
         "expected retry-then-success, stderr: {}",
