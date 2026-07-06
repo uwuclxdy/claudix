@@ -37,6 +37,11 @@ pub(crate) fn process_running(pid: u32) -> bool {
 
 #[cfg(windows)]
 pub(crate) fn process_running(pid: u32) -> bool {
+    // PID 0 is the System Idle Process on Windows (always live), but the marker
+    // layer uses 0 as its never-a-real-process sentinel; guard it like unix.
+    if pid == 0 {
+        return false;
+    }
     Command::new("tasklist")
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .output()
