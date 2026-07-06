@@ -223,7 +223,11 @@ mod tests {
         assert!(std::fs::write(&path, "not-a-pid").is_ok());
         // Backdate so the malformed-marker stale window has elapsed.
         let stale = SystemTime::now() - Duration::from_secs(3 * 60);
-        let _ = fs::File::open(&path).and_then(|f| f.set_modified(stale));
+        // Write handle: windows refuses set_modified through a read-only open.
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(stale));
 
         let marker = PidMarker::install(path.clone());
         assert!(marker.is_ok(), "malformed marker must be reclaimable");

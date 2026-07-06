@@ -405,7 +405,11 @@ mod tests {
         let marker_path = dir.path().join("watch.pid");
         fs::write(&marker_path, "not-a-pid").unwrap_or_else(|_| unreachable!());
         let stale = SystemTime::now() - Duration::from_secs(WATCH_MARKER_STALE_SECS + 1);
-        let _ = fs::File::open(&marker_path).and_then(|f| f.set_modified(stale));
+        // Write handle: windows refuses set_modified through a read-only open.
+        let _ = fs::OpenOptions::new()
+            .write(true)
+            .open(&marker_path)
+            .and_then(|f| f.set_modified(stale));
 
         assert!(
             !crate::store::marker::is_alive(
