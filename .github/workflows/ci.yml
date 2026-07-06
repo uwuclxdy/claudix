@@ -93,7 +93,9 @@ jobs:
       - name: clippy (-D warnings)
         run: cargo clippy --all-targets --all-features --release -- -D warnings
       - name: test
-        run: cargo nextest run --release --all-targets --all-features
+        # --no-fail-fast: surface every platform-specific failure in one run
+        # instead of masking all but the first (tests are ~seconds; compile dominates).
+        run: cargo nextest run --release --all-targets --all-features --no-fail-fast
       # nextest can't run doctests, so cover them with cargo test. Self-gates on
       # a doctest target so a bin-only crate (no lib) skips instead of erroring
       # with "no library targets found". shell: bash so the linux/mac/windows
