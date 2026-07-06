@@ -472,11 +472,14 @@ mod tests {
         );
         drop(listener);
 
+        // Generous timeout so a refused connection (near-instant on loopback)
+        // wins the race and is classified as unreachable, not a timeout — a
+        // 50ms budget lost that race on loaded windows runners.
         let provider = HttpProvider::new(
             endpoint.clone(),
             "test-model",
             Dimension(2),
-            Duration::from_millis(50),
+            Duration::from_secs(5),
             None,
         );
         assert!(provider.is_ok());
