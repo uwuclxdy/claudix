@@ -9,7 +9,16 @@ all-features = true
 # `unmaintained` re-added in 0.18.2: all | workspace | transitive | none (NOT deny/warn).
 yanked       = "deny"
 unmaintained = "workspace"  # flag unmaintained direct deps, not deep transitives we can't control
-ignore       = []
+ignore       = [
+  # quick-xml RUSTSEC-2026-0194/0195: DoS-only reader bugs (NsReader namespace
+  # allocation, quadratic duplicate-attribute check), both need attacker-fed XML.
+  # quick-xml reaches claudix only via lancedb -> lance-testing -> pprof ->
+  # inferno -> quick-xml, where inferno writes flamegraph SVGs and never ingests
+  # untrusted XML; claudix has no XML parsing. quick-xml ^0.26 is pinned by
+  # inferno ^0.11 and no patched 0.26.x exists. drop on a lancedb bump past 0.31.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
 
 [licenses]
 confidence-threshold = 0.8  # cargo-deny's default, stated for clarity
@@ -24,6 +33,11 @@ allow = [
   "Unicode-3.0",
   "MPL-2.0",
   "Zlib",
+  # transitive licenses pulled in by lancedb / reqwest / notify:
+  "CDDL-1.0",            # inferno (flamegraph SVG via pprof)
+  "CC0-1.0",             # notify, tiny-keccak
+  "CDLA-Permissive-2.0", # webpki-roots / webpki-root-certs (Mozilla CA bundle)
+  "BSL-1.0",             # xxhash-rust
 ]
 
 [bans]
