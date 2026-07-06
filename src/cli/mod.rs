@@ -1897,8 +1897,18 @@ mod tests {
         .await?;
         write_fixture_config(fixture_b.root(), &config)?;
 
-        let repo_a = fixture_a.root().display().to_string();
-        let repo_b = fixture_b.root().display().to_string();
+        let repo_a = fixture_a
+            .root()
+            .canonicalize()
+            .map_err(ClaudixError::from)?
+            .display()
+            .to_string();
+        let repo_b = fixture_b
+            .root()
+            .canonicalize()
+            .map_err(ClaudixError::from)?
+            .display()
+            .to_string();
         Ok((fixture_a, fixture_b, repo_a, repo_b))
     }
 
