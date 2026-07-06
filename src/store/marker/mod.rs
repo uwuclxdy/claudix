@@ -11,7 +11,9 @@ pub(crate) mod reindex_queue;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(unix)]
+use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 /// How long an unparseable or otherwise-pending marker stays "young" before

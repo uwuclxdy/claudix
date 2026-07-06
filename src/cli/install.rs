@@ -196,6 +196,7 @@ fn local_plugin_root() -> PathBuf {
         .join("claudix-plugin")
 }
 
+#[cfg_attr(not(unix), allow(unused_variables))]
 async fn make_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
