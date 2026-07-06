@@ -2,20 +2,27 @@ name: release
 
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: write      # softprops/action-gh-release creates the release
+  id-token: write      # GitHub OIDC — keyless build-provenance attestation (optional)
+  attestations: write  # actions/attest-build-provenance (optional)
 
 jobs:
-  # Release page exists the moment the tag lands; notes are NOT auto-generated
-  # (the release script writes them). Each build leg attaches its own binary as
-  # it finishes; the checksums job attaches SHA256SUMS last.
   create-release:
     name: create release
     runs-on: ubuntu-latest
     steps:
+      - name: Validate tag is semver
+        # Tightens the `v*` trigger to strict vX.Y.Z — a malformed tag otherwise
+        # mints a broken Release page. Pre-release suffixes (`v1.2.3-rc1`) need
+        # the regex relaxed.
+        run: |
+          ver="${GITHUB_REF_NAME#v}"
+          if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '${GITHUB_REF_NAME}' is not vX.Y.Z"; exit 1
+          fi
       - uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: false
@@ -48,6 +55,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # lancedb/lance transitively pulls in prost-build (substrait proto codegen),
+      # which needs `protoc` on PATH; the linux leg also needs clang+lld to
+      # match `.cargo/config.toml`'s pinned linker for x86_64-unknown-linux-gnu.
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler clang lld
@@ -58,16 +68,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: choco install protoc -y
+      - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --locked --target "${{ matrix.target }}"
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Smoke test binary
         run: "target/${{ matrix.target }}/release/claudix${{ matrix.ext }} --version"
-      - name: Stage asset
+      - name: Prepare asset
         run: cp "target/${{ matrix.target }}/release/claudix${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
       - name: Upload to release
         uses: softprops/action-gh-release@v3
         with:
           files: ${{ matrix.asset_name }}${{ matrix.ext }}
+      - name: Attest build provenance   # optional supply-chain: keyless SLSA provenance for the asset
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ matrix.asset_name }}${{ matrix.ext }}
       - name: Upload artifact for checksum job
         uses: actions/upload-artifact@v7
         with:
@@ -88,11 +103,13 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - name: Generate SHA256SUMS
+      - name: Generate sha256sums.txt
+        # Glob whatever was actually built so a partial release still produces a
+        # sums file matching exactly what shipped.
         run: |
           cd artifacts
-          sha256sum claudix-* > ../SHA256SUMS
-      - name: Upload SHA256SUMS to release
+          sha256sum claudix-* > ../sha256sums.txt
+      - name: Upload sha256sums.txt to release
         uses: softprops/action-gh-release@v3
         with:
-          files: SHA256SUMS
+          files: sha256sums.txt
