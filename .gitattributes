@@ -1,0 +1,4 @@
+# Force LF on checkout for every runner. Tests hash raw file bytes, so a
+# Git-for-Windows autocrlf checkout that rewrote LF fixtures to CRLF would
+# hash differently than linux/macos and diverge the results.
+* text=auto eol=lf
