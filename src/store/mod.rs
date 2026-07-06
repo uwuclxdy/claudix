@@ -866,15 +866,19 @@ mod tests {
         assert!(store.is_ok());
         let store = store.ok().unwrap_or_else(|| unreachable!());
 
-        assert_eq!(store.project_root(), project_root.path());
-        assert_eq!(store.paths.state_dir, project_root.path().join(".claudix"));
-        assert_eq!(
-            store.paths.index_dir,
-            project_root.path().join(".claudix/index")
-        );
+        // Store::new canonicalizes the root; compare against the resolved path
+        // so symlinked tempdirs (macos /var, windows verbatim) still match.
+        let root = project_root
+            .path()
+            .canonicalize()
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(store.project_root(), root.as_path());
+        assert_eq!(store.paths.state_dir, root.join(".claudix"));
+        assert_eq!(store.paths.index_dir, root.join(".claudix/index"));
         assert_eq!(
             store.paths.manifest_path,
-            project_root.path().join(".claudix/manifest.json")
+            root.join(".claudix/manifest.json")
         );
     }
 
