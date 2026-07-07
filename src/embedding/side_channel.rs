@@ -28,6 +28,12 @@ use super::ProviderCache;
 /// cold build.
 const SERVER_EXCHANGE_TIMEOUT_MS: u64 = 30_000;
 
+/// Cadence for re-checking the port marker. `bind_and_advertise` writes it once
+/// at startup, but a newer same-repo server's clean-exit `withdraw` removes the
+/// shared marker; without periodic re-claim an older still-running server stays
+/// unadvertised until it restarts.
+const READVERTISE_INTERVAL_SECS: u64 = 15;
+
 /// Marker file name under the store state dir (`.claudix/`).
 pub const EMBED_PORT_MARKER_FILE_NAME: &str = "embed-port";
 
@@ -80,6 +86,38 @@ pub fn withdraw(marker_path: &Path) {
 fn read_marker(marker_path: &Path) -> Option<PortMarker> {
     let payload = std::fs::read_to_string(marker_path).ok()?;
     serde_json::from_str(&payload).ok()
+}
+
+/// Re-claim the advertisement when the marker is missing, unparseable, or names
+/// a dead process; leave a marker owned by a live process alone. Returns whether
+/// it rewrote the marker.
+///
+/// Two concurrent same-repo servers must not thrash the marker — either live
+/// server's port is a valid warm target — so a live owner is never overwritten.
+/// This closes the gap where a newer server's clean-exit `withdraw` removes the
+/// shared marker and leaves an older still-running server unadvertised.
+fn reclaim_if_orphaned(marker_path: &Path, port: u16) -> bool {
+    if read_marker(marker_path).is_some_and(|m| crate::store::marker::process_running(m.pid)) {
+        return false;
+    }
+    let marker = PortMarker {
+        pid: std::process::id(),
+        port,
+    };
+    serde_json::to_string(&marker).is_ok_and(|payload| std::fs::write(marker_path, payload).is_ok())
+}
+
+/// Re-advertise the warm-embed port for the server's lifetime so the marker
+/// heals after another same-repo server withdrew it. Best effort: a write
+/// failure only costs hooks the warm path until the next tick.
+pub async fn maintain_advertisement(marker_path: PathBuf, port: u16) {
+    let mut tick = tokio::time::interval(Duration::from_secs(READVERTISE_INTERVAL_SECS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // consume the immediate first tick; startup already advertised
+    loop {
+        tick.tick().await;
+        reclaim_if_orphaned(&marker_path, port);
+    }
 }
 
 /// Accept loop. Each exchange runs on its own task under a hard timeout; any
@@ -273,5 +311,39 @@ mod tests {
         assert!(std::fs::write(&marker_path, foreign.to_string()).is_ok());
         withdraw(&marker_path);
         assert!(marker_path.exists(), "foreign marker must survive");
+    }
+
+    #[test]
+    fn reclaim_writes_marker_when_missing() {
+        let (_dir, marker_path) = temp_marker();
+        assert!(!marker_path.exists());
+        assert!(reclaim_if_orphaned(&marker_path, 4321));
+        let marker = read_marker(&marker_path).unwrap_or_else(|| unreachable!());
+        assert_eq!(marker.pid, std::process::id());
+        assert_eq!(marker.port, 4321);
+    }
+
+    #[test]
+    fn reclaim_replaces_dead_owner() {
+        let (_dir, marker_path) = temp_marker();
+        // pid 0 is the never-a-real-process sentinel (see store::marker).
+        let dead = serde_json::json!({"pid": 0, "port": 1});
+        assert!(std::fs::write(&marker_path, dead.to_string()).is_ok());
+        assert!(reclaim_if_orphaned(&marker_path, 5555));
+        let marker = read_marker(&marker_path).unwrap_or_else(|| unreachable!());
+        assert_eq!(marker.pid, std::process::id());
+        assert_eq!(marker.port, 5555);
+    }
+
+    #[test]
+    fn reclaim_leaves_live_owner_untouched() {
+        let (_dir, marker_path) = temp_marker();
+        // This process is live: a marker it owns (another server's port) must
+        // not be stolen — either live server is a valid warm target.
+        let live = serde_json::json!({"pid": std::process::id(), "port": 9090});
+        assert!(std::fs::write(&marker_path, live.to_string()).is_ok());
+        assert!(!reclaim_if_orphaned(&marker_path, 1111));
+        let marker = read_marker(&marker_path).unwrap_or_else(|| unreachable!());
+        assert_eq!(marker.port, 9090, "live owner's advertisement must survive");
     }
 }

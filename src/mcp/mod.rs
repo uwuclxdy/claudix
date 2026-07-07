@@ -233,14 +233,24 @@ pub async fn run(project_root: impl AsRef<Path>) -> crate::error::Result<()> {
         // whole session.
         .filter(|store| store.ensure_layout().is_ok())
         .map(|store| store.embed_port_marker_path());
+    let mut advertisement: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(marker_path) = embed_marker.clone()
         && let Ok(listener) = side_channel::bind_and_advertise(&marker_path).await
     {
+        let port = listener.local_addr().ok().map(|addr| addr.port());
         tokio::spawn(side_channel::serve_embed_requests(
             listener,
             project_root,
             provider_cache,
         ));
+        // Re-advertise on a cadence so the marker heals if another same-repo
+        // server withdrew it on exit, leaving this one unadvertised.
+        if let Some(port) = port {
+            advertisement = Some(tokio::spawn(side_channel::maintain_advertisement(
+                marker_path,
+                port,
+            )));
+        }
     }
 
     // The service driver is spawned with `spawn_local` under the `local` feature,
@@ -260,6 +270,11 @@ pub async fn run(project_root: impl AsRef<Path>) -> crate::error::Result<()> {
         })
         .await;
 
+    // Stop re-advertising before withdrawing so the marker isn't re-written for
+    // this exiting pid right after we clear it.
+    if let Some(advertisement) = advertisement {
+        advertisement.abort();
+    }
     if let Some(marker_path) = embed_marker {
         side_channel::withdraw(&marker_path);
     }
