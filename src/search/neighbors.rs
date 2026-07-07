@@ -11,7 +11,7 @@ use std::collections::BinaryHeap;
 use crate::store::StoredChunk;
 use crate::types::RelativePath;
 
-use super::cosine_similarity;
+use super::{cosine_with_norms, l2_norm};
 
 /// Total order over neighbors, best-first: higher score wins, ties broken
 /// deterministically by `file_path` then `line_start`. Without the tiebreak,
@@ -100,14 +100,22 @@ pub fn neighbors(
     let mut best: std::collections::HashMap<&str, (f32, &StoredChunk)> =
         std::collections::HashMap::new();
 
+    // Norms are invariant across the row loop (query) and across the inner
+    // query loop (row) — precompute both so the hot loop is dot-product only.
+    let query_norms: Vec<f32> = query_vectors.iter().map(|qv| l2_norm(qv)).collect();
+
     for row in rows {
         if row.file_path == exclude_path.as_str() {
             continue;
         }
 
+        let row_norm = l2_norm(&row.vector);
         let row_score = query_vectors
             .iter()
-            .map(|qv| cosine_similarity(qv, &row.vector).max(0.0))
+            .zip(&query_norms)
+            .map(|(qv, &qv_norm)| {
+                cosine_with_norms(qv, qv_norm, &row.vector, row_norm).max(0.0)
+            })
             .fold(0.0_f32, f32::max);
 
         let entry = best.entry(row.file_path.as_str()).or_insert((0.0, row));

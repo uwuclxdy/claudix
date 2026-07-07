@@ -252,11 +252,18 @@ fn rank_rows(
     let bm25_per_row = bm25_scores(&docs, &query_tokens);
 
     // Single pass: dense scores zipped with the pre-computed cross-corpus BM25.
+    let query_norm = l2_norm(&query_vector);
     let mut scores: Vec<RowScore> = filtered_rows
         .iter()
         .zip(bm25_per_row)
         .map(|((_, row), bm25)| {
-            let dense = cosine_similarity(&query_vector, &row.vector).max(0.0);
+            let dense = cosine_with_norms(
+                &query_vector,
+                query_norm,
+                &row.vector,
+                l2_norm(&row.vector),
+            )
+            .max(0.0);
             RowScore {
                 dense,
                 bm25,
@@ -576,26 +583,36 @@ fn compare_scores_desc(
         .then_with(|| left_index.cmp(&right_index))
 }
 
-pub(crate) fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
-    if left.len() != right.len() || left.is_empty() {
+pub(crate) fn l2_norm(vector: &[f32]) -> f32 {
+    vector.iter().map(|v| v * v).sum::<f32>().sqrt()
+}
+
+/// Cosine with both norms precomputed, so per-row loops pay only the dot
+/// product. Callers scoring one query against N rows hoist the query norm; the
+/// O(n²) duplicates scan precomputes every norm once.
+pub(crate) fn cosine_with_norms(
+    left: &[f32],
+    left_norm: f32,
+    right: &[f32],
+    right_norm: f32,
+) -> f32 {
+    if left.len() != right.len() || left.is_empty() || left_norm == 0.0 || right_norm == 0.0 {
         return 0.0;
     }
 
     let mut dot = 0.0;
-    let mut left_norm = 0.0;
-    let mut right_norm = 0.0;
-
     for index in 0..left.len() {
         dot += left[index] * right[index];
-        left_norm += left[index] * left[index];
-        right_norm += right[index] * right[index];
     }
 
-    if left_norm == 0.0 || right_norm == 0.0 {
-        return 0.0;
-    }
+    dot / (left_norm * right_norm)
+}
 
-    dot / (left_norm.sqrt() * right_norm.sqrt())
+/// Reference formulation; production callers precompute norms and go through
+/// [`cosine_with_norms`] directly.
+#[cfg(test)]
+pub(crate) fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    cosine_with_norms(left, l2_norm(left), right, l2_norm(right))
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -731,6 +748,29 @@ mod tests {
         assert_eq!(cosine_similarity(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
         assert_eq!(cosine_similarity(&[1.0, 0.0, 0.0], &[1.0, 0.0]), 0.0);
         assert_eq!(cosine_similarity(&[], &[1.0]), 0.0);
+    }
+
+    /// Non-normalized vectors: the precomputed-norm path must match the naive
+    /// single-pass formula, and a zero vector must yield 0, not NaN.
+    #[test]
+    fn cosine_with_norms_matches_naive_formula() {
+        let left = [3.0_f32, -1.0, 2.5, 0.5];
+        let right = [0.5_f32, 4.0, -2.0, 1.0];
+
+        let naive = {
+            let dot: f32 = left.iter().zip(right).map(|(l, r)| l * r).sum();
+            let ln: f32 = left.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let rn: f32 = right.iter().map(|v| v * v).sum::<f32>().sqrt();
+            dot / (ln * rn)
+        };
+        let split = cosine_with_norms(&left, l2_norm(&left), &right, l2_norm(&right));
+        assert!((split - naive).abs() < 1e-6, "split={split} naive={naive}");
+
+        let zero = [0.0_f32; 4];
+        assert_eq!(
+            cosine_with_norms(&zero, l2_norm(&zero), &right, l2_norm(&right)),
+            0.0
+        );
     }
 
     #[test]

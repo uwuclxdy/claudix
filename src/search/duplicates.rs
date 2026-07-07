@@ -13,7 +13,7 @@ use serde::Serialize;
 
 use crate::store::StoredChunk;
 
-use super::cosine_similarity;
+use super::{cosine_with_norms, l2_norm};
 
 /// Stable identity tuple for a single chunk member, used as a tiebreak key.
 fn chunk_key(c: &DuplicateChunk) -> (&str, &str, u32) {
@@ -126,6 +126,10 @@ pub fn find_duplicates(
     // the heap, so rejected pairs allocate nothing beyond a similarity `f32`.
     let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(limit + 1);
 
+    // Each vector participates in ~n pairs; precompute every norm once so the
+    // O(n²) loop pays only the dot product.
+    let norms: Vec<f32> = chunks.iter().map(|c| l2_norm(&c.chunk.vector)).collect();
+
     for i in 0..chunks.len() {
         for j in (i + 1)..chunks.len() {
             let a = &chunks[i];
@@ -136,7 +140,7 @@ pub fn find_duplicates(
                 continue;
             }
 
-            let sim = cosine_similarity(&a.chunk.vector, &b.chunk.vector);
+            let sim = cosine_with_norms(&a.chunk.vector, norms[i], &b.chunk.vector, norms[j]);
             if sim < min_similarity {
                 continue;
             }
