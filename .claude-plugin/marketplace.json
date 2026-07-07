@@ -10,7 +10,7 @@
       "name": "claudix",
       "source": "./",
       "description": "Local semantic search for Claude Code.",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "license": "MIT",
       "category": "development",
       "tags": ["semantic-search", "rust", "mcp", "local-first"],
