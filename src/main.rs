@@ -254,6 +254,8 @@ async fn run() -> Result<()> {
         Command::Doctor => {
             let output = cli::run_doctor(&project_root).await?;
             println!("project_root: {}", output.project_root);
+            println!("binary_path: {}", output.binary_path);
+            println!("development_mode: {}", output.development_mode);
             println!("index_present: {}", output.index_present);
             print_index_stats(
                 output.chunk_count,
