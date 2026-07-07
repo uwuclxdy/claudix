@@ -41,11 +41,15 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
         HookEvent::PreToolUse => pre_tool_use::handle_pre_tool_use(project_root, payload).await,
         HookEvent::UserPromptSubmit => {
             let config = config::load(project_root).ok();
-            let index_ready = config
+            let store = config
                 .as_ref()
-                .and_then(|cfg| check_index_ready(project_root, cfg, "UserPromptSubmit"));
+                .and_then(|cfg| crate::store::Store::new(project_root, cfg).ok());
+            let index_ready = match (store.as_ref(), config.as_ref()) {
+                (Some(st), Some(cfg)) => check_index_ready(st, cfg, "UserPromptSubmit"),
+                _ => None,
+            };
             let neighbors =
-                take_change_neighbors_context(project_root, config.as_ref(), "UserPromptSubmit");
+                take_change_neighbors_context(store.as_ref(), config.as_ref(), "UserPromptSubmit");
             Ok(combine_hook_responses(
                 "UserPromptSubmit",
                 [index_ready, neighbors],

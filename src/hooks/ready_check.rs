@@ -12,12 +12,7 @@ use crate::store::marker::pending_index::{self, FAILURE_GRACE_SECS};
 pub(super) const PENDING_INDEX_READY_GRACE_SECS: u64 = 3;
 pub(super) const PENDING_INDEX_ACK_FILE_NAME: &str = "indexing-pending-acked";
 
-pub(super) fn check_index_ready(
-    project_root: &Path,
-    config: &Config,
-    event_name: &str,
-) -> Option<Value> {
-    let store = Store::new(project_root, config).ok()?;
+pub(super) fn check_index_ready(store: &Store, config: &Config, event_name: &str) -> Option<Value> {
     let marker_path = store.pending_index_marker_path();
     let ack_path = store.state_dir_path().join(PENDING_INDEX_ACK_FILE_NAME);
     let marker = pending_index::read(&marker_path)?;
@@ -50,7 +45,7 @@ pub(super) fn check_index_ready(
         let Some(manifest) = manifest else {
             // ts changed but the manifest is gone — treat as a failed run so
             // the user is informed instead of silently dropping the signal.
-            return Some(build_failed_response(project_root, config, event_name));
+            return Some(build_failed_response(store.project_root(), config, event_name));
         };
         return Some(indexing_complete_response(
             event_name,
@@ -89,7 +84,7 @@ pub(super) fn check_index_ready(
         return None;
     }
 
-    Some(build_failed_response(project_root, config, event_name))
+    Some(build_failed_response(store.project_root(), config, event_name))
 }
 
 /// Build the indexing-failed notice with a pointer to `index.log` and, when
@@ -172,7 +167,7 @@ mod tests {
         let payload = format!("none\n{stale_created_at}\n0\n");
         fs::write(store.pending_index_marker_path(), payload)?;
 
-        let response = check_index_ready(fixture.root(), &config, "PostToolUse");
+        let response = check_index_ready(&store, &config, "PostToolUse");
         let response = response.unwrap_or(Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -200,7 +195,7 @@ mod tests {
         let payload = format!("none\n{stale_created_at}\n{my_pid}\n");
         fs::write(store.pending_index_marker_path(), payload)?;
 
-        let response = check_index_ready(fixture.root(), &config, "PostToolUse");
+        let response = check_index_ready(&store, &config, "PostToolUse");
         assert!(
             response.is_none(),
             "must not declare failure while spawned child is alive"
@@ -232,7 +227,7 @@ mod tests {
         let payload = format!("none\n{stale_created_at}\n");
         fs::write(store.pending_index_marker_path(), payload)?;
 
-        let response = check_index_ready(fixture.root(), &config, "UserPromptSubmit");
+        let response = check_index_ready(&store, &config, "UserPromptSubmit");
         let response = response.unwrap_or(Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -267,7 +262,7 @@ mod tests {
         let payload = format!("none\n{stale_created_at}\n");
         fs::write(store.pending_index_marker_path(), payload)?;
 
-        let response = check_index_ready(fixture.root(), &config, "PostToolUse");
+        let response = check_index_ready(&store, &config, "PostToolUse");
         let response = response.unwrap_or(Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -295,7 +290,7 @@ mod tests {
         let payload = format!("none\n{stale_created_at}\n");
         fs::write(store.pending_index_marker_path(), payload)?;
 
-        let response = check_index_ready(fixture.root(), &config, "PostToolUse");
+        let response = check_index_ready(&store, &config, "PostToolUse");
         let response = response.unwrap_or(Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()

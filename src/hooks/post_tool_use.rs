@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -45,6 +45,13 @@ pub(super) async fn handle_post_tool_use(
         return Ok(None);
     }
 
+    // One Store for the whole event: every branch below needs its paths, and
+    // `Store::new` canonicalizes the root — building it per check multiplies
+    // that syscall cost on the busiest hook. `None` fail-opens every branch.
+    let store = config
+        .as_ref()
+        .and_then(|cfg| Store::new(project_root, cfg).ok());
+
     // Coalesce the no-watcher reindex path. The ready-check and
     // neighbor-surfacing run on every PostToolUse event regardless.
     //
@@ -60,10 +67,11 @@ pub(super) async fn handle_post_tool_use(
         && matches!(name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
-        && !watcher_alive(project_root, cfg)
+        && let Some(st) = store.as_ref()
+        && !watcher_alive(st)
         && let Some(input) = payload.tool_input.as_ref()
     {
-        let enqueued = enqueue_watchable_edits(project_root, cfg, input);
+        let enqueued = enqueue_watchable_edits(st, input);
         // Append-before-ensure-worker: the worker must see the entry when it
         // reads the queue. Claim-or-skip, so calling it every time is safe.
         if enqueued > 0 {
@@ -79,15 +87,16 @@ pub(super) async fn handle_post_tool_use(
     // Prefer not to drop any message: index-ready, change-neighbors, and
     // read-neighbors are all surfaced together. Index-ready goes first (most
     // urgent); the rest append in order.
-    let index_ready = config
-        .as_ref()
-        .and_then(|cfg| check_index_ready(project_root, cfg, "PostToolUse"));
+    let index_ready = match (store.as_ref(), config.as_ref()) {
+        (Some(st), Some(cfg)) => check_index_ready(st, cfg, "PostToolUse"),
+        _ => None,
+    };
 
     let change_neighbors =
-        take_change_neighbors_context(project_root, config.as_ref(), "PostToolUse");
+        take_change_neighbors_context(store.as_ref(), config.as_ref(), "PostToolUse");
 
     let read_neighbors = read_surfacing_context(
-        project_root,
+        store.as_ref(),
         config.as_ref(),
         tool_name,
         read_input.as_ref(),
@@ -117,7 +126,7 @@ pub(super) async fn handle_post_tool_use(
 /// Reuses [`neighbors`] over the read file's stored vectors — no embedding call.
 /// Fail-open: any error behaves as a noop.
 async fn read_surfacing_context(
-    project_root: &Path,
+    store: Option<&Store>,
     config: Option<&Config>,
     tool_name: Option<&str>,
     tool_input: Option<&ToolInput>,
@@ -138,19 +147,13 @@ async fn read_surfacing_context(
         return None;
     }
 
+    let store = store?;
+    let project_root = store.project_root();
+
     // Claude Code typically sends absolute paths. Strip the project root to get
     // a relative path so it matches what the store indexes. Reject anything that
     // escapes the project root (absolute path outside the root, or `..` traversal).
-    let raw = Path::new(file_path);
-    let relative = if raw.is_absolute() {
-        let raw_canonical = raw.canonicalize();
-        let raw_absolute = raw_canonical.as_deref().unwrap_or(raw);
-        let root_canonical = project_root.canonicalize();
-        let root_absolute = root_canonical.as_deref().unwrap_or(project_root);
-        raw_absolute.strip_prefix(root_absolute).ok()?.to_path_buf()
-    } else {
-        raw.to_path_buf()
-    };
+    let relative = project_relative(project_root, file_path)?;
     let read_path = RelativePath::from_path(&relative);
     read_path
         .reject_escape(prompts::hints::READ_INSIDE_PROJECT_DIR)
@@ -160,8 +163,6 @@ async fn read_surfacing_context(
     let end = input
         .limit
         .map(|count| start.saturating_add(count.saturating_sub(1)));
-
-    let store = Store::new(project_root, cfg).ok()?;
     // Read-time surfacing rides the hot `Read` path. `read_chunks` deserializes
     // every vector and the cosine scan is O(n²); on a large repo (or while a full
     // reindex holds the write lock) either can block for seconds and stall the
@@ -271,7 +272,7 @@ fn chunk_overlaps_window(
 /// Returns `None` when the marker is absent, feature is disabled, or the store
 /// cannot be constructed (fail-open).
 pub(super) fn take_change_neighbors_context(
-    project_root: &Path,
+    store: Option<&Store>,
     config: Option<&Config>,
     event_name: &str,
 ) -> Option<Value> {
@@ -279,7 +280,8 @@ pub(super) fn take_change_neighbors_context(
     if !cfg.hooks.surface_related_on_edit {
         return None;
     }
-    let store = Store::new(project_root, cfg).ok()?;
+    let store = store?;
+    let project_root = store.project_root();
     let marker_path = store.change_neighbors_marker_path();
     let marker = change_neighbors::read_and_remove(&marker_path)?;
 
@@ -366,10 +368,7 @@ pub(super) fn combine_hook_responses(
     }
 }
 
-pub(super) fn watcher_alive(project_root: &Path, config: &Config) -> bool {
-    let Ok(store) = Store::new(project_root, config) else {
-        return false;
-    };
+pub(super) fn watcher_alive(store: &Store) -> bool {
     crate::store::marker::is_alive(
         &store.watch_marker_path(),
         Duration::from_secs(WATCH_MARKER_STALE_SECS),
@@ -381,31 +380,22 @@ pub(super) fn watcher_alive(project_root: &Path, config: &Config) -> bool {
 /// Mirrors the watcher's `WatchFilter::is_watchable` check so PostToolUse
 /// doesn't fire a detached `claudix reindex-file` for `.claudix/manifest.json`,
 /// `.git/HEAD`, gitignored build artifacts, or paths outside the project root.
-/// Fail-open: any error during the check returns `true` so a legitimate edit
-/// is still reindexed if the filter setup itself fails.
-fn reindex_target_is_watchable(project_root: &Path, file_path: &str) -> bool {
-    let raw = Path::new(file_path);
-    let relative = if raw.is_absolute() {
-        // Canonicalise both sides so a project root on a symlinked prefix
-        // (macOS `/tmp` → `/private/tmp`) still strip-prefix-matches the
-        // canonical raw path Claude Code hands us.
-        let raw_canonical = raw.canonicalize();
-        let raw_absolute = raw_canonical.as_deref().unwrap_or(raw);
-        let root_canonical = project_root.canonicalize();
-        let root_absolute = root_canonical.as_deref().unwrap_or(project_root);
-        match raw_absolute.strip_prefix(root_absolute) {
-            Ok(relative) => relative.to_path_buf(),
-            Err(_) => return false,
-        }
-    } else {
-        raw.to_path_buf()
+/// Fail-open: a failed filter load (`None`) returns `true` so a legitimate
+/// edit is still reindexed if the filter setup itself fails.
+fn reindex_target_is_watchable(
+    canonical_root: &Path,
+    filter: Option<&WatchFilter>,
+    file_path: &str,
+) -> bool {
+    let Some(relative) = project_relative(canonical_root, file_path) else {
+        return false;
     };
     if relative.as_os_str().is_empty() {
         return false;
     }
-    match WatchFilter::load(project_root) {
-        Ok(filter) => filter.is_watchable(&relative),
-        Err(_) => true,
+    match filter {
+        Some(filter) => filter.is_watchable(&relative),
+        None => true,
     }
 }
 
@@ -418,18 +408,19 @@ fn reindex_target_is_watchable(project_root: &Path, file_path: &str) -> bool {
 /// [`canonical_dedup_key`]) so the same file arriving as an absolute path in one
 /// edit and a project-relative path in another coalesces to a single queue path,
 /// and the drain worker's `reindex_file` consumes the relative spelling directly.
-fn enqueue_watchable_edits(project_root: &Path, config: &Config, input: &ToolInput) -> usize {
-    let Ok(store) = Store::new(project_root, config) else {
-        return 0;
-    };
+fn enqueue_watchable_edits(store: &Store, input: &ToolInput) -> usize {
     if store.ensure_layout().is_err() {
         return 0;
     }
+    let root = store.project_root();
+    // The filter parses three ignore files; load it once per event, not per
+    // edited path. A failed load fail-opens inside the watchable check.
+    let filter = WatchFilter::load(root).ok();
     let queue_path = store.reindex_queue_path();
-    reindex_paths_from_input(project_root, input)
+    reindex_paths_from_input(root, input)
         .into_iter()
-        .filter(|p| reindex_target_is_watchable(project_root, p))
-        .filter(|p| reindex_queue::append(&queue_path, &canonical_dedup_key(project_root, p)))
+        .filter(|p| reindex_target_is_watchable(root, filter.as_ref(), p))
+        .filter(|p| reindex_queue::append(&queue_path, &canonical_dedup_key(root, p)))
         .count()
 }
 
@@ -470,25 +461,33 @@ fn reindex_paths_from_input(project_root: &Path, input: &ToolInput) -> Vec<Strin
 }
 
 /// Canonical project-relative dedup key for a tool-input path. Strips an
-/// absolute path to the project root (canonicalizing both sides so a symlinked
-/// prefix still matches) and normalizes separators via [`RelativePath`]. A path
-/// outside the project (or one that fails to strip) keys on its own normalized
-/// spelling — it is never reindexed anyway, so a unique key is harmless.
-fn canonical_dedup_key(project_root: &Path, file_path: &str) -> String {
+/// absolute path to the project root via [`project_relative`] and normalizes
+/// separators via [`RelativePath`]. A path outside the project (or one that
+/// fails to strip) keys on its own normalized spelling — it is never reindexed
+/// anyway, so a unique key is harmless.
+fn canonical_dedup_key(canonical_root: &Path, file_path: &str) -> String {
+    let relative = project_relative(canonical_root, file_path)
+        .unwrap_or_else(|| Path::new(file_path).to_path_buf());
+    RelativePath::from_path(&relative).as_str().to_owned()
+}
+
+/// Project-relative form of a tool-input path against an already-canonical
+/// project root (`Store::new` canonicalizes; hook entry canonicalizes too).
+/// The raw path is canonicalized so a symlinked prefix (macOS `/tmp` →
+/// `/private/tmp`) still strip-prefix-matches. `None` when the path is
+/// absolute but outside the project root.
+fn project_relative(canonical_root: &Path, file_path: &str) -> Option<PathBuf> {
     let raw = Path::new(file_path);
-    let relative = if raw.is_absolute() {
+    if raw.is_absolute() {
         let raw_canonical = raw.canonicalize();
         let raw_absolute = raw_canonical.as_deref().unwrap_or(raw);
-        let root_canonical = project_root.canonicalize();
-        let root_absolute = root_canonical.as_deref().unwrap_or(project_root);
         raw_absolute
-            .strip_prefix(root_absolute)
+            .strip_prefix(canonical_root)
+            .ok()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|_| raw.to_path_buf())
     } else {
-        raw.to_path_buf()
-    };
-    RelativePath::from_path(&relative).as_str().to_owned()
+        Some(raw.to_path_buf())
+    }
 }
 
 #[cfg(test)]
@@ -652,17 +651,34 @@ mod tests {
     #[test]
     fn reindex_target_is_watchable_rejects_index_internal_paths() {
         let fixture = TestFixture::new("small_rust").unwrap_or_else(|_| unreachable!());
-        assert!(reindex_target_is_watchable(fixture.root(), "src/math.rs"));
+        // Callers pass the store's canonical root; mirror that here so a
+        // symlinked temp prefix (macOS) still strip-prefix-matches.
+        let root = fixture
+            .root()
+            .canonicalize()
+            .unwrap_or_else(|_| fixture.root().to_path_buf());
+        let filter = WatchFilter::load(&root).ok();
+        assert!(reindex_target_is_watchable(
+            &root,
+            filter.as_ref(),
+            "src/math.rs"
+        ));
         assert!(!reindex_target_is_watchable(
-            fixture.root(),
+            &root,
+            filter.as_ref(),
             ".claudix/manifest.json"
         ));
-        assert!(!reindex_target_is_watchable(fixture.root(), ".git/HEAD"));
+        assert!(!reindex_target_is_watchable(
+            &root,
+            filter.as_ref(),
+            ".git/HEAD"
+        ));
         // Outside the project root: claude code generally resolves to absolute
         // paths inside CLAUDE_PROJECT_DIR, but defend in depth.
         let absolute_outside = std::env::temp_dir().join("nope.rs");
         assert!(!reindex_target_is_watchable(
-            fixture.root(),
+            &root,
+            filter.as_ref(),
             &absolute_outside.to_string_lossy(),
         ));
     }
@@ -805,7 +821,7 @@ mod tests {
         fs::write(&marker_path, std::process::id().to_string())?;
 
         assert!(
-            watcher_alive(fixture.root(), &config),
+            watcher_alive(&store),
             "current-PID watch marker must register as alive"
         );
         Ok(())
@@ -815,7 +831,8 @@ mod tests {
     async fn watcher_alive_returns_false_without_marker() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;
         let config = stub_config();
-        assert!(!watcher_alive(fixture.root(), &config));
+        let store = Store::new(fixture.root(), &config)?;
+        assert!(!watcher_alive(&store));
         Ok(())
     }
 
@@ -862,7 +879,7 @@ mod tests {
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
 
-        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
         let response = response.unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -898,7 +915,7 @@ mod tests {
             "marker must exist before read"
         );
 
-        let _ = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let _ = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
 
         assert!(
             !store.change_neighbors_marker_path().exists(),
@@ -916,7 +933,7 @@ mod tests {
         store.ensure_layout()?;
 
         // No marker written — must produce None.
-        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
         assert!(
             response.is_none(),
             "absent marker must produce no additionalContext"
@@ -939,7 +956,7 @@ mod tests {
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
 
-        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
         assert!(
             response.is_none(),
             "surface_related_on_edit = false must suppress output even when marker is present"
@@ -966,7 +983,7 @@ mod tests {
             ],
         );
 
-        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
         let response = response.unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -999,7 +1016,7 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
         let response = response.unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -1016,7 +1033,7 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
         assert!(
             response.is_none(),
             "identical (edited → neighbor) pair already surfaced this session must be suppressed"
@@ -1038,7 +1055,7 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let _ = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let _ = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
 
         // Same neighbor, different edited file → different dedup key → surfaces.
         write_neighbors_marker(
@@ -1046,7 +1063,7 @@ mod tests {
             "src/other.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let response = take_change_neighbors_context(fixture.root(), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
         let response = response.unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
