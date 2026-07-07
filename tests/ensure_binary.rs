@@ -144,8 +144,11 @@ fn run_install(
     output.ok().unwrap_or_else(|| unreachable!())
 }
 
-/// Local fake release server. Serves `claudix-linux-x86_64` with HTTP 404 for the
-/// first `miss` requests, then the stub bytes; always serves a matching SHA256SUMS.
+/// Local fake release server. Serves the release metadata (`/release.json` carrying
+/// the asset's `sha256:` digest, mirroring GitHub's releases API) with HTTP 404 for
+/// the first `miss` requests, then the JSON; always serves the `claudix-linux-x86_64`
+/// bytes. The bootstrap resolves the digest before downloading, so gating the
+/// metadata exercises its transient-retry path.
 /// node argv: [2]=binary path, [3]=miss count, [4]=port file ([0]=exe, [1]=script).
 const SERVER_SRC: &str = r#"const http=require('http'),crypto=require('crypto'),fs=require('fs');
 const bin=fs.readFileSync(process.argv[2]);
@@ -154,10 +157,10 @@ const sum=crypto.createHash('sha256').update(bin).digest('hex');
 let n=0;
 const srv=http.createServer((q,r)=>{
   const u=q.url||'';
-  if(u.endsWith('/claudix-linux-x86_64')){
+  if(u.endsWith('/release.json')){
     if(n<miss){n++;r.statusCode=404;r.end('nope');return;}
-    r.end(bin);
-  }else if(u.endsWith('/SHA256SUMS')){r.end(sum+'  claudix-linux-x86_64\n');}
+    r.end(JSON.stringify({assets:[{name:'claudix-linux-x86_64',digest:'sha256:'+sum}]}));
+  }else if(u.endsWith('/claudix-linux-x86_64')){r.end(bin);}
   else{r.statusCode=404;r.end();}
 });
 srv.listen(0,'127.0.0.1',()=>fs.writeFileSync(process.argv[4],String(srv.address().port)));

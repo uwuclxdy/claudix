@@ -191,7 +191,7 @@ async function sha256File(p) {
   for await (const chunk of fs.createReadStream(p)) h.update(chunk);
   return h.digest('hex');
 }
-function fetchFile(url, dest) {
+function fetchFile(url, dest, headers) {
   return new Promise((resolve, reject) => {
     if (url.startsWith('file://')) {
       fs.promises.copyFile(url.slice('file://'.length), dest).then(resolve, (e) => {
@@ -203,7 +203,7 @@ function fetchFile(url, dest) {
     const proto = url.startsWith('https') ? https : http;
     let hops = 0;
     const doGet = (u) => {
-      const req = proto.get(u, { timeout: 270000 }, (res) => {
+      const req = proto.get(u, { timeout: 270000, headers: headers || {} }, (res) => {
         if (
           res.statusCode >= 300 &&
           res.statusCode < 400 &&
@@ -259,6 +259,50 @@ async function fetchFileWithRetry(label, url, dest) {
     } catch (err) {
       if (!isTransientNetError(err) || Date.now() >= deadline) throw err;
       log(label + ' not ready (' + (err.message || err) + '); retrying...');
+      await new Promise((r) => setTimeout(r, RELEASE_RETRY_MS));
+    }
+  }
+}
+
+// GitHub stamps every release asset with an immutable sha256 `digest`
+// ("sha256:<hex>", releases API since 2025) at upload time — the checksum source of
+// truth, so no sidecar sums file is needed. api.github.com REQUIRES a User-Agent
+// (403s without one); a token (GITHUB_TOKEN/GH_TOKEN), when present, lifts the 60/hr
+// anonymous rate limit.
+function githubApiHeaders() {
+  const h = { 'User-Agent': PLUGIN_NAME + '-bootstrap', Accept: 'application/vnd.github+json' };
+  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  if (token) h.Authorization = 'Bearer ' + token;
+  return h;
+}
+// Release-metadata endpoint. A CLAUDIX_RELEASE_BASE_URL override (tests / mirrors)
+// serves a `release.json` sidecar next to the assets; otherwise hit the real API.
+function releaseApiUrl(version) {
+  if (process.env.CLAUDIX_RELEASE_API_URL) return process.env.CLAUDIX_RELEASE_API_URL;
+  const base = process.env.CLAUDIX_RELEASE_BASE_URL;
+  if (base) return base.replace(/\/+$/, '') + '/release.json';
+  return 'https://api.github.com/repos/' + GITHUB_REPO + '/releases/tags/v' + version;
+}
+// Poll the release metadata until the asset carries a sha256 digest. The digest
+// only appears once release.yml finishes uploading the asset, so a not-yet-present
+// digest retries within the same transient window the binary download uses — and a
+// present digest guarantees the binary itself is downloadable.
+async function resolveExpectedSha256(apiUrl, asset, tmpDir) {
+  const metaPath = path.join(tmpDir, 'release.json');
+  const headers = githubApiHeaders();
+  const deadline = Date.now() + RELEASE_WAIT_MS;
+  for (;;) {
+    try {
+      await fetchFile(apiUrl, metaPath, headers);
+      const meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
+      const found = (meta.assets || []).find((a) => a.name === asset);
+      const digest = found && found.digest;
+      if (digest && digest.startsWith('sha256:')) return digest.slice('sha256:'.length);
+      throw new Error('release asset ' + asset + ' has no sha256 digest yet');
+    } catch (err) {
+      const pending = /has no sha256 digest yet$/.test(String((err && err.message) || err));
+      if ((!isTransientNetError(err) && !pending) || Date.now() >= deadline) throw err;
+      log('release checksum for ' + asset + ' not ready (' + ((err && err.message) || err) + '); retrying...');
       await new Promise((r) => setTimeout(r, RELEASE_RETRY_MS));
     }
   }
@@ -345,25 +389,18 @@ async function installFromRelease(version, platform) {
     process.env.CLAUDIX_RELEASE_BASE_URL ||
     'https://github.com/' + GITHUB_REPO + '/releases/download/v' + version;
 
+  const apiUrl = releaseApiUrl(version);
+
   await fs.promises.mkdir(BIN_DIR, { recursive: true });
   const tmpDir = await fs.promises.mkdtemp(path.join(CACHE_DIR, 'download.'));
   const assetPath = path.join(tmpDir, asset);
-  const sumsPath = path.join(tmpDir, 'SHA256SUMS');
   try {
     log('downloading ' + asset + ' v' + version);
     await logAppend('downloading ' + asset + ' v' + version);
+    // Resolve GitHub's per-asset sha256 digest first: it only lands once the asset
+    // is fully uploaded, so a present digest means the binary is ready to fetch.
+    const expected = await resolveExpectedSha256(apiUrl, asset, tmpDir);
     await fetchFileWithRetry(asset, baseUrl + '/' + asset, assetPath);
-    await fetchFileWithRetry('SHA256SUMS', baseUrl + '/SHA256SUMS', sumsPath);
-    const sums = await fs.promises.readFile(sumsPath, 'utf8');
-    let expected = null;
-    for (const line of sums.split('\n')) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length === 2 && parts[1] === asset) {
-        expected = parts[0];
-        break;
-      }
-    }
-    if (!expected) throw new Error('SHA256SUMS does not contain ' + asset);
     const actual = await sha256File(assetPath);
     if (actual !== expected) throw new Error('checksum mismatch for ' + asset);
     if (!isWindows) await fs.promises.chmod(assetPath, 0o755);
