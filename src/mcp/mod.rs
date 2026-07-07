@@ -16,8 +16,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::cli;
+use crate::config;
+use crate::embedding::{ProviderCache, side_channel};
 use crate::error::{ClaudixError, RecoveryHint};
 use crate::prompts::hints;
+use crate::store::Store;
 
 /// What every `#[tool]` handler returns. The `Ok` always carries a
 /// `CallToolResult`; a failed tool run is an `Ok(CallToolResult::error(..))`, not
@@ -70,14 +73,18 @@ struct ReindexFileRequest {
 #[derive(Clone)]
 pub struct ClaudixServer {
     project_root: PathBuf,
+    /// Warm provider shared with the embed side channel: the first search or
+    /// hook embed pays the build, the rest of the session reuses it.
+    provider_cache: Arc<ProviderCache>,
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
 impl ClaudixServer {
-    fn new(project_root: PathBuf) -> Self {
+    fn new(project_root: PathBuf, provider_cache: Arc<ProviderCache>) -> Self {
         Self {
             project_root,
+            provider_cache,
             tool_router: Self::tool_router(),
         }
     }
@@ -91,8 +98,9 @@ impl ClaudixServer {
                 recovery: RecoveryHint(hints::QUERY_NON_EMPTY),
             }));
         }
-        let outcome = cli::run_search(
+        let outcome = cli::run_search_cached(
             &self.project_root,
+            &self.provider_cache,
             request.query,
             request.top_k.map(|value| value as usize),
             request.language_filter,
@@ -209,11 +217,36 @@ fn tool_catalog() -> std::result::Result<Vec<Tool>, ErrorData> {
 }
 
 pub async fn run(project_root: impl AsRef<Path>) -> crate::error::Result<()> {
-    let server = ClaudixServer::new(project_root.as_ref().to_path_buf());
+    let project_root = project_root.as_ref().to_path_buf();
+    let provider_cache = Arc::new(ProviderCache::new());
+    let server = ClaudixServer::new(project_root.clone(), Arc::clone(&provider_cache));
+
+    // Warm-embed side channel for hook processes: fail-open, the MCP server
+    // must serve normally when the listener or marker cannot be set up. The
+    // marker path needs a Store (config + canonical root); any failure along
+    // the way just means hooks stay on their cold path.
+    let embed_marker = config::load(&project_root)
+        .ok()
+        .and_then(|config| Store::new(&project_root, &config).ok())
+        // On a never-indexed repo the state dir doesn't exist yet and the
+        // marker write would silently fail, muting the warm channel for the
+        // whole session.
+        .filter(|store| store.ensure_layout().is_ok())
+        .map(|store| store.embed_port_marker_path());
+    if let Some(marker_path) = embed_marker.clone()
+        && let Ok(listener) = side_channel::bind_and_advertise(&marker_path).await
+    {
+        tokio::spawn(side_channel::serve_embed_requests(
+            listener,
+            project_root,
+            provider_cache,
+        ));
+    }
+
     // The service driver is spawned with `spawn_local` under the `local` feature,
     // so it must run inside a `LocalSet`.
     let local = tokio::task::LocalSet::new();
-    local
+    let outcome = local
         .run_until(async move {
             let running = server
                 .serve(stdio())
@@ -225,7 +258,12 @@ pub async fn run(project_root: impl AsRef<Path>) -> crate::error::Result<()> {
                 .map_err(|error| ClaudixError::Mcp(error.to_string()))?;
             Ok(())
         })
-        .await
+        .await;
+
+    if let Some(marker_path) = embed_marker {
+        side_channel::withdraw(&marker_path);
+    }
+    outcome
 }
 
 /// Convert one `prompts::mcp` JSON tool definition into an rmcp `Tool`. Keeps
@@ -283,7 +321,8 @@ mod tests {
 
     #[test]
     fn get_info_advertises_server_info() {
-        let info = ClaudixServer::new(PathBuf::from(".")).get_info();
+        let info =
+            ClaudixServer::new(PathBuf::from("."), Arc::new(ProviderCache::new())).get_info();
 
         assert_eq!(info.server_info.name, env!("CARGO_PKG_NAME"));
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
@@ -331,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn reindex_file_rejects_empty_path() {
-        let server = ClaudixServer::new(PathBuf::from("."));
+        let server = ClaudixServer::new(PathBuf::from("."), Arc::new(ProviderCache::new()));
         let outcome = server
             .reindex_file(Parameters(ReindexFileRequest {
                 path: "   ".to_owned(),

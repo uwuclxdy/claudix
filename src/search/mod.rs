@@ -59,7 +59,9 @@ const QUERY_BUDGET_WARN_MS: u64 = 200;
 pub struct Searcher {
     project_root: PathBuf,
     store: Store,
-    embedder: Arc<dyn Provider>,
+    /// `None` only via [`Searcher::without_embedder`]: every query must then
+    /// arrive with a precomputed vector.
+    embedder: Option<Arc<dyn Provider>>,
     config: SearchConfig,
 }
 
@@ -73,12 +75,46 @@ impl Searcher {
         Self {
             project_root,
             store,
-            embedder,
+            embedder: Some(embedder),
+            config,
+        }
+    }
+
+    /// Provider-less searcher for callers that already hold the query vector
+    /// (the PreToolUse hook, which gets it from the warm MCP side channel and
+    /// must never pay a provider cold build). Only
+    /// [`Searcher::search_with_query_vector`] works on this instance.
+    pub fn without_embedder(project_root: PathBuf, store: Store, config: SearchConfig) -> Self {
+        Self {
+            project_root,
+            store,
+            embedder: None,
             config,
         }
     }
 
     pub async fn search(&self, query: SearchQuery) -> Result<SearchResults> {
+        self.search_impl(query, None).await
+    }
+
+    /// Search with a precomputed query vector; no embedding call is made.
+    /// `expected_dimensions` is the caller's reference identity (typically the
+    /// active manifest's) — the vector is validated against it.
+    pub async fn search_with_query_vector(
+        &self,
+        query: SearchQuery,
+        query_vector: Vec<f32>,
+        expected_dimensions: Dimension,
+    ) -> Result<SearchResults> {
+        validate_query_vector(&query_vector, expected_dimensions)?;
+        self.search_impl(query, Some(query_vector)).await
+    }
+
+    async fn search_impl(
+        &self,
+        query: SearchQuery,
+        query_vector: Option<Vec<f32>>,
+    ) -> Result<SearchResults> {
         let search_start = std::time::Instant::now();
         let limit = effective_top_k(query.top_k, self.config.top_k);
         if limit == 0 || query.query.trim().is_empty() {
@@ -88,7 +124,7 @@ impl Searcher {
             });
         }
 
-        let mut found = self.search_all(query).await?;
+        let mut found = self.search_all(query, query_vector).await?;
         found.results = deduplicate_by_file_path(found.results);
         found.results.truncate(limit);
 
@@ -104,7 +140,11 @@ impl Searcher {
         Ok(found)
     }
 
-    async fn search_all(&self, query: SearchQuery) -> Result<SearchResults> {
+    async fn search_all(
+        &self,
+        query: SearchQuery,
+        precomputed_vector: Option<Vec<f32>>,
+    ) -> Result<SearchResults> {
         if query.query.trim().is_empty() {
             return Ok(SearchResults {
                 results: Vec::new(),
@@ -120,19 +160,31 @@ impl Searcher {
             });
         }
 
-        // Embed the query once with the active embedder. Its model/dimensions
-        // are the reference identity every cross-repo's vectors must match.
-        // When the active provider has bundled fallback enabled, this call falls
-        // back before ranking the non-empty corpus.
-        let vectors = self.embedder.embed(&[query.query.as_str()]).await?;
-        if vectors.len() != 1 {
-            return Err(ClaudixError::Embedding(format!(
-                "provider returned {} vectors for 1 query",
-                vectors.len()
-            )));
-        }
-        let query_vector = vectors.into_iter().next().unwrap_or_default();
-        validate_query_vector(&query_vector, self.embedder.dimensions())?;
+        let query_vector = match precomputed_vector {
+            Some(vector) => vector,
+            None => {
+                let embedder = self.embedder.as_ref().ok_or_else(|| {
+                    ClaudixError::Embedding(
+                        "provider-less searcher requires a precomputed query vector".to_owned(),
+                    )
+                })?;
+                // Embed the query once with the active embedder. Its
+                // model/dimensions are the reference identity every
+                // cross-repo's vectors must match. When the active provider
+                // has bundled fallback enabled, this call falls back before
+                // ranking the non-empty corpus.
+                let vectors = embedder.embed(&[query.query.as_str()]).await?;
+                if vectors.len() != 1 {
+                    return Err(ClaudixError::Embedding(format!(
+                        "provider returned {} vectors for 1 query",
+                        vectors.len()
+                    )));
+                }
+                let query_vector = vectors.into_iter().next().unwrap_or_default();
+                validate_query_vector(&query_vector, embedder.dimensions())?;
+                query_vector
+            }
+        };
 
         let config = self.config.clone();
         let mut results =
@@ -166,10 +218,22 @@ impl Searcher {
             return Ok((labeled, repo_errors));
         }
 
-        // Reference identity comes from the active manifest so the single query
-        // embedding is comparable to every repo's stored vectors.
-        let ref_model = self.embedder.model_id();
-        let ref_dims = self.embedder.dimensions().0;
+        // Reference identity: the active embedder when present, else the
+        // active manifest (provider-less searchers hold a vector that was
+        // produced by the manifest's model). Either way the single query
+        // embedding must be comparable to every repo's stored vectors.
+        let (ref_model, ref_dims) = match self.embedder.as_ref() {
+            Some(embedder) => (embedder.model_id().to_owned(), embedder.dimensions().0),
+            None => {
+                let manifest = self.store.read_manifest()?.ok_or_else(|| {
+                    ClaudixError::Store(
+                        "cross-repo search needs a manifest to establish the reference embedding identity".to_owned(),
+                    )
+                })?;
+                (manifest.embedding_model.clone(), manifest.dimensions)
+            }
+        };
+        let ref_model = ref_model.as_str();
         let mut seen: HashSet<Arc<str>> = HashSet::from([Arc::clone(&active_repo)]);
 
         for repo in &query.repos {
@@ -257,13 +321,9 @@ fn rank_rows(
         .iter()
         .zip(bm25_per_row)
         .map(|((_, row), bm25)| {
-            let dense = cosine_with_norms(
-                &query_vector,
-                query_norm,
-                &row.vector,
-                l2_norm(&row.vector),
-            )
-            .max(0.0);
+            let dense =
+                cosine_with_norms(&query_vector, query_norm, &row.vector, l2_norm(&row.vector))
+                    .max(0.0);
             RowScore {
                 dense,
                 bm25,
@@ -1058,13 +1118,16 @@ mod tests {
         );
 
         let output = searcher
-            .search_all(SearchQuery {
-                query: "add".to_owned(),
-                top_k: 10,
-                language_filter: None,
-                path_prefix: None,
-                repos: Vec::new(),
-            })
+            .search_all(
+                SearchQuery {
+                    query: "add".to_owned(),
+                    top_k: 10,
+                    language_filter: None,
+                    path_prefix: None,
+                    repos: Vec::new(),
+                },
+                None,
+            )
             .await?;
 
         assert!(output.results.is_empty());
@@ -1089,13 +1152,16 @@ mod tests {
         );
 
         let error = searcher
-            .search_all(SearchQuery {
-                query: "add".to_owned(),
-                top_k: 10,
-                language_filter: None,
-                path_prefix: None,
-                repos: Vec::new(),
-            })
+            .search_all(
+                SearchQuery {
+                    query: "add".to_owned(),
+                    top_k: 10,
+                    language_filter: None,
+                    path_prefix: None,
+                    repos: Vec::new(),
+                },
+                None,
+            )
             .await;
 
         assert!(
@@ -1328,13 +1394,16 @@ mod tests {
 
         let results = harness
             .searcher
-            .search_all(SearchQuery {
-                query: "pub".to_owned(),
-                top_k: 10,
-                language_filter: None,
-                path_prefix: None,
-                repos: Vec::new(),
-            })
+            .search_all(
+                SearchQuery {
+                    query: "pub".to_owned(),
+                    top_k: 10,
+                    language_filter: None,
+                    path_prefix: None,
+                    repos: Vec::new(),
+                },
+                None,
+            )
             .await;
         assert!(results.is_ok());
         let results = results.ok().unwrap_or_else(|| unreachable!()).results;

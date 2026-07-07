@@ -75,6 +75,17 @@ impl IndexProgress for () {
 impl Claudix {
     pub async fn new(project_root: PathBuf, config: Arc<Config>) -> Result<Self> {
         let embedder = build_provider(config.as_ref()).await?;
+        Self::with_embedder(project_root, config, embedder)
+    }
+
+    /// Construct around an already-built provider (e.g. from a
+    /// [`crate::embedding::ProviderCache`]) so a long-lived process skips the
+    /// per-call provider build. Same manifest validation as [`Claudix::new`].
+    pub fn with_embedder(
+        project_root: PathBuf,
+        config: Arc<Config>,
+        embedder: Arc<dyn Provider>,
+    ) -> Result<Self> {
         let store = Store::new(&project_root, config.as_ref())?;
         store.validate_manifest_compatibility(embedder.model_id(), embedder.dimensions().0)?;
 
@@ -544,7 +555,7 @@ impl Claudix {
     }
 }
 
-async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
+pub(crate) async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
     let dimensions = Dimension(config.embedding.dimensions);
 
     #[cfg(any(test, feature = "test-stub"))]

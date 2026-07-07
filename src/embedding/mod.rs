@@ -1,5 +1,6 @@
 pub mod bundled;
 pub mod http;
+pub mod side_channel;
 #[cfg(any(test, feature = "test-stub"))]
 pub mod stub;
 
@@ -8,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 
+use crate::config::Config;
 use crate::error::Result;
 use crate::types::Dimension;
 
@@ -15,6 +17,36 @@ pub use bundled::BundledProvider;
 pub use http::HttpProvider;
 #[cfg(any(test, feature = "test-stub"))]
 pub use stub::StubProvider;
+
+/// Session-lifetime cache of the built provider, keyed by the embedding config
+/// that produced it. The bundled ONNX session build dominates provider cost;
+/// a long-lived process (the MCP server) reuses one instance across searches
+/// and hook embed requests, rebuilding only when the embedding config changes.
+#[derive(Default)]
+pub struct ProviderCache {
+    inner: tokio::sync::Mutex<Option<(String, Arc<dyn Provider>)>>,
+}
+
+impl ProviderCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub async fn get_or_build(&self, config: &Config) -> Result<Arc<dyn Provider>> {
+        let fingerprint = serde_json::to_string(&config.embedding)?;
+        // The lock is held across the build on purpose: concurrent first
+        // requests must not race two ONNX session loads.
+        let mut slot = self.inner.lock().await;
+        if let Some((cached_fingerprint, provider)) = slot.as_ref()
+            && *cached_fingerprint == fingerprint
+        {
+            return Ok(Arc::clone(provider));
+        }
+        let provider = crate::build_provider(config).await?;
+        *slot = Some((fingerprint, Arc::clone(&provider)));
+        Ok(provider)
+    }
+}
 
 #[async_trait]
 pub trait Provider: Send + Sync {

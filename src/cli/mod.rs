@@ -614,6 +614,51 @@ pub async fn run_search(
     path_prefix: Option<String>,
     repos: Option<Vec<String>>,
 ) -> Result<SearchOutput> {
+    run_search_impl(
+        project_root,
+        None,
+        query,
+        top_k,
+        language_filter,
+        path_prefix,
+        repos,
+    )
+    .await
+}
+
+/// `run_search` that draws the provider from a session-lifetime cache; the MCP
+/// server uses this so only the first search of a session pays the provider
+/// build (the bundled ONNX session load dominates otherwise).
+pub async fn run_search_cached(
+    project_root: impl AsRef<Path>,
+    provider_cache: &crate::embedding::ProviderCache,
+    query: String,
+    top_k: Option<usize>,
+    language_filter: Option<Vec<String>>,
+    path_prefix: Option<String>,
+    repos: Option<Vec<String>>,
+) -> Result<SearchOutput> {
+    run_search_impl(
+        project_root,
+        Some(provider_cache),
+        query,
+        top_k,
+        language_filter,
+        path_prefix,
+        repos,
+    )
+    .await
+}
+
+async fn run_search_impl(
+    project_root: impl AsRef<Path>,
+    provider_cache: Option<&crate::embedding::ProviderCache>,
+    query: String,
+    top_k: Option<usize>,
+    language_filter: Option<Vec<String>>,
+    path_prefix: Option<String>,
+    repos: Option<Vec<String>>,
+) -> Result<SearchOutput> {
     validate_search_query(&query)?;
     let project_root = canonical_project_root(project_root.as_ref())?;
     let config = config::load(&project_root)?;
@@ -622,7 +667,13 @@ pub async fn run_search(
     // Active project is always in scope; union the config cross_repos with the
     // per-call repos, deduped at search time by canonical path.
     let repos = effective_cross_repos(&config.search.cross_repos, repos);
-    let claudix = Claudix::new(project_root, Arc::new(config)).await?;
+    let claudix = match provider_cache {
+        Some(cache) => {
+            let provider = cache.get_or_build(&config).await?;
+            Claudix::with_embedder(project_root, Arc::new(config), provider)?
+        }
+        None => Claudix::new(project_root, Arc::new(config)).await?,
+    };
 
     run_search_with_claudix(&claudix, query, top_k, language_filter, path_prefix, repos).await
 }

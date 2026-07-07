@@ -114,6 +114,14 @@ impl Store {
         self.paths.state_dir.join("watch.pid")
     }
 
+    /// Loopback port advertisement for the MCP server's warm-embed side
+    /// channel. See [`crate::embedding::side_channel`].
+    pub fn embed_port_marker_path(&self) -> PathBuf {
+        self.paths
+            .state_dir
+            .join(crate::embedding::side_channel::EMBED_PORT_MARKER_FILE_NAME)
+    }
+
     /// Append-only queue of edited paths awaiting a debounced no-watcher
     /// reindex. Hooks append; the single drain worker reads, reindexes, and
     /// rewrites it. See [`marker::reindex_queue`].

@@ -45,7 +45,11 @@ pub(super) fn check_index_ready(store: &Store, config: &Config, event_name: &str
         let Some(manifest) = manifest else {
             // ts changed but the manifest is gone — treat as a failed run so
             // the user is informed instead of silently dropping the signal.
-            return Some(build_failed_response(store.project_root(), config, event_name));
+            return Some(build_failed_response(
+                store.project_root(),
+                config,
+                event_name,
+            ));
         };
         return Some(indexing_complete_response(
             event_name,
@@ -84,7 +88,11 @@ pub(super) fn check_index_ready(store: &Store, config: &Config, event_name: &str
         return None;
     }
 
-    Some(build_failed_response(store.project_root(), config, event_name))
+    Some(build_failed_response(
+        store.project_root(),
+        config,
+        event_name,
+    ))
 }
 
 /// Build the indexing-failed notice with a pointer to `index.log` and, when

@@ -113,9 +113,7 @@ pub fn neighbors(
         let row_score = query_vectors
             .iter()
             .zip(&query_norms)
-            .map(|(qv, &qv_norm)| {
-                cosine_with_norms(qv, qv_norm, &row.vector, row_norm).max(0.0)
-            })
+            .map(|(qv, &qv_norm)| cosine_with_norms(qv, qv_norm, &row.vector, row_norm).max(0.0))
             .fold(0.0_f32, f32::max);
 
         let entry = best.entry(row.file_path.as_str()).or_insert((0.0, row));
