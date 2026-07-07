@@ -465,16 +465,11 @@ impl Store {
         let dimension = Dimension(config.embedding.dimensions);
         let replacement_rows = stored_chunks_from_embedded(chunks, dimension)?;
         let replacement_paths = distinct_file_paths(&replacement_rows);
-        let existing_rows = self.read_chunks().await?;
+        self.delete_paths_and_append(&replacement_paths, replacement_rows, dimension)
+            .await?;
 
-        let mut merged_rows: Vec<_> = existing_rows
-            .into_iter()
-            .filter(|row| !replacement_paths.contains(&row.file_path))
-            .collect();
-        merged_rows.extend(replacement_rows);
-        sort_rows(&mut merged_rows);
-
-        let stats = stats_from_rows(&merged_rows);
+        let metadata = self.read_chunk_metadata().await?;
+        let stats = stats_from_metadata(&metadata);
         // Preserve no-chunk file hashes from the existing manifest so that files
         // that produce no chunks but were tracked by a prior index_full are not
         // forgotten by a per-file replace operation.
@@ -486,8 +481,7 @@ impl Store {
         for path in &replacement_paths {
             file_hashes.remove(path.as_str());
         }
-        file_hashes.extend(file_hashes_from_rows(&merged_rows));
-        self.persist_rows(merged_rows, dimension).await?;
+        file_hashes.extend(file_hashes_from_metadata(&metadata));
         self.sync_manifest_with_timestamp(config, &stats, file_hashes, false)?;
         Ok(stats)
     }
@@ -498,23 +492,19 @@ impl Store {
         config: &Config,
     ) -> Result<StoreStats> {
         let dimension = Dimension(config.embedding.dimensions);
-        let mut remaining_rows: Vec<_> = self
-            .read_chunks()
-            .await?
-            .into_iter()
-            .filter(|row| row.file_path != relative_path.as_str())
-            .collect();
-        sort_rows(&mut remaining_rows);
+        let paths = BTreeSet::from([relative_path.as_str().to_owned()]);
+        self.delete_paths_and_append(&paths, Vec::new(), dimension)
+            .await?;
 
-        let stats = stats_from_rows(&remaining_rows);
+        let metadata = self.read_chunk_metadata().await?;
+        let stats = stats_from_metadata(&metadata);
         let base = self
             .read_manifest()?
             .map(|m| m.file_hashes)
             .unwrap_or_default();
         let mut file_hashes = base;
         file_hashes.remove(relative_path.as_str());
-        file_hashes.extend(file_hashes_from_rows(&remaining_rows));
-        self.persist_rows(remaining_rows, dimension).await?;
+        file_hashes.extend(file_hashes_from_metadata(&metadata));
         self.sync_manifest_with_timestamp(config, &stats, file_hashes, false)?;
         Ok(stats)
     }
@@ -537,14 +527,17 @@ impl Store {
         }
 
         let dimension = Dimension(config.embedding.dimensions);
-        let remaining_rows: Vec<_> = self
-            .read_chunks()
-            .await?
-            .into_iter()
-            .filter(|row| !missing.contains(&row.file_path))
-            .collect();
+        let paths: BTreeSet<String> = missing.iter().cloned().collect();
+        self.delete_paths_and_append(&paths, Vec::new(), dimension)
+            .await?;
 
-        let stats = stats_from_rows(&remaining_rows);
+        // The metadata scan above already describes the post-delete table:
+        // everything not in `missing` survives. No second read needed.
+        let remaining: Vec<ChunkMetadata> = metadata
+            .into_iter()
+            .filter(|entry| !missing.contains(&entry.file_path))
+            .collect();
+        let stats = stats_from_metadata(&remaining);
         let mut file_hashes = self
             .read_manifest()?
             .map(|m| m.file_hashes)
@@ -552,8 +545,7 @@ impl Store {
         for path in &missing {
             file_hashes.remove(path.as_str());
         }
-        file_hashes.extend(file_hashes_from_rows(&remaining_rows));
-        self.persist_rows(remaining_rows, dimension).await?;
+        file_hashes.extend(file_hashes_from_metadata(&remaining));
         self.sync_manifest_with_timestamp(config, &stats, file_hashes, false)?;
         Ok(Some(stats))
     }
@@ -612,6 +604,53 @@ impl Store {
 
         let manifest = Manifest::for_config(config);
         self.write_manifest(&manifest)
+    }
+
+    /// Delete every row whose `file_path` is in `paths`, then append
+    /// `new_rows`. The single-file mutation shape: unlike [`Self::persist_rows`]
+    /// (drop table + rewrite everything), untouched files' rows never leave the
+    /// table, so a crash mid-operation leaves a present-but-partial table that
+    /// the next manifest-hash comparison reindexes — never the empty-table
+    /// state the row-count gate exists for.
+    async fn delete_paths_and_append(
+        &self,
+        paths: &BTreeSet<String>,
+        new_rows: Vec<StoredChunk>,
+        dimension: Dimension,
+    ) -> Result<()> {
+        use arrow_array::{RecordBatchIterator, RecordBatchReader};
+
+        self.ensure_layout()?;
+        let connection = self.open_connection().await?;
+        let table = if self.chunks_table_exists(&connection).await? {
+            connection
+                .open_table(CHUNKS_TABLE_NAME)
+                .execute()
+                .await
+                .map_err(ClaudixError::from)?
+        } else {
+            connection
+                .create_empty_table(CHUNKS_TABLE_NAME, chunk_schema(dimension))
+                .execute()
+                .await?
+        };
+
+        if !paths.is_empty() {
+            let literals: Vec<String> = paths.iter().map(|p| sql_string_literal(p)).collect();
+            let predicate = format!("file_path IN ({})", literals.join(", "));
+            table.delete(&predicate).await?;
+        }
+
+        if new_rows.is_empty() {
+            return Ok(());
+        }
+        let batch = record_batch_from_rows(&new_rows, dimension)?;
+        let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
+            vec![Ok(batch)],
+            chunk_schema(dimension),
+        ));
+        table.add(reader).execute().await?;
+        Ok(())
     }
 
     async fn persist_rows(&self, rows: Vec<StoredChunk>, dimension: Dimension) -> Result<()> {
@@ -782,6 +821,21 @@ fn stats_from_rows(rows: &[StoredChunk]) -> StoreStats {
         chunk_count: rows.len(),
         file_count: distinct_file_paths(rows).len(),
     }
+}
+
+fn stats_from_metadata(metadata: &[ChunkMetadata]) -> StoreStats {
+    let distinct: HashSet<&str> = metadata.iter().map(|m| m.file_path.as_str()).collect();
+    StoreStats {
+        chunk_count: metadata.len(),
+        file_count: distinct.len(),
+    }
+}
+
+/// Quote a value as a SQL string literal for a LanceDB delete predicate.
+/// File paths are attacker-influenced (repo contents), so the embedded quote
+/// escape is load-bearing, not cosmetic.
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
 }
 
 fn sort_rows(rows: &mut [StoredChunk]) {
@@ -1315,6 +1369,59 @@ mod tests {
         let rows = rows.ok().unwrap_or_else(|| unreachable!());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_path, "src/other.rs");
+    }
+
+    /// A file path containing a single quote must round-trip the delete
+    /// predicate: the replace targets exactly that file, never a syntax error
+    /// or (worse) a predicate that matches other rows.
+    #[tokio::test]
+    async fn replace_file_chunks_handles_quote_in_path() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        let quoted_path = "src/it's.rs";
+        let initial = vec![
+            sample_chunk(1, quoted_path, "alpha", "pub fn alpha() {}", &[1.0; 384]),
+            sample_chunk(2, "src/other.rs", "omega", "pub fn omega() {}", &[2.0; 384]),
+        ];
+        assert!(store.replace_chunks(&initial, &config).await.is_ok());
+
+        let replacement = vec![sample_chunk(
+            3,
+            quoted_path,
+            "beta",
+            "pub fn beta() {}",
+            &[3.0; 384],
+        )];
+        let stats = store.replace_file_chunks(&replacement, &config).await?;
+        assert_eq!(
+            stats,
+            StoreStats {
+                chunk_count: 2,
+                file_count: 2,
+            }
+        );
+
+        let rows = store.read_chunks().await?;
+        assert!(rows.iter().any(|row| row.name.as_deref() == Some("beta")));
+        assert!(rows.iter().any(|row| row.name.as_deref() == Some("omega")));
+        assert!(
+            !rows.iter().any(|row| row.name.as_deref() == Some("alpha")),
+            "old rows of the quoted path must be deleted, not duplicated"
+        );
+
+        let stats = store
+            .delete_file_chunks(&RelativePath::new(quoted_path), &config)
+            .await?;
+        assert_eq!(
+            stats,
+            StoreStats {
+                chunk_count: 1,
+                file_count: 1,
+            }
+        );
+        Ok(())
     }
 
     #[tokio::test]

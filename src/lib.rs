@@ -372,10 +372,7 @@ impl Claudix {
             return;
         }
 
-        let Ok(store) = Store::new(&self.project_root, self.config.as_ref()) else {
-            return;
-        };
-        let marker_path = store.change_neighbors_marker_path();
+        let marker_path = self.store.change_neighbors_marker_path();
         let entries: Vec<NeighborEntry> = hits
             .iter()
             .map(|n| NeighborEntry {
