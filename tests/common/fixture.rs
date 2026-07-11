@@ -15,6 +15,12 @@ impl TestFixture {
         let tempdir = tempfile::tempdir()?;
         let root = tempdir.path().join(name);
         copy_dir_recursive(&source, &root)?;
+        // Mirror production: `Store::new` canonicalizes the project root, so a
+        // test comparing a path against this root must use the same canonical
+        // spelling. On macOS (/var → /private/var) and Windows (\\?\ verbatim +
+        // 8.3 short names) the raw tempdir path diverges from its canonical form
+        // and breaks strip_prefix / substring checks that pass on plain /tmp.
+        let root = root.canonicalize()?;
         init_git_repo(&root)?;
 
         Ok(Self {
@@ -33,6 +39,8 @@ impl TestFixture {
         let tempdir = tempfile::tempdir()?;
         let root = tempdir.path().join(name);
         copy_dir_recursive(&source, &root)?;
+        // Canonicalize to match production's canonical root (see `new`).
+        let root = root.canonicalize()?;
 
         Ok(Self {
             _tempdir: tempdir,
