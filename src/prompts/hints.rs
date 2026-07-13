@@ -24,7 +24,7 @@ pub const FIND_DUPLICATES_ARGS: &str =
 // --- config validation --------------------------------------------------
 pub const FIX_GLOBAL_CONFIG: &str = "Fix ~/.claude/claudix.toml";
 pub const FIX_PROJECT_CONFIG: &str = "Fix .claude/claudix.toml";
-pub const FIX_CIRRUS_CONFIG: &str = "Fix the file at CIRRUS_CONFIG path";
+pub const FIX_CIRRUS_CONFIG: &str = "Fix the config file that CIRRUS_CONFIG points to";
 pub const PROJECT_RELATIVE_PATH: &str =
     "Set the path to a project-relative value such as .claudix/index";
 pub const SET_ENDPOINT: &str = "Set [embedding].endpoint or switch provider to bundled";

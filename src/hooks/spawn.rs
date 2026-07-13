@@ -26,8 +26,8 @@ pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bo
     // Mismatched embedding model means the existing chunks have the wrong
     // dimension. Spawning `claudix index` without `--force` would either fail
     // or append vectors of a different shape — the user has to run
-    // `claudix clear && claudix index` (or equivalent) themselves; the
-    // session-start additionalContext already tells them so.
+    // `claudix index --force` themselves; the session-start
+    // additionalContext already tells them so.
     if let Some(ref manifest) = manifest
         && manifest.chunk_count > 0
         && manifest.embedding_model != config.embedding.model
