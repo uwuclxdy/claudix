@@ -77,6 +77,7 @@ async fn install_plugin_assets(project_root: &Path, plugin_root: &Path) -> Resul
     .await?;
     changed |=
         copy_plugin_directory(project_root, "commands", plugin_root.join("commands")).await?;
+    changed |= copy_plugin_directory(project_root, "skills", plugin_root.join("skills")).await?;
     Ok(changed)
 }
 
@@ -111,19 +112,24 @@ async fn copy_plugin_directory(
     if fs::try_exists(&destination).await? {
         fs::remove_dir_all(&destination).await?;
     }
-    fs::create_dir_all(&destination).await?;
 
-    let mut entries = fs::read_dir(source).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let file_type = entry.file_type().await?;
-        if file_type.is_file() {
-            let destination_file = destination.join(entry.file_name());
-            fs::copy(entry.path(), &destination_file).await?;
-            if destination_file
-                .extension()
-                .is_some_and(|extension| extension == "sh")
-            {
-                make_executable(&destination_file).await?;
+    let mut pending = vec![(source, destination)];
+    while let Some((source_dir, destination_dir)) = pending.pop() {
+        fs::create_dir_all(&destination_dir).await?;
+        let mut entries = fs::read_dir(&source_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = entry.file_type().await?;
+            let destination_path = destination_dir.join(entry.file_name());
+            if file_type.is_dir() {
+                pending.push((entry.path(), destination_path));
+            } else if file_type.is_file() {
+                fs::copy(entry.path(), &destination_path).await?;
+                if destination_path
+                    .extension()
+                    .is_some_and(|extension| extension == "sh")
+                {
+                    make_executable(&destination_path).await?;
+                }
             }
         }
     }
@@ -150,32 +156,40 @@ async fn directories_match(left: &Path, right: &Path) -> Result<bool> {
         return Ok(false);
     }
 
-    let mut left_entries = directory_file_names(left).await?;
-    let mut right_entries = directory_file_names(right).await?;
-    left_entries.sort();
-    right_entries.sort();
-    if left_entries != right_entries {
-        return Ok(false);
-    }
-
-    for entry in left_entries {
-        if !files_match(&left.join(&entry), &right.join(&entry)).await? {
+    let mut pending = vec![(left.to_path_buf(), right.to_path_buf())];
+    while let Some((left_dir, right_dir)) = pending.pop() {
+        let mut left_entries = directory_entries(&left_dir).await?;
+        let mut right_entries = directory_entries(&right_dir).await?;
+        left_entries.sort();
+        right_entries.sort();
+        if left_entries != right_entries {
             return Ok(false);
+        }
+
+        for (name, is_dir) in left_entries {
+            let left_path = left_dir.join(&name);
+            let right_path = right_dir.join(&name);
+            if is_dir {
+                pending.push((left_path, right_path));
+            } else if !files_match(&left_path, &right_path).await? {
+                return Ok(false);
+            }
         }
     }
 
     Ok(true)
 }
 
-async fn directory_file_names(path: &Path) -> Result<Vec<std::ffi::OsString>> {
-    let mut file_names = Vec::new();
+async fn directory_entries(path: &Path) -> Result<Vec<(std::ffi::OsString, bool)>> {
+    let mut collected = Vec::new();
     let mut entries = fs::read_dir(path).await?;
     while let Some(entry) = entries.next_entry().await? {
-        if entry.file_type().await?.is_file() {
-            file_names.push(entry.file_name());
+        let file_type = entry.file_type().await?;
+        if file_type.is_file() || file_type.is_dir() {
+            collected.push((entry.file_name(), file_type.is_dir()));
         }
     }
-    Ok(file_names)
+    Ok(collected)
 }
 
 async fn required_plugin_asset(project_root: &Path, source_relative: &str) -> Result<PathBuf> {
@@ -378,10 +392,17 @@ mod tests {
             "bootstrap source missing"
         );
 
-        let index_command = fs::read_to_string(plugin_root.join("commands").join("index.md")).await;
-        assert!(index_command.is_ok());
-        let index_command = index_command.ok().unwrap_or_default();
-        assert!(index_command.contains("claudix-bootstrap.js\" index"));
+        let doctor_command =
+            fs::read_to_string(plugin_root.join("commands").join("doctor.md")).await;
+        assert!(doctor_command.is_ok());
+        let doctor_command = doctor_command.ok().unwrap_or_default();
+        assert!(doctor_command.contains("claudix-bootstrap.js\" doctor"));
+
+        let index_skill =
+            fs::read_to_string(plugin_root.join("skills").join("index").join("SKILL.md")).await;
+        assert!(index_skill.is_ok());
+        let index_skill = index_skill.ok().unwrap_or_default();
+        assert!(index_skill.contains(".indexinclude"));
 
         // scripts/ is no longer an install asset (bash wrappers deleted).
         let scripts_copied = fs::try_exists(plugin_root.join("scripts"))
