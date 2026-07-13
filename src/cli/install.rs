@@ -378,12 +378,10 @@ mod tests {
             "bootstrap source missing"
         );
 
-        let search_command =
-            fs::read_to_string(plugin_root.join("commands").join("search.md")).await;
-        assert!(search_command.is_ok());
-        let search_command = search_command.ok().unwrap_or_default();
-        assert!(search_command.contains("!`claudix search"));
-        assert!(!search_command.contains("CLAUDE_PLUGIN_ROOT"));
+        let index_command = fs::read_to_string(plugin_root.join("commands").join("index.md")).await;
+        assert!(index_command.is_ok());
+        let index_command = index_command.ok().unwrap_or_default();
+        assert!(index_command.contains("claudix-bootstrap.js\" index"));
 
         // scripts/ is no longer an install asset (bash wrappers deleted).
         let scripts_copied = fs::try_exists(plugin_root.join("scripts"))
