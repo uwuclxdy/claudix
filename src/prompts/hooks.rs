@@ -33,13 +33,13 @@ pub fn session_start_response(
         .map(|p| format!(" Tail `{p}` to check progress."))
         .unwrap_or_default();
     let additional_context = if model_mismatch {
-        "claudix semantic search unavailable: the index was built with a different embedding model. Call the reindex tool with force: true (or run /claudix:index --force) to rebuild.".to_owned()
+        "claudix semantic search unavailable: the index was built with a different embedding model. Call the reindex tool with force: true (or run `claudix index --force`) to rebuild.".to_owned()
     } else if chunk_count == 0 && indexing_in_flight {
         format!(
             "claudix is building its first index in the background; you'll be notified here when it's ready. Don't poll get_index_status.{progress_suffix}"
         )
     } else if chunk_count == 0 {
-        "claudix is installed but the index is empty. Run /claudix:index to build it; until then use Grep or Read for code discovery.".to_owned()
+        "claudix is installed but the index is empty. Call the reindex tool (or run `claudix index`) to build it; until then use Grep or Read for code discovery.".to_owned()
     } else if indexing_in_flight {
         format!(
             "claudix semantic search ready: {file_count} files, {chunk_count} chunks (reindexing in background; you'll be notified when complete). \

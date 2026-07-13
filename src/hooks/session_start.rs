@@ -169,7 +169,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(
             model_context,
-            "claudix is installed but the index is empty. Run /claudix:index to build it; until then use Grep or Read for code discovery."
+            "claudix is installed but the index is empty. Call the reindex tool (or run `claudix index`) to build it; until then use Grep or Read for code discovery."
         );
     }
 

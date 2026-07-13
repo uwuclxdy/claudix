@@ -398,11 +398,11 @@ mod tests {
         let doctor_command = doctor_command.ok().unwrap_or_default();
         assert!(doctor_command.contains("claudix-bootstrap.js\" doctor"));
 
-        let index_skill =
-            fs::read_to_string(plugin_root.join("skills").join("index").join("SKILL.md")).await;
-        assert!(index_skill.is_ok());
-        let index_skill = index_skill.ok().unwrap_or_default();
-        assert!(index_skill.contains(".indexinclude"));
+        let claudix_skill =
+            fs::read_to_string(plugin_root.join("skills").join("claudix").join("SKILL.md")).await;
+        assert!(claudix_skill.is_ok());
+        let claudix_skill = claudix_skill.ok().unwrap_or_default();
+        assert!(claudix_skill.contains(".indexinclude"));
 
         // scripts/ is no longer an install asset (bash wrappers deleted).
         let scripts_copied = fs::try_exists(plugin_root.join("scripts"))

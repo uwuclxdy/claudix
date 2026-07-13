@@ -86,7 +86,7 @@ pub const REINDEX_ALIGN_DIMENSIONS: &str =
 pub const FINITE_MIN_SIMILARITY: &str = "Use a finite min_similarity between 0 and 1";
 pub const POSITIVE_LIMIT: &str = "Use a positive limit";
 pub const GIT_REPO_REQUIRED: &str = "Run claudix index from inside a git repository";
-pub const RUN_REINDEX: &str = "Run the reindex tool (or /claudix:index) to build the index";
+pub const RUN_REINDEX: &str = "Run the reindex tool (or `claudix index`) to build the index";
 pub const VALID_HOOK_EVENTS: &str =
     "Use one of: SessionStart, PostToolUse, PreToolUse, UserPromptSubmit";
 pub const SEARCH_QUERY_NON_EMPTY: &str = "Pass a non-empty search query";
