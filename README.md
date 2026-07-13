@@ -27,7 +27,7 @@ Core design goal: never break the session, always recover gracefully.
 
 ## Installation
 
-**Requires**: Claude Code 2.0.12+.
+**Requires**: Claude Code 2.1.0+ (plugin skills in the slash menu).
 
 claudix ships the bundled `bge-small-en-v1.5` embedder and uses it as the fallback when no embedding provider is configured. Set `embedding.provider = "http"` if you prefer LM Studio, Ollama, or another OpenAI-compatible embedding server.
 
@@ -52,6 +52,8 @@ claude plugin install claudix@claudix
 
 The native binary downloads on first session (~150MB). Restart Claude Code, then run `/claudix:doctor` to verify.
 
+The downloader honors `GITHUB_TOKEN`/`GH_TOKEN` (lifts the anonymous rate limit) and, for mirrors or air-gapped installs, `CLAUDIX_RELEASE_API_URL`, `CLAUDIX_RELEASE_BASE_URL`, `CLAUDIX_RELEASE_WAIT_MS`, `CLAUDIX_RELEASE_RETRY_MS`.
+
 Targets without a prebuilt (e.g. linux-aarch64, darwin-x86_64) fall back to `cargo install claudix@<version>`. Install [Rust](https://rustup.rs) first if you are on one of those.
 
 ## Configuration
@@ -66,6 +68,8 @@ Both optional. If neither file sets an embedding provider, bundled defaults and 
 ### Full Schema (defaults)
 
 ```toml
+watch = false                       # opt-in file watcher; default off (the PostToolUse hook covers edits)
+
 [embedding]
 provider = "bundled"                # bundled | http
 endpoint = ""                       # required if provider = http (e.g., http://localhost:1234)
@@ -107,14 +111,40 @@ log_dir = ".claudix/logs"           # relative to repo root
 
 Configuration is validated at every entry point (MCP, hook, CLI). Invalid config exits early with field-level error messages.
 
-## Slash Commands
+### Index Scope: `.indexignore` / `.indexinclude`
 
-| Command | Description | Arguments |
-|---------|-------------|-----------|
-| `/claudix:index` | Build or rebuild the index | `[--force]` |
-| `/claudix:doctor` | Health check: binary, index, embedding provider | (none) |
+Two optional rule files control what gets indexed, using gitignore syntax (globs, `!` negation, comments). Place them at the repo root or in any subdirectory; patterns are relative to the rule file's own directory, like nested `.gitignore` files. Precedence per path: `.indexinclude` beats `.gitignore`, which beats `.indexignore`.
 
-Everything else is an MCP tool the agent calls directly: `search_code`, `get_index_status`, `overview`, `find_duplicates`, `reindex`, `reindex_file`, `clear_index`. Ask for a search in plain language ("where is auth handled?") and the agent routes it to `search_code`; the same CLI subcommands (`claudix search`, `claudix status`, ...) remain available in a terminal.
+- `.indexignore` excludes tracked files from the index: test fixtures, vendored code, minified bundles.
+- `.indexinclude` pulls gitignored paths into the index: internal `docs/`, generated code. A one-line `*` in `docs/.indexinclude` indexes that whole tree. Files without a code chunker index as plain text.
+
+A rule file buried two or more levels inside a gitignored subtree is not discovered; put it at the top of the gitignored directory or at the repo root. Edited rule files apply on the next `/claudix:index` run. To index everything gitignored instead, set `[indexing] respect_gitignore = false`.
+
+## Skills & Commands
+
+| Invocation | Kind | What it does |
+|---|---|---|
+| `/claudix:index` | skill | Build or rebuild the index (`--force` wipes first); covers `.indexignore`/`.indexinclude` scope control |
+| `/claudix:doctor` | command | Health check: binary, index, embedding provider |
+
+Everything else is an MCP tool the agent calls directly: `search_code`, `get_index_status`, `overview`, `find_duplicates`, `reindex`, `reindex_file`, `clear_index`. Ask for a search in plain language ("where is auth handled?") and the agent routes it to `search_code`.
+
+### CLI
+
+The same binary works as a CLI in a terminal (`claudix` on PATH on Linux/macOS; `node <plugin>/bin/claudix-bootstrap.js <subcommand>` on Windows):
+
+| Subcommand | Flags |
+|---|---|
+| `index` | `--force`, `--progress` |
+| `search <query...>` | `--top-k N`, `--language L` (repeatable), `--path-prefix P`, `--repo /abs/path` (repeatable) |
+| `status` | |
+| `overview` | `--path-prefix P` |
+| `find-duplicates` | `--min-similarity N`, `--limit N`, `--repo /abs/path` (repeatable) |
+| `reindex-file <path>` | |
+| `clear` | |
+| `doctor` | |
+| `install` | |
+| `watch` | Runs the opt-in file watcher (pairs with `watch = true`) |
 
 ## How It Works
 
@@ -133,29 +163,21 @@ If anything fails, the hook exits 0 (fail-open): session continues unaffected.
 
 After `Write`, `Edit`, or `MultiEdit` tools, the hook:
 
-1. Reads edited file path from tool input
-2. Invokes `claudix hook PostToolUse <path>`
+1. Reads the edited file path(s) from the tool payload on stdin
+2. Queues the paths; a background drain worker coalesces rapid edits (`reindex_debounce_secs` / `reindex_max_wait_secs`) so a burst re-embeds each file once
 3. Atomically upserts new chunks, removes stale ones
 4. Index stays live without a watcher
+
+The same event (plus `UserPromptSubmit`) also surfaces background-indexing completion and semantically related code for the file just edited or read.
 
 ### PreToolUse Hook (Grep Intercept)
 
 Before `Grep` or `Bash` tools (with `rg`, `grep`, `ag` commands), the hook:
 
-1. Analyzes query for regex patterns, globs, short length
-2. Checks if index is stale or missing
-3. If index is fresh and query looks conceptual, returns:
-   ```json
-   {
-     "hookSpecificOutput": {
-       "hookEventName": "PreToolUse",
-       "permissionDecision": "deny",
-       "permissionDecisionReason": "Use the claudix.search_code MCP tool for semantic queries; this query looks conceptual.",
-       "additionalContext": "Original query was '<query>'. The claudix search index has <N> chunks across <M> files."
-     }
-   }
-   ```
-4. Otherwise allows grep to proceed
+1. Analyzes the query for regex patterns, globs, short length
+2. Checks if the index is stale or missing
+3. If the index is fresh and the query looks conceptual, denies the grep and answers it inline: the response carries the ranked semantic matches (file, line range, snippet, score) as `additionalContext` with a tip to call `search_code` directly next time
+4. Otherwise grep proceeds untouched
 
 Heuristics for passthrough: regex anchors/character classes, explicit file globs, <3 tokens, stale index, `intercept_grep = false`.
 
@@ -337,7 +359,7 @@ Key modules:
 - `src/hooks/` — SessionStart, PostToolUse, PreToolUse handlers
 - `src/cli/` — slash command entry points
 
-Tests live next to code (`#[cfg(test)]`) or in `tests/integration/` with fixtures in `tests/fixtures/`.
+Tests live next to code (`#[cfg(test)]`) or in `tests/*.rs` with shared helpers in `tests/common/`.
 
 ## License
 
