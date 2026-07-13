@@ -109,26 +109,12 @@ Configuration is validated at every entry point (MCP, hook, CLI). Invalid config
 
 ## Slash Commands
 
-All commands are available as `/claudix:<name>`:
-
 | Command | Description | Arguments |
 |---------|-------------|-----------|
-| `/claudix:search` | Semantic code search | `<query> [--top-k N] [--language rust --language python] [--path-prefix src/]` |
-| `/claudix:index` | Build or refresh index | (none) |
-| `/claudix:status` | Show index metadata | (none) |
-| `/claudix:doctor` | Diagnose health | (none) |
-| `/claudix:reindex-file` | Re-embed one file | `<path>` |
-| `/claudix:overview` | Map the repo by directory | `[--path-prefix src/]` |
-| `/claudix:find-duplicates` | Find near-duplicate chunks | `[--min-similarity N] [--limit N]` |
-| `/claudix:clear` | Delete index | (none) |
+| `/claudix:index` | Build or rebuild the index | `[--force]` |
+| `/claudix:doctor` | Health check: binary, index, embedding provider | (none) |
 
-### Search Example
-
-```
-/claudix:search authentication flow --language rust --top-k 5
-```
-
-Results show file path, line range, language, definition kind, name, and relevance score.
+Everything else is an MCP tool the agent calls directly: `search_code`, `get_index_status`, `overview`, `find_duplicates`, `reindex`, `reindex_file`, `clear_index`. Ask for a search in plain language ("where is auth handled?") and the agent routes it to `search_code`; the same CLI subcommands (`claudix search`, `claudix status`, ...) remain available in a terminal.
 
 ## How It Works
 
@@ -311,12 +297,12 @@ tail -f .claudix/logs/index.log
 Logs are created on first run. Enable debug logging:
 
 ```bash
-RUST_LOG=debug /claudix:status  # or any other command
+RUST_LOG=debug claudix status  # or any other subcommand
 ```
 
 ### Schema Mismatch After Upgrade
 
-If the binary is newer than indexed chunks, SessionStart triggers background reindex and emits `additionalContext`. You can manually reindex with `/claudix:clear` then `/claudix:index`.
+If the binary is newer than indexed chunks, SessionStart triggers background reindex and emits `additionalContext`. You can manually rebuild with `/claudix:index --force`.
 
 ## Fail-Open Guarantee
 
