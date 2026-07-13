@@ -118,16 +118,30 @@ Two optional rule files control what gets indexed, using gitignore syntax (globs
 - `.indexignore` excludes tracked files from the index: test fixtures, vendored code, minified bundles.
 - `.indexinclude` pulls gitignored paths into the index: internal `docs/`, generated code. A one-line `*` in `docs/.indexinclude` indexes that whole tree. Files without a code chunker index as plain text.
 
-A rule file buried two or more levels inside a gitignored subtree is not discovered; put it at the top of the gitignored directory or at the repo root. Edited rule files apply on the next `/claudix:index` run. To index everything gitignored instead, set `[indexing] respect_gitignore = false`.
+A rule file buried two or more levels inside a gitignored subtree is not discovered; put it at the top of the gitignored directory or at the repo root. Edited rule files apply on the next index run. To index everything gitignored instead, set `[indexing] respect_gitignore = false`.
+
+### Cross-Repo Search
+
+Index each repo on its own first, with the same embedding model (per-repo mismatches surface in `repo_errors`). Extra repos are read-only. Include them persistently via `[search] cross_repos = ["/abs/path"]`, or per call via the `repos` argument on `search_code` (added to the active project) and `find_duplicates` (replaces the active project: list everything to scan). Grouped results prefix each directory with its repo (`<repo> :: <dir>`).
 
 ## Skills & Commands
 
 | Invocation | Kind | What it does |
 |---|---|---|
-| `/claudix:index` | skill | Build or rebuild the index (`--force` wipes first); covers `.indexignore`/`.indexinclude` scope control |
+| `/claudix:claudix` | skill | Teaches the agent the full feature surface: index rebuilds, `.indexignore`/`.indexinclude` scope, provider switches, cross-repo setup, hook tuning. Triggers on its own when a task touches those. |
 | `/claudix:doctor` | command | Health check: binary, index, embedding provider |
 
-Everything else is an MCP tool the agent calls directly: `search_code`, `get_index_status`, `overview`, `find_duplicates`, `reindex`, `reindex_file`, `clear_index`. Ask for a search in plain language ("where is auth handled?") and the agent routes it to `search_code`.
+Day-to-day operations are MCP tools the agent calls directly; ask in plain language ("where is auth handled?", "rebuild the index") and it routes to the right one:
+
+| Tool | Purpose |
+|---|---|
+| `search_code` | Hybrid semantic search; `repos` adds other indexed repos |
+| `get_index_status` | Chunk/file counts, model, staleness |
+| `reindex` | Full rebuild; `force: true` wipes first |
+| `reindex_file` | Re-embed one file immediately |
+| `clear_index` | Drop all stored chunks |
+| `overview` | Per-directory map: files, chunks, languages, top identifiers |
+| `find_duplicates` | Near-identical chunk pairs; `repos` scans only the listed repos |
 
 ### CLI
 
@@ -150,12 +164,12 @@ The same binary works as a CLI in a terminal (`claudix` on PATH on Linux/macOS; 
 
 ### SessionStart Hook
 
-On first session or after plugin upgrade, the `SessionStart` hook:
+On every session start, the hook:
 
-1. Checks that plugin files and global config are present
-2. Emits `claudix ready` via `systemMessage` when setup is complete
-3. Tells the user to rerun the install script if setup is incomplete
-4. Kicks off the background update check
+1. Checks that plugin files and global config are present; tells the user to rerun the install script if not
+2. Builds the first index in the background when none exists and notifies the conversation on completion
+3. Reindexes in the background when the index is older than `reindex_after_hours` or the binary is newer than the stored schema
+4. Tells the agent how search is set up: index freshness, `search_code` vs Grep routing, or a model-mismatch notice with the rebuild step
 
 If anything fails, the hook exits 0 (fail-open): session continues unaffected.
 
@@ -180,6 +194,10 @@ Before `Grep` or `Bash` tools (with `rg`, `grep`, `ag` commands), the hook:
 4. Otherwise grep proceeds untouched
 
 Heuristics for passthrough: regex anchors/character classes, explicit file globs, <3 tokens, stale index, `intercept_grep = false`.
+
+### Related-Code Surfacing
+
+After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` and `related_min_similarity` control volume; a (file, neighbor) pair already surfaced this session is not repeated.
 
 ### MCP Tool: `search_code`
 
@@ -221,13 +239,13 @@ endpoint = "http://localhost:11434"
 model = "nomic-embed-text"
 ```
 
-All three backends return 384-dimensional vectors (for bge-small); other models may differ. Dimension mismatch triggers reindex.
+All three backends return 384-dimensional vectors (for bge-small); other models may differ. After any model or dimension change, rebuild with `claudix index --force` (SessionStart flags the mismatch but never wipes your index on its own).
 
 ### Choosing a Model
 
 The bundled `bge-small-en-v1.5` is a small general-purpose English text model. It is a fine zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases.
 
-The `http` provider speaks the OpenAI `/v1/embeddings` format and sends no authorization header, so it connects to keyless servers: LM Studio, Ollama, a local vLLM instance, or a local proxy such as LiteLLM. Hosted APIs that require a key (Voyage, OpenAI, Gemini) are reachable only by fronting them with a local proxy that injects the key. Set `dimensions` to the model's output size, or to a smaller Matryoshka size it supports; changing the dimension triggers a full reindex.
+The `http` provider speaks the OpenAI `/v1/embeddings` format and sends no authorization header, so it connects to keyless servers: LM Studio, Ollama, a local vLLM instance, or a local proxy such as LiteLLM. Hosted APIs that require a key (Voyage, OpenAI, Gemini) are reachable only by fronting them with a local proxy that injects the key. Set `dimensions` to the model's output size, or to a smaller Matryoshka size it supports; changing the dimension requires a `claudix index --force` rebuild.
 
 | Pick | Model | Dimensions | Context | Access | Why |
 |------|-------|-----------|---------|--------|-----|
@@ -294,9 +312,7 @@ Diagnostic output:
 
 ### Index Missing or Stale
 
-```
-/claudix:index
-```
+Ask the agent to rebuild the index (it calls the `reindex` MCP tool), or run `claudix index` in a terminal.
 
 Full reindex takes ~1-5 minutes depending on repo size. Incremental updates (on file edit) take milliseconds.
 
@@ -306,7 +322,7 @@ If using LM Studio or Ollama:
 
 1. Verify server is running: `curl http://localhost:1234/health` (LM Studio) or `curl http://localhost:11434/api/embeddings` (Ollama)
 2. Check configuration: `/claudix:doctor` shows `endpoint` in use
-3. Switch to bundled: set `provider = "bundled"` in `~/.claude/claudix.toml`, then run `/claudix:index` to reindex
+3. Switch to bundled: set `provider = "bundled"` in `~/.claude/claudix.toml`, then rebuild with `claudix index --force` (the model changed)
 
 ### Hooks Don't Trigger or Fail Silently
 
@@ -324,7 +340,7 @@ RUST_LOG=debug claudix status  # or any other subcommand
 
 ### Schema Mismatch After Upgrade
 
-If the binary is newer than indexed chunks, SessionStart triggers background reindex and emits `additionalContext`. You can manually rebuild with `/claudix:index --force`.
+If the binary is newer than indexed chunks, SessionStart triggers background reindex and emits `additionalContext`. You can manually rebuild with `claudix index --force`.
 
 ## Fail-Open Guarantee
 
