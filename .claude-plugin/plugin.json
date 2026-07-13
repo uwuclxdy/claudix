@@ -7,7 +7,7 @@
   },
   "license": "MIT",
   "repository": "https://github.com/uwuclxdy/claudix",
-  "minClaudeCodeVersion": "2.0.12",
+  "minClaudeCodeVersion": "2.1.0",
   "mcpServers": {
     "claudix": {
       "command": "node",
