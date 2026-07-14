@@ -24,6 +24,10 @@ pub mod mcp;
 pub const SNIPPET_MAX_LINES: usize = 20;
 
 /// First `max_lines` of `content`, with an ellipsis line when anything was cut.
+///
+/// `lines()` + `\n` rejoin LF-normalizes CRLF content — deliberate: snippets
+/// feed a model, where a `\r` is token noise, and the agent Reads the file
+/// when it needs true bytes.
 pub fn truncate_snippet(content: &str, max_lines: usize) -> String {
     let mut lines = content.lines();
     let taken: Vec<&str> = lines.by_ref().take(max_lines).collect();
