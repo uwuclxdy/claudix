@@ -136,12 +136,13 @@ Day-to-day operations are MCP tools the agent calls directly; ask in plain langu
 | Tool | Purpose |
 |---|---|
 | `search_code` | Hybrid semantic search; `repos` adds other indexed repos |
-| `get_index_status` | Chunk/file counts, model, staleness |
-| `reindex` | Full rebuild; `force: true` wipes first |
-| `reindex_file` | Re-embed one file immediately |
-| `clear_index` | Drop all stored chunks |
+| `reindex` | Full rebuild; `path` re-embeds one file, `force: true` wipes first |
 | `overview` | Per-directory map: files, chunks, languages, top identifiers |
-| `find_duplicates` | Near-identical chunk pairs; `repos` scans only the listed repos |
+| `find_duplicates` | Near-identical chunk pairs; `repos` adds other indexed repos |
+
+Index status and a full teardown stay on the CLI (`claudix status`, `claudix clear`) and
+`/claudix:doctor` — the session start hook already reports counts and staleness, so spending
+agent context on tools for them bought nothing.
 
 ### CLI
 

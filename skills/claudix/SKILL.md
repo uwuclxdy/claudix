@@ -59,4 +59,4 @@ All under `[hooks]`:
 
 ## Verify and troubleshoot
 
-`get_index_status` (MCP) or `claudix status` shows file/chunk counts, the embedding model, staleness. `/claudix:doctor` diagnoses the binary, index, provider health, config errors. Logs: `.claudix/logs/index.log`; `RUST_LOG=debug` on any CLI subcommand for verbose output.
+`claudix status` shows file/chunk counts, the embedding model, staleness — SessionStart already reports these, so reach for it only mid-session. `/claudix:doctor` diagnoses the binary, index, provider health, config errors. Logs: `.claudix/logs/index.log`; `RUST_LOG=debug` on any CLI subcommand for verbose output.
