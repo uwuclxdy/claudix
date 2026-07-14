@@ -45,28 +45,18 @@ const RETIRED_TOOL_NAMES: [&str; 3] = ["get_index_status", "clear_index", "reind
 mod tests {
     use super::*;
 
-    /// Render every branch of every agent-visible hook builder.
-    fn rendered_agent_strings() -> Vec<String> {
-        let mut rendered = vec![
-            hooks::session_start_message(&["binary", "hooks"]),
-            hooks::session_start_response(0, 0, false, true, false, None).to_string(),
-            hooks::session_start_response(0, 0, false, false, true, Some("log")).to_string(),
-            hooks::session_start_response(0, 0, false, false, false, None).to_string(),
-            hooks::session_start_response(4, 9, false, false, true, Some("log")).to_string(),
-            hooks::session_start_response(4, 9, true, false, false, None).to_string(),
-            hooks::session_start_response(4, 9, false, false, false, None).to_string(),
-            hooks::indexing_complete_response("SessionStart", 4, 9).to_string(),
-            hooks::indexing_failed_response("SessionStart", "log", Some("boom")).to_string(),
-            hooks::read_related_context("a.rs", 1, Some(9), &["b.rs:1-2".to_owned()]),
-            hooks::edit_related_context("a.rs", &["b.rs:1-2".to_owned()]),
-        ];
-        rendered.extend(
-            mcp::tool_definitions(true)
-                .iter()
-                .map(|tool| tool["description"].to_string()),
-        );
-        rendered
-    }
+    /// Every source file whose string literals reach the agent, scanned as raw
+    /// text. Rendering each builder instead would mean enumerating them, and an
+    /// enumeration is itself a list someone forgets to extend — the exact failure
+    /// this test exists to catch. `hints` alone is ~60 standalone consts that
+    /// nothing enumerates. Raw text also flags a doc comment naming a dead tool,
+    /// which is rot too. `mod.rs` is excluded: it holds RETIRED_TOOL_NAMES and
+    /// would match itself.
+    const PROMPT_SOURCES: [(&str, &str); 3] = [
+        ("prompts/hints.rs", include_str!("hints.rs")),
+        ("prompts/hooks.rs", include_str!("hooks.rs")),
+        ("prompts/mcp.rs", include_str!("mcp.rs")),
+    ];
 
     #[test]
     fn no_agent_visible_string_names_a_retired_tool() {
@@ -84,11 +74,12 @@ mod tests {
             );
         }
 
-        for text in rendered_agent_strings() {
+        for (file, source) in PROMPT_SOURCES {
             for retired in RETIRED_TOOL_NAMES {
                 assert!(
-                    !text.contains(retired),
-                    "an agent-visible string still names the retired tool {retired}: {text}"
+                    !source.contains(retired),
+                    "{file} still names the retired tool {retired} — \
+                     the agent will be pointed at a tool that no longer exists"
                 );
             }
         }
