@@ -36,7 +36,7 @@ pub fn session_start_response(
         "claudix semantic search unavailable: the index was built with a different embedding model. Call the reindex tool with force: true (or run `claudix index --force`) to rebuild.".to_owned()
     } else if chunk_count == 0 && indexing_in_flight {
         format!(
-            "claudix is building its first index in the background; you'll be notified here when it's ready. Don't poll get_index_status.{progress_suffix}"
+            "claudix is building its first index in the background; you'll be notified here when it's ready, so just carry on with Grep or Read until then.{progress_suffix}"
         )
     } else if chunk_count == 0 {
         "claudix is installed but the index is empty. Call the reindex tool (or run `claudix index`) to build it; until then use Grep or Read for code discovery.".to_owned()
@@ -133,7 +133,10 @@ pub fn pre_tool_use_search_response(query: &str, results: Vec<SearchResult>) -> 
             stale_warning,
         ));
         if !chunk.content.is_empty() {
-            lines.push(truncate_snippet(&chunk.content, 20));
+            lines.push(super::truncate_snippet(
+                &chunk.content,
+                super::SNIPPET_MAX_LINES,
+            ));
         }
         lines.push(String::new());
     }
@@ -150,16 +153,6 @@ pub fn pre_tool_use_search_response(query: &str, results: Vec<SearchResult>) -> 
             "additionalContext": context,
         }
     })
-}
-
-fn truncate_snippet(content: &str, max_lines: usize) -> String {
-    let mut lines = content.lines();
-    let taken: Vec<&str> = lines.by_ref().take(max_lines).collect();
-    if lines.next().is_some() {
-        format!("{}\n…", taken.join("\n"))
-    } else {
-        taken.join("\n")
-    }
 }
 
 // --- PostToolUse neighbor surfacing -----------------------------------------

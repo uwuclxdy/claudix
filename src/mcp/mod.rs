@@ -42,6 +42,9 @@ pub struct SearchCodeRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema, Default)]
 struct ReindexRequest {
+    /// Present = reindex this file only; absent = sweep the whole project.
+    #[serde(default)]
+    path: Option<String>,
     #[serde(default)]
     force: bool,
 }
@@ -60,11 +63,6 @@ struct FindDuplicatesRequest {
     limit: Option<u32>,
     #[serde(default)]
     repos: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
-struct ReindexFileRequest {
-    path: String,
 }
 
 /// The claudix MCP server. Holds the active project root and the generated tool
@@ -87,6 +85,17 @@ impl ClaudixServer {
             provider_cache,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Whether `[search].cross_repos` names anything, deciding if the catalog
+    /// advertises `repos`. Read per `tools/list` rather than cached at
+    /// construction so a `/mcp` reconnect picks up a config edit. A config that
+    /// fails to load answers "no": the handlers still accept `repos`, so the
+    /// cost of guessing wrong is an unadvertised parameter, not a broken tool.
+    fn cross_repo_configured(&self) -> bool {
+        config::load(&self.project_root)
+            .map(|config| !config.search.cross_repos.is_empty())
+            .unwrap_or(false)
     }
 
     /// Semantic code search over the active project plus optional cross-repos.
@@ -112,16 +121,23 @@ impl ClaudixServer {
         Ok(into_result(outcome))
     }
 
-    /// Chunk count, file count, model, and staleness for the active index.
-    #[tool(name = "get_index_status")]
-    async fn get_index_status(&self) -> ToolOutcome {
-        let outcome = cli::run_status(&self.project_root).await.and_then(to_value);
-        Ok(into_result(outcome))
-    }
-
-    /// Rebuild the active project index; `force` wipes before rebuilding.
+    /// Whole-project sweep, or one file when `path` is set. `force` wipes first
+    /// and is meaningless for a single file, so the two are mutually exclusive
+    /// rather than silently letting `force` nuke the index on a file reindex.
     #[tool(name = "reindex")]
     async fn reindex(&self, Parameters(request): Parameters<ReindexRequest>) -> ToolOutcome {
+        if let Some(path) = request.path {
+            if path.trim().is_empty() {
+                return Ok(error_result(ClaudixError::ConfigInvalid {
+                    message: "path cannot be empty".to_owned(),
+                    recovery: RecoveryHint(hints::PATH_NON_EMPTY),
+                }));
+            }
+            let outcome = cli::run_reindex_file(&self.project_root, Path::new(&path))
+                .await
+                .and_then(to_value);
+            return Ok(into_result(outcome));
+        }
         let outcome = async {
             if request.force {
                 cli::run_clear_index(&self.project_root).await?;
@@ -130,33 +146,6 @@ impl ClaudixServer {
             to_value(output)
         }
         .await;
-        Ok(into_result(outcome))
-    }
-
-    /// Delete all stored chunks and the manifest for the active project.
-    #[tool(name = "clear_index")]
-    async fn clear_index(&self) -> ToolOutcome {
-        let outcome = cli::run_clear_index(&self.project_root)
-            .await
-            .and_then(to_value);
-        Ok(into_result(outcome))
-    }
-
-    /// Re-embed one file in the active project without touching other chunks.
-    #[tool(name = "reindex_file")]
-    async fn reindex_file(
-        &self,
-        Parameters(request): Parameters<ReindexFileRequest>,
-    ) -> ToolOutcome {
-        if request.path.trim().is_empty() {
-            return Ok(error_result(ClaudixError::ConfigInvalid {
-                message: "path cannot be empty".to_owned(),
-                recovery: RecoveryHint(hints::PATH_NON_EMPTY),
-            }));
-        }
-        let outcome = cli::run_reindex_file(&self.project_root, Path::new(&request.path))
-            .await
-            .and_then(to_value);
         Ok(into_result(outcome))
     }
 
@@ -202,15 +191,17 @@ impl ServerHandler for ClaudixServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tool_catalog()?))
+        Ok(ListToolsResult::with_all_items(tool_catalog(
+            self.cross_repo_configured(),
+        )?))
     }
 }
 
 /// The served tool catalog, built from `prompts::mcp` in declared order. Single
 /// source of truth for `tools/list`; the macro-derived per-tool schemas are not
 /// served.
-fn tool_catalog() -> std::result::Result<Vec<Tool>, ErrorData> {
-    crate::prompts::mcp::tool_definitions()
+fn tool_catalog(cross_repo: bool) -> std::result::Result<Vec<Tool>, ErrorData> {
+    crate::prompts::mcp::tool_definitions(cross_repo)
         .into_iter()
         .map(tool_from_definition)
         .collect()
@@ -334,6 +325,28 @@ fn error_result(error: ClaudixError) -> CallToolResult {
 mod tests {
     use super::*;
 
+    mod fixture {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/fixture.rs"
+        ));
+    }
+
+    // Each `include!` is its own module copy, so the helpers this one doesn't
+    // need (the indexing path) are dead here but live in `cli`'s copy.
+    #[allow(dead_code)]
+    mod test_support {
+        use crate as claudix;
+
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/common/test_support.rs"
+        ));
+    }
+
+    use fixture::TestFixture;
+    use test_support::{stub_config, write_fixture_config};
+
     #[test]
     fn get_info_advertises_server_info() {
         let info =
@@ -346,7 +359,7 @@ mod tests {
 
     #[test]
     fn list_tools_returns_documented_tool_names_in_order() {
-        let tools = tool_catalog().unwrap_or_default();
+        let tools = tool_catalog(false).unwrap_or_default();
         let names = tools
             .iter()
             .map(|tool| tool.name.as_ref())
@@ -354,16 +367,24 @@ mod tests {
 
         assert_eq!(
             names,
-            vec![
-                "search_code",
-                "get_index_status",
-                "reindex",
-                "clear_index",
-                "reindex_file",
-                "overview",
-                "find_duplicates",
-            ]
+            vec!["search_code", "reindex", "overview", "find_duplicates"]
         );
+    }
+
+    /// Every served tool must have a handler the router can dispatch to, or the
+    /// catalog advertises a call that fails at runtime.
+    #[test]
+    fn every_served_tool_has_a_handler() {
+        let served = tool_catalog(true).unwrap_or_default();
+        let routed = ClaudixServer::tool_router();
+
+        for tool in &served {
+            assert!(
+                routed.has_route(tool.name.as_ref()),
+                "{} is served but has no handler",
+                tool.name
+            );
+        }
     }
 
     #[test]
@@ -384,11 +405,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reindex_file_rejects_empty_path() {
+    async fn reindex_rejects_blank_path_rather_than_sweeping_the_project() {
         let server = ClaudixServer::new(PathBuf::from("."), Arc::new(ProviderCache::new()));
         let outcome = server
-            .reindex_file(Parameters(ReindexFileRequest {
-                path: "   ".to_owned(),
+            .reindex(Parameters(ReindexRequest {
+                path: Some("   ".to_owned()),
+                force: false,
             }))
             .await;
         assert!(outcome.is_ok());
@@ -400,20 +422,96 @@ mod tests {
             .iter()
             .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
             .collect::<String>();
-        assert!(text.contains("Pass a non-empty path to reindex_file"));
+        assert!(text.contains("Pass a non-empty path to reindex"));
     }
 
     #[test]
-    fn reindex_request_defaults_force_to_false() -> serde_json::Result<()> {
+    fn reindex_request_defaults_to_a_whole_project_sweep() -> serde_json::Result<()> {
         let request: ReindexRequest = serde_json::from_str("{}")?;
+        assert_eq!(request.path, None);
         assert!(!request.force);
         Ok(())
     }
 
     #[test]
-    fn reindex_request_parses_force_true() -> serde_json::Result<()> {
-        let request: ReindexRequest = serde_json::from_str(r#"{"force":true}"#)?;
-        assert!(request.force);
+    fn reindex_request_parses_force_and_path() -> serde_json::Result<()> {
+        let forced: ReindexRequest = serde_json::from_str(r#"{"force":true}"#)?;
+        assert!(forced.force);
+        assert_eq!(forced.path, None);
+
+        let single: ReindexRequest = serde_json::from_str(r#"{"path":"src/lib.rs"}"#)?;
+        assert_eq!(single.path.as_deref(), Some("src/lib.rs"));
+        assert!(!single.force);
         Ok(())
+    }
+
+    /// `force` wipes the whole index. Reaching it on a single-file reindex would
+    /// destroy every other file's chunks to re-embed one, so the `path` branch
+    /// must return before `force` is read. Hoisting the force check above the
+    /// path branch leaves every other test green, hence this one: a real index,
+    /// a `path` + `force: true` call, and the other file's chunks still there.
+    #[tokio::test]
+    async fn reindex_with_path_and_force_does_not_wipe_the_index() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+        assert!(write_fixture_config(fixture.root(), &config).is_ok());
+
+        let indexed = cli::run_index(fixture.root(), false).await;
+        assert!(indexed.is_ok(), "fixture index failed: {indexed:?}");
+        let before = indexed.ok().unwrap_or_else(|| unreachable!());
+        assert!(before.chunk_count > 0, "fixture must index something");
+
+        let server =
+            ClaudixServer::new(fixture.root().to_path_buf(), Arc::new(ProviderCache::new()));
+        let outcome = server
+            .reindex(Parameters(ReindexRequest {
+                path: Some("src/math.rs".to_owned()),
+                force: true,
+            }))
+            .await;
+        assert!(outcome.is_ok());
+        let result = outcome.unwrap_or_else(|_| CallToolResult::success(vec![]));
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "single-file reindex errored: {result:?}"
+        );
+
+        let after = cli::run_status(fixture.root()).await;
+        assert!(after.is_ok());
+        let after = after.ok().unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            after.chunk_count, before.chunk_count,
+            "force wiped the index during a single-file reindex"
+        );
+    }
+
+    /// `cross_repo_configured` reads the real config layers, so a bare "." would
+    /// resolve the developer's own `~/.claude/claudix.toml` and pass or fail with
+    /// their machine. Pin both answers against a fixture that owns its config.
+    #[tokio::test]
+    async fn cross_repo_advertises_repos_only_when_config_lists_them() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let server =
+            ClaudixServer::new(fixture.root().to_path_buf(), Arc::new(ProviderCache::new()));
+
+        let mut config = stub_config();
+        config.search.cross_repos = vec![];
+        assert!(write_fixture_config(fixture.root(), &config).is_ok());
+        assert!(
+            !server.cross_repo_configured(),
+            "no cross_repos configured, yet repos was advertised"
+        );
+
+        config.search.cross_repos = vec!["/somewhere/else".to_owned()];
+        assert!(write_fixture_config(fixture.root(), &config).is_ok());
+        assert!(
+            server.cross_repo_configured(),
+            "cross_repos configured, yet repos stayed hidden"
+        );
     }
 }

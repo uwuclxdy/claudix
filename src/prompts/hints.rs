@@ -11,15 +11,8 @@ pub const MCP_PATH_INSIDE_PROJECT_DIR: &str = "Use a path inside $CLAUDE_PROJECT
 pub const READ_INSIDE_PROJECT_DIR: &str = "Read a path inside the project root";
 
 // --- mcp tool args ------------------------------------------------------
-pub const SEARCH_CODE_ARGS: &str =
-    "Pass query plus optional top_k, language_filter, path_prefix, and repos";
 pub const QUERY_NON_EMPTY: &str = "Pass a non-empty query string to search_code";
-pub const REINDEX_ARGS: &str = "Pass force as an optional boolean";
-pub const REINDEX_FILE_PATH_ARG: &str = "Pass path for a file inside $CLAUDE_PROJECT_DIR";
-pub const PATH_NON_EMPTY: &str = "Pass a non-empty path to reindex_file";
-pub const OVERVIEW_ARGS: &str = "Pass an optional path_prefix string";
-pub const FIND_DUPLICATES_ARGS: &str =
-    "Pass optional min_similarity (number), limit (integer), repos (array of strings)";
+pub const PATH_NON_EMPTY: &str = "Pass a non-empty path to reindex";
 
 // --- config validation --------------------------------------------------
 pub const FIX_GLOBAL_CONFIG: &str = "Fix ~/.claude/claudix.toml";

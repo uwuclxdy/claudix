@@ -12,6 +12,18 @@ pub fn stub_config() -> Config {
     stub_config_with_model("stub-v1")
 }
 
+/// Write `.claude/claudix.toml` into a fixture so `config::load` doesn't fall
+/// through to the developer's global config, which on a real machine points at
+/// an embedding model that doesn't match the stub index.
+pub fn write_fixture_config(project_root: &Path, config: &Config) -> claudix::Result<()> {
+    let claude_dir = project_root.join(".claude");
+    std::fs::create_dir_all(&claude_dir)?;
+    let text = toml::to_string(config)
+        .map_err(|e| ClaudixError::Store(format!("serialize stub config: {e}")))?;
+    std::fs::write(claude_dir.join("claudix.toml"), text)?;
+    Ok(())
+}
+
 pub fn stub_config_with_model(model: impl Into<String>) -> Config {
     let mut config = Config::default();
     config.embedding.model = model.into();

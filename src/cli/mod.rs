@@ -45,8 +45,6 @@ pub use watch::run_watch;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SearchHit {
-    /// Canonical path of the repo this hit came from.
-    pub repo: String,
     pub file_path: String,
     pub language: String,
     pub kind: String,
@@ -54,7 +52,14 @@ pub struct SearchHit {
     pub line_start: u32,
     pub line_end: u32,
     pub score: f32,
+    /// Serialized only when true: a `false` on every hit is dead weight in the
+    /// agent's context, and `SearchOutput::stale_hint` explains the flag when
+    /// any hit actually carries it. The repo a hit came from is not repeated
+    /// here — it is the owning `DirectoryGroup::repo`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stale: bool,
+    /// Capped at [`prompts::SNIPPET_MAX_LINES`]; an uncapped tree-sitter chunk
+    /// can be an entire impl block.
     pub snippet: String,
 }
 
@@ -73,6 +78,11 @@ pub struct SearchOutput {
     /// Repos that could not be searched (unindexed, mismatched, missing).
     /// Empty for single-repo searches.
     pub repo_errors: Vec<RepoError>,
+    /// What a `stale` hit means, carried only when at least one hit is stale.
+    /// Conditional guidance rides the response instead of the tool description,
+    /// so a session that never sees a stale hit never pays for the explanation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stale_hint: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -474,11 +484,11 @@ pub(crate) async fn load_repo_chunks_readonly(
     Ok((canonical_repo, chunks))
 }
 
-/// Find near-duplicate code chunks within the active repo or across an explicit list of repos.
+/// Find near-duplicate code chunks in the active repo, plus any repos in `repos`.
 ///
-/// When `repos` is `None` or empty, only `project_root` is scanned.
-/// When `repos` is non-empty, EXACTLY those paths are used — `project_root` is NOT
-/// auto-added; the caller decides what to include.
+/// `project_root` is always scanned; `repos` adds to it, matching `search_code`.
+/// Repos are deduped by the canonical path their store resolves to, so naming the
+/// active project explicitly is a no-op however it is spelled.
 ///
 /// The reference embedding identity (model + dimensions) is established from the
 /// manifest of the first repo that loads successfully. All subsequent repos must
@@ -507,11 +517,11 @@ pub async fn run_find_duplicates(
         });
     }
 
-    // Determine which repo paths to scan.
-    let repo_paths: Vec<String> = match repos {
-        Some(list) if !list.is_empty() => list,
-        _ => vec![project_root.display().to_string()],
-    };
+    // The active project always participates and `repos` adds to it, matching
+    // `search_code`.
+    let repo_paths: Vec<String> = std::iter::once(project_root.display().to_string())
+        .chain(repos.into_iter().flatten())
+        .collect();
 
     let mut all_chunks: Vec<crate::store::StoredChunk> = Vec::new();
     let mut repo_labels: Vec<Arc<str>> = Vec::new();
@@ -520,6 +530,13 @@ pub async fn run_find_duplicates(
     // The reference embedding identity is taken from the first repo whose manifest
     // loads successfully. Subsequent repos must match or they become RepoErrors.
     let mut ref_identity: Option<(String, u16)> = None;
+
+    // Dedup on the canonical path the store resolved to, never the caller's
+    // spelling: `--repo .`, a trailing slash, a symlink, macOS `/var` vs
+    // `/private/var`, and Windows `\\?\C:\r` vs `C:\r` all name one repo. Loading
+    // one twice emits every cross-file pair four times, each burning a `limit`
+    // slot, and doubles the O(n²) scan. `search` dedups the same way.
+    let mut seen: HashSet<Arc<str>> = HashSet::new();
 
     for path in &repo_paths {
         // Resolve reference identity lazily from the first successful manifest.
@@ -539,6 +556,9 @@ pub async fn run_find_duplicates(
         match load_repo_chunks_readonly(path, ref_model, *ref_dims).await {
             Ok((canonical, chunks)) => {
                 let label: Arc<str> = Arc::from(canonical.as_str());
+                if !seen.insert(Arc::clone(&label)) {
+                    continue;
+                }
                 for _ in &chunks {
                     repo_labels.push(Arc::clone(&label));
                 }
@@ -918,11 +938,12 @@ async fn run_search_with_claudix(
     let mut group_index: Vec<(String, String)> = Vec::new();
     let mut grouped: HashMap<(String, String), Vec<SearchHit>> = HashMap::new();
 
+    let mut any_stale = false;
     for result in found.results {
         let dir = immediate_parent_dir(result.chunk.file_path.as_str());
-        let key = (result.repo.clone(), dir);
+        let key = (result.repo, dir);
+        any_stale |= result.stale;
         let hit = SearchHit {
-            repo: result.repo,
             file_path: result.chunk.file_path.to_string(),
             language: result.chunk.language.to_string(),
             kind: result.chunk.kind.to_string(),
@@ -931,7 +952,10 @@ async fn run_search_with_claudix(
             line_end: result.chunk.line_range.end,
             score: result.score,
             stale: result.stale,
-            snippet: result.chunk.content,
+            snippet: crate::prompts::truncate_snippet(
+                &result.chunk.content,
+                crate::prompts::SNIPPET_MAX_LINES,
+            ),
         };
         if !grouped.contains_key(&key) {
             group_index.push(key.clone());
@@ -955,6 +979,7 @@ async fn run_search_with_claudix(
     Ok(SearchOutput {
         groups,
         repo_errors: found.repo_errors,
+        stale_hint: any_stale.then_some(crate::prompts::mcp::STALE_HITS_NOTE),
     })
 }
 
@@ -1030,7 +1055,7 @@ mod tests {
     }
 
     use fixture::TestFixture;
-    use test_support::{index_fixture, stub_config};
+    use test_support::{index_fixture, stub_config, write_fixture_config};
 
     struct CliHarness {
         // Some when the harness owns its fixture (private harness); None when
@@ -1876,7 +1901,8 @@ mod tests {
         let repo_a = fixture_a.root().display().to_string();
         let repo_b = fixture_b.root().display().to_string();
 
-        // Provide both repos explicitly — active project is NOT auto-added.
+        // Listing the active project explicitly is a no-op: it is always scanned,
+        // and the exact-string dedup keeps it from being paired with itself.
         let output = run_find_duplicates(
             fixture_a.root(),
             Some(0.99),
@@ -1906,19 +1932,94 @@ mod tests {
         );
     }
 
-    // ── cross-repo search tests (Feature 6) ─────────────────────────────────
+    /// Naming the active project in a spelling that isn't its canonical path must
+    /// still dedup. An exact-string filter passes the sibling test (fixtures are
+    /// pre-canonicalized) but fails here, and on Windows it fails always: the
+    /// repo loads twice under one label and every cross-file pair is emitted four
+    /// times, each burning a `limit` slot.
+    #[tokio::test]
+    async fn find_duplicates_dedups_a_non_canonical_spelling_of_the_active_project() {
+        // dup_harness, not a bare fixture: this needs a repo that actually
+        // produces pairs, or every assertion below holds on an empty vec.
+        let result = dup_harness().await;
+        assert!(result.is_ok());
+        let (fixture, _store) = result.ok().unwrap_or_else(|| unreachable!());
+        assert!(write_fixture_config(fixture.root(), &stub_config()).is_ok());
 
-    /// Write `.claude/claudix.toml` into a fixture so `config::load` doesn't
-    /// fall through to the user's global config (which on dev machines may
-    /// point at a real embedding model that doesn't match the stub index).
-    fn write_fixture_config(project_root: &Path, config: &Config) -> Result<()> {
-        let claude_dir = project_root.join(".claude");
-        fs::create_dir_all(&claude_dir).map_err(ClaudixError::from)?;
-        let text = toml::to_string(config)
-            .map_err(|e| ClaudixError::Store(format!("serialize stub config: {e}")))?;
-        fs::write(claude_dir.join("claudix.toml"), text).map_err(ClaudixError::from)?;
-        Ok(())
+        let baseline = run_find_duplicates(fixture.root(), None, None, None).await;
+        assert!(baseline.is_ok());
+        let baseline = baseline.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            !baseline.pairs.is_empty(),
+            "harness must produce pairs, else this test proves nothing"
+        );
+
+        // Same repo, spelled so the store canonicalizes it back to the root.
+        let uncanonical = format!("{}/.", fixture.root().display());
+        let output = run_find_duplicates(fixture.root(), None, None, Some(vec![uncanonical])).await;
+        assert!(output.is_ok(), "duplicate scan failed: {output:?}");
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        // A second load of the same repo emits every pair 4x under one label.
+        assert_eq!(
+            output.pairs.len(),
+            baseline.pairs.len(),
+            "naming the active project a second way changed the pair count — it was scanned twice"
+        );
+        let mut keys: Vec<String> = output
+            .pairs
+            .iter()
+            .map(|pair| {
+                format!(
+                    "{}|{}:{}-{}|{}:{}-{}",
+                    pair.a.repo,
+                    pair.a.file_path,
+                    pair.a.line_start,
+                    pair.a.line_end,
+                    pair.b.file_path,
+                    pair.b.line_start,
+                    pair.b.line_end
+                )
+            })
+            .collect();
+        let total = keys.len();
+        keys.sort();
+        keys.dedup();
+        assert_eq!(
+            keys.len(),
+            total,
+            "identical pairs repeated — the repo was loaded more than once"
+        );
     }
+
+    /// `repos` adds to the active project rather than replacing it, matching
+    /// `search_code`. Naming only the other repo must still scan this one, or a
+    /// caller silently audits everything except the code they are working in.
+    #[tokio::test]
+    async fn find_duplicates_scans_active_project_when_repos_names_only_another() {
+        let setup = dual_repo_harness().await;
+        assert!(setup.is_ok());
+        let (fixture_a, _fixture_b, repo_a, repo_b) = setup.ok().unwrap_or_else(|| unreachable!());
+
+        // repo_b only — repo_a is the active project and must be scanned anyway.
+        let output =
+            run_find_duplicates(fixture_a.root(), Some(0.99), None, Some(vec![repo_b])).await;
+        assert!(output.is_ok(), "duplicate scan failed: {output:?}");
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(output.repo_errors.is_empty(), "both repos are indexed");
+        let touches_active = output
+            .pairs
+            .iter()
+            .any(|pair| pair.a.repo == repo_a || pair.b.repo == repo_a);
+        assert!(
+            touches_active,
+            "the unlisted active project {repo_a} must still be scanned; pairs: {:?}",
+            output.pairs
+        );
+    }
+
+    // ── cross-repo search tests (Feature 6) ─────────────────────────────────
 
     /// Set up two repos backed by the small_rust fixture and indexed with the
     /// same stub model so their vectors are comparable. Returns the canonical
@@ -1963,6 +2064,149 @@ mod tests {
         Ok((fixture_a, fixture_b, repo_a, repo_b))
     }
 
+    /// `stale_hint` is the whole point of moving the staleness explanation out of
+    /// the always-billed tool description: it must be absent on a fresh index and
+    /// present the moment a hit goes stale. `stale: false` must also stay off the
+    /// wire — that is per-hit dead weight for the common case.
+    #[tokio::test]
+    async fn stale_hint_and_flag_ride_the_payload_only_when_a_hit_is_stale() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config.clone());
+        assert!(claudix.is_ok());
+        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            index_fixture(
+                &claudix.store,
+                claudix.embedder.as_ref(),
+                claudix.project_root(),
+                &config,
+            )
+            .await
+            .is_ok()
+        );
+        assert!(write_fixture_config(fixture.root(), &config).is_ok());
+
+        let fresh = run_search(fixture.root(), "add".to_owned(), Some(10), None, None, None).await;
+        assert!(fresh.is_ok(), "search failed: {fresh:?}");
+        let fresh = fresh.ok().unwrap_or_else(|| unreachable!());
+        assert!(!fresh.groups.is_empty(), "fixture must produce hits");
+        assert_eq!(
+            fresh.stale_hint, None,
+            "a fresh index must not pay for the stale explanation"
+        );
+        // `stale: false` is skipped, so it never reaches the agent's context.
+        let json = serde_json::to_string(&fresh);
+        assert!(json.is_ok());
+        let json = json.unwrap_or_default();
+        assert!(!json.contains("\"stale\""), "stale: false was serialized");
+        assert!(!json.contains("stale_hint"), "stale_hint was serialized");
+
+        // Touch an indexed file so its stored hash no longer matches disk.
+        let math = fixture.root().join("src/math.rs");
+        let existing = std::fs::read_to_string(&math);
+        assert!(existing.is_ok());
+        assert!(
+            std::fs::write(
+                &math,
+                format!("{}\n// drift\n", existing.unwrap_or_default())
+            )
+            .is_ok()
+        );
+
+        let drifted =
+            run_search(fixture.root(), "add".to_owned(), Some(10), None, None, None).await;
+        assert!(drifted.is_ok(), "search failed: {drifted:?}");
+        let drifted = drifted.ok().unwrap_or_else(|| unreachable!());
+        let any_stale = drifted
+            .groups
+            .iter()
+            .flat_map(|g| g.hits.iter())
+            .any(|hit| hit.stale);
+        assert!(
+            any_stale,
+            "editing an indexed file must mark its hits stale"
+        );
+        assert_eq!(
+            drifted.stale_hint,
+            Some(crate::prompts::mcp::STALE_HITS_NOTE),
+            "a stale hit must carry its explanation"
+        );
+    }
+
+    /// The cap has to bite on the payload `run_search` actually builds, not just
+    /// in `truncate_snippet` — a tested helper nobody calls caps nothing. The
+    /// fixture's own chunks are a few lines each, so this writes a function long
+    /// enough to prove the wiring rather than passing vacuously on short chunks.
+    #[tokio::test]
+    async fn search_caps_snippet_lines_on_an_oversized_chunk() {
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let body = (0..60)
+            .map(|n| format!("    let value_{n} = {n};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let long_fn = format!("pub fn subtract_many_numbers() -> i64 {{\n{body}\n    0\n}}\n");
+        assert!(std::fs::write(fixture.root().join("src/long.rs"), &long_fn).is_ok());
+
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config.clone());
+        assert!(claudix.is_ok());
+        let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            index_fixture(
+                &claudix.store,
+                claudix.embedder.as_ref(),
+                claudix.project_root(),
+                &config,
+            )
+            .await
+            .is_ok()
+        );
+        assert!(write_fixture_config(fixture.root(), &config).is_ok());
+
+        let output = run_search(
+            fixture.root(),
+            "subtract many numbers".to_owned(),
+            Some(10),
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(output.is_ok(), "search failed: {output:?}");
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        let hits: Vec<&SearchHit> = output.groups.iter().flat_map(|g| g.hits.iter()).collect();
+        assert!(!hits.is_empty(), "expected the long function to be indexed");
+        let capped = hits
+            .iter()
+            .find(|hit| hit.name.as_deref() == Some("subtract_many_numbers"));
+        assert!(
+            capped.is_some(),
+            "the 62-line function must surface, else this test proves nothing"
+        );
+        let capped = capped.unwrap_or_else(|| unreachable!());
+
+        // 20 kept lines + the ellipsis marker.
+        assert_eq!(
+            capped.snippet.lines().count(),
+            crate::prompts::SNIPPET_MAX_LINES + 1
+        );
+        assert!(capped.snippet.ends_with('…'));
+        for hit in &hits {
+            assert!(
+                hit.snippet.lines().count() <= crate::prompts::SNIPPET_MAX_LINES + 1,
+                "{} snippet exceeded the cap",
+                hit.file_path
+            );
+        }
+    }
+
     #[tokio::test]
     async fn search_spans_active_and_listed_repo_with_correct_labels() {
         let setup = dual_repo_harness().await;
@@ -1983,33 +2227,22 @@ mod tests {
 
         assert!(output.repo_errors.is_empty(), "no errors expected");
 
-        // Hits surface from both repos, each correctly labeled.
-        let from_a = output
-            .groups
-            .iter()
-            .flat_map(|g| g.hits.iter())
-            .any(|h| h.repo == repo_a);
-        let from_b = output
-            .groups
-            .iter()
-            .flat_map(|g| g.hits.iter())
-            .any(|h| h.repo == repo_b);
+        // Hits surface from both repos, each correctly labeled. The group owns
+        // the repo label; hits no longer repeat it.
+        let labelled = |repo: &str| {
+            output
+                .groups
+                .iter()
+                .any(|g| g.repo == repo && !g.hits.is_empty())
+        };
         assert!(
-            from_a,
+            labelled(&repo_a),
             "expected at least one hit from active repo {repo_a}"
         );
-        assert!(from_b, "expected at least one hit from extra repo {repo_b}");
-
-        // Every hit's repo equals its group's repo.
-        for group in &output.groups {
-            for hit in &group.hits {
-                assert_eq!(
-                    hit.repo, group.repo,
-                    "hit/group repo mismatch in directory {}",
-                    group.directory
-                );
-            }
-        }
+        assert!(
+            labelled(&repo_b),
+            "expected at least one hit from extra repo {repo_b}"
+        );
     }
 
     #[tokio::test]

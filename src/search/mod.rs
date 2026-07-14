@@ -751,6 +751,9 @@ mod tests {
         ));
     }
 
+    // Each `include!` is its own module copy, so the helpers this one doesn't
+    // need are dead here but live in another module's copy.
+    #[allow(dead_code)]
     mod test_support {
         use crate as claudix;
 

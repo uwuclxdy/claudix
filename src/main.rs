@@ -90,7 +90,7 @@ enum Command {
         #[arg(
             long = "repo",
             help = "Additional already-indexed repo path to scan; repeatable. \
-                    When specified, ONLY these paths are used — the active project is NOT auto-added."
+                    The active project is always scanned; these are added to it."
         )]
         repos: Vec<String>,
     },
