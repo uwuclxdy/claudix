@@ -44,7 +44,7 @@ Edited rule files apply on the next index run, so reindex after changing them.
 Each repo must be indexed on its own first, with the same embedding model (mismatches surface per repo in `repo_errors`). Extra repos are read-only. Two ways to include them:
 
 - persistent: `[search] cross_repos = ["/abs/path/other-repo"]` in the active repo's config
-- per call: the `repos` arg on `search_code` (added to the active project) or on `find_duplicates` (replaces the active project: list everything to scan)
+- per call: the `repos` arg on `search_code` or `find_duplicates` (both add to the active project, which is always scanned)
 
 Grouped results prefix each directory with its repo (`<repo> :: <dir>`).
 

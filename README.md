@@ -122,7 +122,7 @@ A rule file buried two or more levels inside a gitignored subtree is not discove
 
 ### Cross-Repo Search
 
-Index each repo on its own first, with the same embedding model (per-repo mismatches surface in `repo_errors`). Extra repos are read-only. Include them persistently via `[search] cross_repos = ["/abs/path"]`, or per call via the `repos` argument on `search_code` (added to the active project) and `find_duplicates` (replaces the active project: list everything to scan). Grouped results prefix each directory with its repo (`<repo> :: <dir>`).
+Index each repo on its own first, with the same embedding model (per-repo mismatches surface in `repo_errors`). Extra repos are read-only. Include them persistently via `[search] cross_repos = ["/abs/path"]`, or per call via the `repos` argument on `search_code` and `find_duplicates` (both add to the active project, which is always scanned). Grouped results prefix each directory with its repo (`<repo> :: <dir>`).
 
 ## Skills & Commands
 
