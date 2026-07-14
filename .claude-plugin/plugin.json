@@ -1,6 +1,6 @@
 {
   "name": "claudix",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Local semantic search plugin for Claude Code — indexes your repository and exposes hybrid vector+BM25 search via MCP, slash commands, and grep interception.",
   "author": {
     "name": "uwuclxdy"
