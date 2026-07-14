@@ -6,7 +6,7 @@ mod watch;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -466,9 +466,39 @@ pub(crate) async fn load_repo_chunks_readonly(
 /// an errored repo never reaches the store's canonical label, so two spellings
 /// of one broken repo would otherwise each earn a `RepoError`.
 pub(crate) fn repo_dedup_key(path: &str) -> String {
-    Path::new(path)
+    let normalized = degrade_verbatim_prefix(path);
+    Path::new(&normalized)
         .canonicalize()
         .map_or_else(|_| path.to_owned(), |c| c.display().to_string())
+}
+
+/// Rewrite a Windows verbatim (`\\?\`) disk or UNC prefix to its plain
+/// equivalent (`C:`, `\\server\share`); a no-op elsewhere. Verbatim paths
+/// bypass Win32's own path normalization, so `/` stops acting as a separator
+/// and `.` components stop collapsing there. A path derived by string-editing
+/// an already-canonical verbatim path (e.g. appending `/.`) then can't
+/// canonicalize back to the same identity, breaking dedup. `canonicalize`
+/// re-derives the correct verbatim form for the real filesystem path anyway,
+/// so degrading the prefix first only restores normal parsing for the rest.
+fn degrade_verbatim_prefix(path: &str) -> String {
+    let Some(Component::Prefix(prefix)) = Path::new(path).components().next() else {
+        return path.to_owned();
+    };
+    let plain_prefix = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => format!("{}:", drive as char),
+        Prefix::VerbatimUNC(server, share) => {
+            format!(
+                "\\\\{}\\{}",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            )
+        }
+        _ => return path.to_owned(),
+    };
+    match path.get(prefix.as_os_str().len()..) {
+        Some(rest) => format!("{plain_prefix}{rest}"),
+        None => path.to_owned(),
+    }
 }
 
 /// Find near-duplicate code chunks in the active repo, plus any repos in `repos`.
