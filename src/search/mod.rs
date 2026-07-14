@@ -9,7 +9,7 @@ use std::sync::Arc;
 use futures::future::join_all;
 use tokio::{fs, task};
 
-use crate::cli::{RepoError, load_repo_chunks_readonly};
+use crate::cli::{RepoError, load_repo_chunks_readonly, repo_dedup_key};
 use crate::config::SearchConfig;
 use crate::embedding::Provider;
 use crate::enumeration::hash_bytes;
@@ -234,15 +234,17 @@ impl Searcher {
             }
         };
         let ref_model = ref_model.as_str();
-        let mut seen: HashSet<Arc<str>> = HashSet::from([Arc::clone(&active_repo)]);
+        // Keyed up front so the error branch dedups too; two spellings of one
+        // broken repo must not each earn a `RepoError`.
+        let mut seen: HashSet<String> = HashSet::from([active_repo.as_ref().to_owned()]);
 
         for repo in &query.repos {
+            if !seen.insert(repo_dedup_key(repo)) {
+                continue;
+            }
             match load_repo_chunks_readonly(repo, ref_model, ref_dims).await {
                 Ok((canonical, rows)) => {
                     let canonical: Arc<str> = Arc::from(canonical.as_str());
-                    if !seen.insert(Arc::clone(&canonical)) {
-                        continue;
-                    }
                     labeled.extend(rows.into_iter().map(|row| (Arc::clone(&canonical), row)));
                 }
                 Err(error) => repo_errors.push(error),

@@ -484,6 +484,17 @@ pub(crate) async fn load_repo_chunks_readonly(
     Ok((canonical_repo, chunks))
 }
 
+/// Best-effort canonical dedup key for a caller-supplied repo path: the same
+/// `canonicalize` the store applies, falling back to the raw spelling when the
+/// path doesn't resolve. Keyed before loading so the error branches dedup too —
+/// an errored repo never reaches the store's canonical label, so two spellings
+/// of one broken repo would otherwise each earn a `RepoError`.
+pub(crate) fn repo_dedup_key(path: &str) -> String {
+    Path::new(path)
+        .canonicalize()
+        .map_or_else(|_| path.to_owned(), |c| c.display().to_string())
+}
+
 /// Find near-duplicate code chunks in the active repo, plus any repos in `repos`.
 ///
 /// `project_root` is always scanned; `repos` adds to it, matching `search_code`.
@@ -531,14 +542,18 @@ pub async fn run_find_duplicates(
     // loads successfully. Subsequent repos must match or they become RepoErrors.
     let mut ref_identity: Option<(String, u16)> = None;
 
-    // Dedup on the canonical path the store resolved to, never the caller's
-    // spelling: `--repo .`, a trailing slash, a symlink, macOS `/var` vs
-    // `/private/var`, and Windows `\\?\C:\r` vs `C:\r` all name one repo. Loading
-    // one twice emits every cross-file pair four times, each burning a `limit`
-    // slot, and doubles the O(n²) scan. `search` dedups the same way.
-    let mut seen: HashSet<Arc<str>> = HashSet::new();
+    // Dedup on the canonical path, never the caller's spelling: `--repo .`, a
+    // trailing slash, a symlink, macOS `/var` vs `/private/var`, and Windows
+    // `\\?\C:\r` vs `C:\r` all name one repo. Loading one twice emits every
+    // cross-file pair four times, each burning a `limit` slot, and doubles the
+    // O(n²) scan; erroring one twice repeats its `RepoError` per spelling.
+    // `search` dedups the same way.
+    let mut seen: HashSet<String> = HashSet::new();
 
     for path in &repo_paths {
+        if !seen.insert(repo_dedup_key(path)) {
+            continue;
+        }
         // Resolve reference identity lazily from the first successful manifest.
         if ref_identity.is_none() {
             match peek_manifest_identity(path) {
@@ -556,9 +571,6 @@ pub async fn run_find_duplicates(
         match load_repo_chunks_readonly(path, ref_model, *ref_dims).await {
             Ok((canonical, chunks)) => {
                 let label: Arc<str> = Arc::from(canonical.as_str());
-                if !seen.insert(Arc::clone(&label)) {
-                    continue;
-                }
                 for _ in &chunks {
                     repo_labels.push(Arc::clone(&label));
                 }
@@ -1992,6 +2004,40 @@ mod tests {
         );
     }
 
+    /// Two spellings of one broken repo must collapse to one `RepoError`, the
+    /// same way two spellings of a loadable repo collapse to one corpus entry.
+    /// The Ok-branch label dedup can't cover it: an errored repo never reaches
+    /// the store's canonical label. Reachable since the active project is
+    /// auto-added — an unindexed project plus any respelling of it in `repos`.
+    #[tokio::test]
+    async fn find_duplicates_reports_one_error_for_two_spellings_of_a_broken_repo() {
+        // A bare fixture, never indexed: the active project itself is broken.
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+        let respelled = format!("{}/.", fixture.root().display());
+        let output = run_find_duplicates(fixture.root(), None, None, Some(vec![respelled])).await;
+        assert!(output.is_ok(), "duplicate scan failed: {output:?}");
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert!(
+            output.pairs.is_empty(),
+            "unindexed repos cannot produce pairs"
+        );
+        assert_eq!(
+            output.repo_errors.len(),
+            1,
+            "one broken repo spelled two ways must yield one error; got: {:?}",
+            output.repo_errors,
+        );
+        assert!(
+            output.repo_errors[0].error.contains("not indexed"),
+            "expected a 'not indexed' error; got: {:?}",
+            output.repo_errors,
+        );
+    }
+
     /// `repos` adds to the active project rather than replacing it, matching
     /// `search_code`. Naming only the other repo must still scan this one, or a
     /// caller silently audits everything except the code they are working in.
@@ -2277,6 +2323,49 @@ mod tests {
         assert!(
             !output.groups.is_empty(),
             "active repo must still produce hits despite the error"
+        );
+    }
+
+    /// The search twin of
+    /// `find_duplicates_reports_one_error_for_two_spellings_of_a_broken_repo`:
+    /// two spellings of one broken extra repo must collapse to one `RepoError`.
+    #[tokio::test]
+    async fn search_reports_one_error_for_two_spellings_of_a_broken_repo() {
+        let harness = cli_harness_private().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        let write = write_fixture_config(harness.claudix.project_root(), &stub_config());
+        assert!(write.is_ok());
+
+        // Exists as a repo but was never indexed: it errors while both of its
+        // spellings still canonicalize to one path.
+        let broken = TestFixture::new("small_rust");
+        assert!(broken.is_ok());
+        let broken = broken.ok().unwrap_or_else(|| unreachable!());
+        let spelled = broken.root().display().to_string();
+        let respelled = format!("{spelled}/.");
+
+        let output = run_search(
+            harness.claudix.project_root(),
+            "add".to_owned(),
+            Some(10),
+            None,
+            None,
+            Some(vec![spelled, respelled]),
+        )
+        .await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+
+        assert_eq!(
+            output.repo_errors.len(),
+            1,
+            "one broken repo spelled two ways must yield one error; got: {:?}",
+            output.repo_errors,
+        );
+        assert!(
+            !output.groups.is_empty(),
+            "active repo hits must survive the broken repo"
         );
     }
 
