@@ -235,8 +235,10 @@ impl Searcher {
         };
         let ref_model = ref_model.as_str();
         // Keyed up front so the error branch dedups too; two spellings of one
-        // broken repo must not each earn a `RepoError`.
-        let mut seen: HashSet<String> = HashSet::from([active_repo.as_ref().to_owned()]);
+        // broken repo must not each earn a `RepoError`. The seed goes through
+        // the same key as the loop so a non-canonical `project_root` can't
+        // let a respelling of the active repo load its corpus twice.
+        let mut seen: HashSet<String> = HashSet::from([repo_dedup_key(&active_repo)]);
 
         for repo in &query.repos {
             if !seen.insert(repo_dedup_key(repo)) {
@@ -1137,6 +1139,58 @@ mod tests {
 
         assert!(output.results.is_empty());
         assert!(output.repo_errors.is_empty());
+        Ok(())
+    }
+
+    /// The active-repo dedup seed must go through the same canonical key as
+    /// the loop, not trust the caller to pass a canonical root. A Searcher
+    /// built on a non-canonical spelling that gets a respelling of itself in
+    /// `repos` must not load its own corpus twice under two labels.
+    #[tokio::test]
+    async fn search_dedups_active_respelling_under_non_canonical_root() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let store = Store::new(fixture.root(), &config)?;
+        let embedder: Arc<dyn Provider> = Arc::new(StubProvider::with_model_id(
+            config.embedding.model.clone(),
+            Dimension(config.embedding.dimensions),
+        ));
+        index_fixture(&store, embedder.as_ref(), fixture.root(), &config).await?;
+
+        // Non-canonical root spelling for the searcher itself.
+        let searcher = Searcher::new(
+            fixture.root().join("."),
+            store,
+            embedder,
+            config.search.clone(),
+        );
+
+        let output = searcher
+            .search_all(
+                SearchQuery {
+                    query: "add".to_owned(),
+                    top_k: 10,
+                    language_filter: None,
+                    path_prefix: None,
+                    repos: vec![fixture.root().display().to_string()],
+                },
+                None,
+            )
+            .await?;
+
+        assert!(
+            !output.results.is_empty(),
+            "indexed fixture must produce hits, else this test proves nothing"
+        );
+        assert!(output.repo_errors.is_empty(), "no errors expected");
+        let mut labels: Vec<&str> = output.results.iter().map(|r| r.repo.as_ref()).collect();
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            1,
+            "one repo surfaced under two labels — the active corpus was loaded twice: {labels:?}"
+        );
         Ok(())
     }
 
