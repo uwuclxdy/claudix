@@ -55,11 +55,19 @@ mod tests {
     /// this test exists to catch. `hints` alone is ~60 standalone consts that
     /// nothing enumerates. Raw text also flags a doc comment naming a dead tool,
     /// which is rot too. `mod.rs` is excluded: it holds RETIRED_TOOL_NAMES and
-    /// would match itself.
-    const PROMPT_SOURCES: [(&str, &str); 3] = [
+    /// would match itself. `cli/` is excluded: the retired MCP names live on
+    /// there as legitimate CLI symbols (`run_reindex_file`), not rot. The two
+    /// markdown files ship to the agent verbatim — the slash command auto-runs
+    /// and the skill loads into context — so they scan like prompt sources.
+    const PROMPT_SOURCES: [(&str, &str); 5] = [
         ("prompts/hints.rs", include_str!("hints.rs")),
         ("prompts/hooks.rs", include_str!("hooks.rs")),
         ("prompts/mcp.rs", include_str!("mcp.rs")),
+        ("commands/doctor.md", include_str!("../../commands/doctor.md")),
+        (
+            "skills/claudix/SKILL.md",
+            include_str!("../../skills/claudix/SKILL.md"),
+        ),
     ];
 
     #[test]
