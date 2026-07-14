@@ -49,12 +49,6 @@ struct ReindexRequest {
     force: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema, Default)]
-struct OverviewRequest {
-    #[serde(default)]
-    path_prefix: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Deserialize, JsonSchema, Default)]
 struct FindDuplicatesRequest {
     #[serde(default)]
@@ -146,15 +140,6 @@ impl ClaudixServer {
             to_value(output)
         }
         .await;
-        Ok(into_result(outcome))
-    }
-
-    /// Per-directory map of the indexed repo.
-    #[tool(name = "overview")]
-    async fn overview(&self, Parameters(request): Parameters<OverviewRequest>) -> ToolOutcome {
-        let outcome = cli::run_overview(&self.project_root, request.path_prefix)
-            .await
-            .and_then(to_value);
         Ok(into_result(outcome))
     }
 
@@ -365,10 +350,7 @@ mod tests {
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            names,
-            vec!["search_code", "reindex", "overview", "find_duplicates"]
-        );
+        assert_eq!(names, vec!["search_code", "reindex", "find_duplicates"]);
     }
 
     /// Every served tool must have a handler the router can dispatch to, or the

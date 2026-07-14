@@ -20,7 +20,6 @@ pub fn tool_definitions(cross_repo: bool) -> Vec<Value> {
     vec![
         search_code(cross_repo),
         reindex(),
-        overview(),
         find_duplicates(cross_repo),
     ]
 }
@@ -62,19 +61,6 @@ fn reindex() -> Value {
             "properties": {
                 "path": { "type": "string", "description": "Reindex only this file (project-relative or absolute inside the project root)" },
                 "force": { "type": "boolean", "description": "Wipe the index before rebuilding. Ignored when path is set." }
-            }
-        }
-    })
-}
-
-fn overview() -> Value {
-    json!({
-        "name": "overview",
-        "description": "Per-directory map of the indexed repo: file and chunk counts, languages, and the most frequent identifiers. Use when: orienting in an unfamiliar codebase or deciding where to start, before reaching for search_code.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "path_prefix": { "type": "string", "description": "Restrict output to files under this project-relative path prefix, e.g. \"src/hooks\"" }
             }
         }
     })
@@ -141,8 +127,8 @@ mod tests {
     }
 
     #[test]
-    fn catalog_is_the_same_four_tools_regardless_of_cross_repo() {
-        let expected = vec!["search_code", "reindex", "overview", "find_duplicates"];
+    fn catalog_is_the_same_three_tools_regardless_of_cross_repo() {
+        let expected = vec!["search_code", "reindex", "find_duplicates"];
         assert_eq!(names(false), expected);
         assert_eq!(names(true), expected);
     }

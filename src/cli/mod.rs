@@ -26,9 +26,6 @@ use input::{
     parse_language_filter, parse_path_prefix, validate_search_query, validate_search_top_k,
 };
 
-/// Maximum number of top identifiers surfaced per directory in `OverviewOutput`.
-const TOP_IDENTIFIERS_CAP: usize = 8;
-
 /// Default cosine-similarity floor for [`run_find_duplicates`]. Higher = stricter / fewer pairs.
 pub(crate) const DEFAULT_MIN_SIMILARITY: f32 = 0.85;
 /// Default maximum number of duplicate pairs returned by [`run_find_duplicates`].
@@ -216,9 +213,6 @@ pub struct DirectoryRollup {
     pub chunk_count: usize,
     /// Languages present in this directory, sorted by chunk count desc then name asc.
     pub languages: Vec<LanguageCount>,
-    /// Most frequent non-empty chunk names, capped at [`TOP_IDENTIFIERS_CAP`], sorted by
-    /// frequency desc then name asc.
-    pub top_identifiers: Vec<String>,
 }
 
 /// Structural map of the indexed repo, grouped by immediate parent directory.
@@ -275,7 +269,6 @@ pub async fn run_overview(
         files: std::collections::HashSet<String>,
         chunk_count: usize,
         languages: HashMap<String, usize>,
-        names: HashMap<String, usize>,
     }
 
     let mut dir_map: HashMap<String, DirAggregate> = HashMap::new();
@@ -293,16 +286,10 @@ pub async fn run_overview(
             files: std::collections::HashSet::new(),
             chunk_count: 0,
             languages: HashMap::new(),
-            names: HashMap::new(),
         });
         agg.files.insert(chunk.file_path.clone());
         agg.chunk_count += 1;
         *agg.languages.entry(chunk.language.clone()).or_insert(0) += 1;
-        if let Some(ref name) = chunk.name
-            && !name.is_empty()
-        {
-            *agg.names.entry(name.clone()).or_insert(0) += 1;
-        }
     }
 
     let mut directories: Vec<DirectoryRollup> = dir_map
@@ -323,22 +310,11 @@ pub async fn run_overview(
                     .then_with(|| a.language.cmp(&b.language))
             });
 
-            let top_identifiers: Vec<String> = {
-                let mut pairs: Vec<(String, usize)> = agg.names.into_iter().collect();
-                // Frequency desc, then name asc for determinism, then cap.
-                pairs.sort_by(|(a_name, a_count), (b_name, b_count)| {
-                    b_count.cmp(a_count).then_with(|| a_name.cmp(b_name))
-                });
-                pairs.truncate(TOP_IDENTIFIERS_CAP);
-                pairs.into_iter().map(|(name, _)| name).collect()
-            };
-
             DirectoryRollup {
                 path: dir,
                 file_count: agg.files.len(),
                 chunk_count: agg.chunk_count,
                 languages,
-                top_identifiers,
             }
         })
         .collect();
@@ -1425,28 +1401,6 @@ mod tests {
         assert!(
             src.languages.iter().any(|l| l.language == "rust"),
             "expected 'rust' among languages in src/"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_overview_top_identifiers_include_known_fixture_name() {
-        let harness = cli_harness().await;
-        assert!(harness.is_ok());
-        let harness = harness.ok().unwrap_or_else(|| unreachable!());
-
-        let output = run_overview(harness.claudix.project_root(), None).await;
-        assert!(output.is_ok());
-        let output = output.ok().unwrap_or_else(|| unreachable!());
-
-        let src = output.directories.iter().find(|d| d.path == "src");
-        assert!(src.is_some());
-        let src = src.unwrap_or_else(|| unreachable!());
-
-        // src/math.rs defines `add` — it must appear in top identifiers.
-        assert!(
-            src.top_identifiers.iter().any(|name| name == "add"),
-            "expected 'add' in top_identifiers for src/; got: {:?}",
-            src.top_identifiers,
         );
     }
 

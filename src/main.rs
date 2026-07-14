@@ -312,9 +312,6 @@ async fn run() -> Result<()> {
                     dir.chunk_count,
                     langs.join(", ")
                 );
-                if !dir.top_identifiers.is_empty() {
-                    println!("    identifiers: {}", dir.top_identifiers.join(", "));
-                }
             }
         }
         Command::FindDuplicates {

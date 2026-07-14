@@ -42,8 +42,18 @@ pub fn truncate_snippet(content: &str, max_lines: usize) -> String {
 /// still naming one points the agent at a call that fails as unknown-tool, and
 /// nothing else in the build catches it — the strings are data, not symbols, so
 /// dropping the handler leaves them compiling and wrong.
+///
+/// The scan is a plain substring match, so `overview` also bans the English word
+/// from every agent-visible string. That is the intended trade: the sources are
+/// few, "directory map" says the same thing, and a name that reads like a tool
+/// call is exactly what misroutes the agent.
 #[cfg(test)]
-const RETIRED_TOOL_NAMES: [&str; 3] = ["get_index_status", "clear_index", "reindex_file"];
+const RETIRED_TOOL_NAMES: [&str; 4] = [
+    "get_index_status",
+    "clear_index",
+    "reindex_file",
+    "overview",
+];
 
 #[cfg(test)]
 mod tests {
@@ -63,7 +73,10 @@ mod tests {
         ("prompts/hints.rs", include_str!("hints.rs")),
         ("prompts/hooks.rs", include_str!("hooks.rs")),
         ("prompts/mcp.rs", include_str!("mcp.rs")),
-        ("commands/doctor.md", include_str!("../../commands/doctor.md")),
+        (
+            "commands/doctor.md",
+            include_str!("../../commands/doctor.md"),
+        ),
         (
             "skills/claudix/SKILL.md",
             include_str!("../../skills/claudix/SKILL.md"),
