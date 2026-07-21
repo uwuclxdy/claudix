@@ -1,4 +1,5 @@
-//! Measurement harness for related-code hint noise (`docs/todo.md` item 1).
+//! Measurement harness for related-code hint noise. Numbers it produced are
+//! recorded in `docs/subsystems/hooks.md`; open questions in `docs/todo.md`.
 //!
 //! Reads the repo's own live index and replays the hook's neighbor pipeline
 //! against it, so the numbers come from the shipped code path rather than from
@@ -207,7 +208,7 @@ fn replay(pools: &[EditPool], top_k: usize, dedup: bool, order: &[usize]) -> Run
                 // seen-filter had not already eaten. A pool that fits under the
                 // cap and comes back empty is the filter working as designed;
                 // this counts the edits where the over-fetch depth is what cost
-                // the hint (`docs/todo.md` item 3).
+                // the hint. Measured at zero everywhere; see `hooks.md`.
                 let cap = top_k.saturating_mul(NEIGHBOR_CANDIDATE_DEPTH);
                 if edit.pool.len() > cap
                     && edit.pool[cap..]
@@ -235,7 +236,8 @@ fn replay(pools: &[EditPool], top_k: usize, dedup: bool, order: &[usize]) -> Run
 }
 
 /// Distinct qualifying neighbor files per edit, uncapped — the pool ceiling
-/// `NEIGHBOR_CANDIDATE_DEPTH` has to cover (`docs/todo.md` item 3).
+/// `NEIGHBOR_CANDIDATE_DEPTH` has to cover. Single-seed, so it is a floor on the
+/// true ceiling rather than the ceiling (`docs/todo.md` item 2).
 fn report_pool_ceiling(label: &str, pools: &[EditPool], top_k: usize) {
     let marker_cap = top_k.saturating_mul(NEIGHBOR_CANDIDATE_DEPTH);
     let mut sizes: Vec<usize> = pools.iter().map(|p| p.pool.len()).collect();
@@ -264,6 +266,95 @@ fn report_pool_ceiling(label: &str, pools: &[EditPool], top_k: usize) {
             worst.pool.len()
         );
     }
+}
+
+/// Nearest-rank percentile over an ascending slice.
+fn percentile(sorted: &[f32], p: usize) -> f32 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (sorted.len() * p).div_ceil(100).saturating_sub(1);
+    sorted[rank.min(sorted.len() - 1)]
+}
+
+/// Where the configured floor lands on this provider's score scale. The floor
+/// is an absolute cosine and each embedding model spreads its similarities
+/// differently, so a floor tuned against one is worth re-checking against
+/// another. Run it on the same repo under two providers and compare. The
+/// bge-small-vs-qwen3 comparison it answered is in `docs/subsystems/hooks.md`.
+///
+/// It scans at floor `0.0` itself rather than taking a pool, because a floored
+/// pool would silently mix a no-neighbor sentinel into the percentiles and drag
+/// every one of them down.
+///
+/// Compare only runs whose corpus matches: the chunk count is printed above,
+/// and a corpus that differs by even a few chunks moves the medians by enough
+/// to swamp the difference being measured.
+///
+/// Pointing it at a second provider needs `CIRRUS_CONFIG` (a `[paths]
+/// index_dir` plus that provider's `[embedding]` block) **and**
+/// `--features test-stub`, since `cirrus_config_path` is gated on that feature
+/// alone, not on `cfg(test)`. Without the feature the override is silently
+/// ignored and the run reads the default index while still printing the other
+/// provider's manifest identity, which looks exactly like a real result.
+///
+/// Give the second provider a whole sibling tree (`index_dir =
+/// "<other>/index"`), never a subdirectory of `.claudix`: the state dir is
+/// `index_dir.parent()`, so `.claudix/index-other` shares one `manifest.json`
+/// with the live index and overwrites it.
+fn report_score_distribution(
+    rows: &[StoredChunk],
+    by_file: &BTreeMap<String, Vec<&StoredChunk>>,
+    top_k: usize,
+    floor: f32,
+) {
+    let pools = scan(rows, build_edits(by_file, Mode::ChangedChunk), 0.0);
+
+    let mut best: Vec<f32> = Vec::with_capacity(pools.len());
+    let mut kth: Vec<f32> = Vec::with_capacity(pools.len());
+    for edit in &pools {
+        best.push(edit.pool.first().map_or(0.0, |n| n.score));
+        kth.push(
+            edit.pool
+                .get(top_k.saturating_sub(1))
+                .map_or(0.0, |n| n.score),
+        );
+    }
+    best.sort_by(f32::total_cmp);
+    kth.sort_by(f32::total_cmp);
+
+    let edits = pools.len().max(1);
+    let any = best.iter().filter(|&&s| s >= floor).count();
+    let full = kth.iter().filter(|&&s| s >= floor).count();
+
+    println!("\n  neighbor score distribution (floor removed)");
+    println!(
+        "    best neighbor per edit    p10 {:.3}  p50 {:.3}  p90 {:.3}  max {:.3}",
+        percentile(&best, 10),
+        percentile(&best, 50),
+        percentile(&best, 90),
+        best.last().copied().unwrap_or(0.0)
+    );
+    println!(
+        "    rank-{top_k} neighbor per edit   p10 {:.3}  p50 {:.3}  p90 {:.3}  max {:.3}",
+        percentile(&kth, 10),
+        percentile(&kth, 50),
+        percentile(&kth, 90),
+        kth.last().copied().unwrap_or(0.0)
+    );
+    println!(
+        "    at floor {floor}: {any} of {} edits ({:.0}%) emit at least one hint, {full} ({:.0}%) emit a full {top_k}",
+        pools.len(),
+        100.0 * any as f64 / edits as f64,
+        100.0 * full as f64 / edits as f64
+    );
+    // The quartiles the p10/p50/p90 line above does not carry, so a candidate
+    // floor can be read straight off the empirical spread rather than guessed.
+    println!(
+        "    best-neighbor quartiles   p25 {:.3}  p75 {:.3}",
+        percentile(&best, 25),
+        percentile(&best, 75)
+    );
 }
 
 /// A file with no first-class chunker falls back to line-index windowing, so a
@@ -381,6 +472,9 @@ async fn hint_distribution_over_the_live_index() {
         session_edits(),
         by_file.len()
     );
+
+    println!("\n=== changed-chunk query, provider score scale ===");
+    report_score_distribution(&rows, &by_file, top_k, floor);
 
     let order = shuffled_order(by_file.len());
     for mode in [Mode::WholeFile, Mode::ChangedChunk] {
