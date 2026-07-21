@@ -357,6 +357,221 @@ fn report_score_distribution(
     );
 }
 
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Whether `content` references `symbol` as a whole identifier rather than as a
+/// substring of a longer name.
+fn mentions_identifier(content: &str, symbol: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut searched = 0;
+
+    while let Some(offset) = content[searched..].find(symbol) {
+        let start = searched + offset;
+        let end = start + symbol.len();
+        let clean_start = start == 0 || !is_identifier_byte(bytes[start - 1]);
+        let clean_end = end == content.len() || !is_identifier_byte(bytes[end]);
+        if clean_start && clean_end {
+            return true;
+        }
+        searched = start + 1;
+    }
+
+    false
+}
+
+/// Symbols too generic to carry a relatedness signal. Every language here has
+/// dozens of unrelated `new`/`fmt`/`main` definitions, so co-occurrence on one
+/// says nothing about whether two chunks belong together.
+const GENERIC_SYMBOLS: &[&str] = &[
+    "new",
+    "main",
+    "default",
+    "from",
+    "into",
+    "next",
+    "drop",
+    "clone",
+    "eq",
+    "hash",
+    "cmp",
+    "fmt",
+    "get",
+    "set",
+    "run",
+    "id",
+    "len",
+    "add",
+    "build",
+    "parse",
+    "read",
+    "write",
+    "init",
+    "test",
+    "name",
+    "value",
+    "path",
+    "start",
+    "end",
+    "close",
+    "open",
+    "to_string",
+    "as_str",
+];
+
+/// Retrieval precision that does not depend on the score scale.
+///
+/// The rest of this harness counts hints, which rewards whichever model happens
+/// to score tighter against a fixed floor. That says nothing about whether the
+/// neighbors are the right ones, so it cannot rank two embedding models. This
+/// can: after an edit to symbol `S`, a neighbor worth surfacing is one that
+/// *references* `S`, and whether a chunk's text contains `S` is decided by the
+/// text alone, identically for every model.
+///
+/// It is a proxy, not ground truth. A truly related chunk that never names the
+/// symbol counts as a miss, and an incidental mention counts as a hit. Both
+/// biases apply equally to every model, so the comparison between models holds
+/// even though the absolute number means little on its own.
+///
+/// The base rate is the control and the only reason the number is readable: it
+/// is the share of other files that mention the symbol at all, which is what
+/// picking neighbors at random would score. Precision at or below the base rate
+/// means the embedding contributed nothing.
+///
+/// Deliberately ranks with **no similarity floor**. Scoring only the queries
+/// that clear one makes the metric conditional on the score scale: a model that
+/// emits fewer, more confident hints is handed an easier question set and wins
+/// on selection rather than on ranking. That silently reversed this metric's
+/// verdict once already. With the floor off, every model answers the identical
+/// symbol set, so `symbols evaluated` must match across two runs on one repo —
+/// if it does not, the comparison is void.
+fn report_symbol_precision(
+    rows: &[StoredChunk],
+    by_file: &BTreeMap<String, Vec<&StoredChunk>>,
+    top_k: usize,
+) {
+    let mut precision_sum = 0.0f64;
+    let mut base_sum = 0.0f64;
+    let mut top1_hits = 0usize;
+    let mut evaluated = 0usize;
+    let mut skipped_no_target = 0usize;
+    // A symbol referenced by half the repo is found by any ranking, so the
+    // aggregate is dominated by cases no model can lose. These are the ones
+    // that discriminate: few correct answers, most of the corpus wrong.
+    let mut rare_precision_sum = 0.0f64;
+    let mut rare_base_sum = 0.0f64;
+    let mut rare_evaluated = 0usize;
+    const RARE_MENTION_LIMIT: usize = 3;
+
+    for row in rows {
+        let Some(symbol) = row.name.as_deref() else {
+            continue;
+        };
+        if symbol.len() < 4 || GENERIC_SYMBOLS.contains(&symbol) {
+            continue;
+        }
+
+        // Only files other than the edited one can be retrieved, so the base
+        // rate and the judgement must both be scoped to them.
+        let mut other_files = 0usize;
+        let mut mentioning: BTreeSet<&str> = BTreeSet::new();
+        for (path, chunks) in by_file {
+            if path == &row.file_path {
+                continue;
+            }
+            other_files += 1;
+            if chunks
+                .iter()
+                .any(|c| mentions_identifier(&c.content, symbol))
+            {
+                mentioning.insert(path.as_str());
+            }
+        }
+        let mentioning_files = mentioning.len();
+
+        // A query with no correct answer anywhere scores zero for every model
+        // and only dilutes the average.
+        if mentioning_files == 0 || other_files == 0 {
+            skipped_no_target += 1;
+            continue;
+        }
+
+        let exclude = RelativePath::new(&row.file_path);
+        let hits = neighbors(
+            rows,
+            std::slice::from_ref(&row.vector),
+            &exclude,
+            top_k,
+            0.0,
+        );
+        if hits.is_empty() {
+            continue;
+        }
+
+        let relevant = hits
+            .iter()
+            .filter(|hit| mentioning.contains(hit.file_path.as_str()))
+            .count();
+
+        let precision = relevant as f64 / hits.len() as f64;
+        let base = mentioning_files as f64 / other_files as f64;
+
+        precision_sum += precision;
+        base_sum += base;
+        if hits
+            .first()
+            .is_some_and(|hit| mentioning.contains(hit.file_path.as_str()))
+        {
+            top1_hits += 1;
+        }
+        evaluated += 1;
+
+        if mentioning_files <= RARE_MENTION_LIMIT {
+            rare_precision_sum += precision;
+            rare_base_sum += base;
+            rare_evaluated += 1;
+        }
+    }
+
+    println!("\n  retrieval precision by symbol co-occurrence (model-independent)");
+    if evaluated == 0 {
+        println!("    no evaluable symbols in this index");
+        return;
+    }
+
+    let precision = precision_sum / evaluated as f64;
+    let base = base_sum / evaluated as f64;
+    println!(
+        "    symbols evaluated        {evaluated} ({skipped_no_target} skipped, referenced nowhere else)"
+    );
+    println!("    precision@{top_k}             {:.3}", precision);
+    println!("    base rate (random)       {:.3}", base);
+    println!(
+        "    lift over random         {:.2}x",
+        if base > 0.0 { precision / base } else { 0.0 }
+    );
+    println!(
+        "    precision@1              {:.3}",
+        top1_hits as f64 / evaluated as f64
+    );
+
+    if rare_evaluated > 0 {
+        let rare_precision = rare_precision_sum / rare_evaluated as f64;
+        let rare_base = rare_base_sum / rare_evaluated as f64;
+        println!(
+            "    rare symbols (<={RARE_MENTION_LIMIT} files) {rare_evaluated} evaluated, precision@{top_k} {:.3}, base {:.3}, lift {:.2}x",
+            rare_precision,
+            rare_base,
+            if rare_base > 0.0 {
+                rare_precision / rare_base
+            } else {
+                0.0
+            }
+        );
+    }
+}
+
 /// A file with no first-class chunker falls back to line-index windowing, so a
 /// line insert or delete rewrites every window after it and the whole file
 /// still reads as changed. Production keeps the file-wide query for those, and
@@ -420,6 +635,36 @@ fn scan(rows: &[StoredChunk], edits: Vec<(String, Vec<Vec<f32>>)>, floor: f32) -
         .collect()
 }
 
+/// Not ignored: the precision metric is only meaningful if this is exact, and
+/// a substring match would silently inflate every model's score equally, which
+/// is the kind of error a model comparison cannot reveal.
+#[cfg(test)]
+mod identifier_tests {
+    use super::mentions_identifier;
+
+    #[test]
+    fn matches_only_whole_identifiers() {
+        assert!(mentions_identifier(
+            "let x = parse_config();",
+            "parse_config"
+        ));
+        assert!(mentions_identifier("parse_config", "parse_config"));
+        assert!(mentions_identifier("(parse_config)", "parse_config"));
+
+        assert!(!mentions_identifier("try_parse_config()", "parse_config"));
+        assert!(!mentions_identifier("parse_config_inner()", "parse_config"));
+        assert!(!mentions_identifier("xparse_configx", "parse_config"));
+        assert!(!mentions_identifier("nothing here", "parse_config"));
+    }
+
+    /// The scanner must keep looking past a rejected substring match rather
+    /// than giving up on the first hit.
+    #[test]
+    fn finds_a_real_match_after_a_rejected_substring() {
+        assert!(mentions_identifier("my_render() then render()", "render"));
+    }
+}
+
 #[tokio::test]
 #[ignore = "measures the working repo's live index; run by hand"]
 async fn hint_distribution_over_the_live_index() {
@@ -475,6 +720,7 @@ async fn hint_distribution_over_the_live_index() {
 
     println!("\n=== changed-chunk query, provider score scale ===");
     report_score_distribution(&rows, &by_file, top_k, floor);
+    report_symbol_precision(&rows, &by_file, top_k);
 
     let order = shuffled_order(by_file.len());
     for mode in [Mode::WholeFile, Mode::ChangedChunk] {
