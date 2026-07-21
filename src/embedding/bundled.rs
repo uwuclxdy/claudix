@@ -16,7 +16,26 @@ use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::prompts::hints;
 use crate::types::Dimension;
 
+/// How a model turns `last_hidden_state` into one vector per input. Every model
+/// publishes exactly one correct answer for itself and reading the wrong one
+/// degrades silently, so it is pinned beside the model id instead of assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pooling {
+    /// First token, `[CLS]`. What the BGE and GTE families specify.
+    Cls,
+    /// Attention-masked mean across tokens.
+    Mean,
+}
+
 pub const BUNDLED_MODEL_ID: &str = "bge-small-en-v1.5";
+/// `BAAI/bge-small-en-v1.5` publishes `pooling_mode_cls_token: true` and
+/// `pooling_mode_mean_tokens: false` in its `1_Pooling/config.json`, and its
+/// card spells out "you select the last hidden state of the first token (i.e.
+/// [CLS]) as the sentence embedding". Read that file from the model being
+/// swapped in rather than carrying this value over; it is per-model, and at
+/// least one published model (`codefuse-ai/F2LLM-v2-80M`) ships a stale one,
+/// so cross-check it against `config.json` and `modules.json`.
+pub const BUNDLED_POOLING: Pooling = Pooling::Cls;
 pub const BUNDLED_MODEL_FILENAME: &str = "bge-small-en-v1.5.onnx";
 pub const BUNDLED_TOKENIZER_FILENAME: &str = "tokenizer.json";
 pub const BUNDLED_OUTPUT_NAME: &str = "last_hidden_state";
@@ -163,7 +182,8 @@ impl BundledProvider {
             .collect::<Result<Vec<_>>>()?;
         let output_dimensions = validate_output_shape(&shape, batch_size, self.inner.dimensions)?;
 
-        Ok(mean_pool_and_normalize(
+        Ok(pool_and_normalize(
+            BUNDLED_POOLING,
             values,
             &attention_mask,
             batch_size,
@@ -382,6 +402,56 @@ fn validate_output_shape(
     Ok(actual_dimensions)
 }
 
+/// Reduce `last_hidden_state` to one vector per input.
+///
+/// Which reduction is not a free choice: a model is trained so that one
+/// specific position or statistic carries the sentence embedding, and every
+/// other reduction returns a vector that is still plausible, still normalized,
+/// and quietly worse. Dispatching on a value pinned beside the model id is what
+/// keeps that choice visible.
+fn pool_and_normalize(
+    strategy: Pooling,
+    values: &[f32],
+    attention_mask: &[i64],
+    batch_size: usize,
+    sequence_length: usize,
+    dimensions: usize,
+) -> Vec<Vec<f32>> {
+    match strategy {
+        Pooling::Cls => cls_pool_and_normalize(values, batch_size, sequence_length, dimensions),
+        Pooling::Mean => mean_pool_and_normalize(
+            values,
+            attention_mask,
+            batch_size,
+            sequence_length,
+            dimensions,
+        ),
+    }
+}
+
+/// Take the first token's hidden state. `[CLS]` is prepended by the tokenizer
+/// and never masked, so the attention mask cannot move which row this reads.
+fn cls_pool_and_normalize(
+    values: &[f32],
+    batch_size: usize,
+    sequence_length: usize,
+    dimensions: usize,
+) -> Vec<Vec<f32>> {
+    let mut vectors = Vec::with_capacity(batch_size);
+
+    for batch_index in 0..batch_size {
+        let base = batch_index * sequence_length * dimensions;
+        let mut vector = match values.get(base..base + dimensions) {
+            Some(row) => row.to_vec(),
+            None => vec![0.0; dimensions],
+        };
+        normalize_l2(&mut vector);
+        vectors.push(vector);
+    }
+
+    vectors
+}
+
 fn mean_pool_and_normalize(
     values: &[f32],
     attention_mask: &[i64],
@@ -484,6 +554,49 @@ mod tests {
         let error = validate_output_shape(&[1, 3, 2], 1, BUNDLED_DIMENSIONS);
 
         assert!(matches!(error, Err(ClaudixError::DimensionMismatch { .. })));
+    }
+
+    /// The published pooling head for the bundled model, pinned as a literal.
+    /// The provider read the mean of every token for its first several
+    /// releases while the model specifies `[CLS]`, which produced vectors that
+    /// were normalized, plausible, and wrong. A round-trip test cannot catch
+    /// that: encoding and searching through the same wrong head stays
+    /// self-consistent. Only an assertion against what the model publishes
+    /// does.
+    #[test]
+    fn bundled_model_pools_the_head_its_model_card_specifies() {
+        assert_eq!(BUNDLED_POOLING, Pooling::Cls);
+    }
+
+    /// Distinguishes the two heads by construction: token 0 is orthogonal to
+    /// token 1, so a mean-pooled result cannot equal a CLS-pooled one.
+    #[test]
+    fn cls_pooling_reads_the_first_token_not_the_mean() {
+        let values = vec![
+            1.0, 0.0, 0.0, 0.0, // token 0, the [CLS] row
+            0.0, 1.0, 0.0, 0.0, // token 1
+            9.0, 9.0, 9.0, 9.0, // padding, ignored by both heads
+        ];
+        let attention_mask = vec![1, 1, 0];
+
+        let cls = pool_and_normalize(Pooling::Cls, &values, &attention_mask, 1, 3, 4);
+        assert_eq!(cls[0], vec![1.0, 0.0, 0.0, 0.0]);
+
+        let mean = pool_and_normalize(Pooling::Mean, &values, &attention_mask, 1, 3, 4);
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((mean[0][0] - half).abs() < 1e-6);
+        assert!((mean[0][1] - half).abs() < 1e-6);
+        assert_ne!(cls[0], mean[0]);
+    }
+
+    /// A short output tensor yields zeros rather than panicking: the hook path
+    /// must fail open, and a truncated model output is exactly the kind of
+    /// corruption that would otherwise take the session down.
+    #[test]
+    fn cls_pooling_survives_a_truncated_output_tensor() {
+        let vectors = cls_pool_and_normalize(&[1.0, 0.0], 1, 3, 4);
+
+        assert_eq!(vectors, vec![vec![0.0; 4]]);
     }
 
     #[test]
