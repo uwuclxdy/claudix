@@ -136,6 +136,21 @@ pub(super) async fn read_all_rows(table: &Table) -> Result<Vec<StoredChunk>> {
     batches_to_rows(batches)
 }
 
+/// Read every row satisfying `predicate`, an SQL filter pushed down to
+/// LanceDB. Same output shape as [`read_all_rows`]; the caller owns building
+/// (and escaping) the predicate.
+pub(super) async fn read_rows_matching(table: &Table, predicate: &str) -> Result<Vec<StoredChunk>> {
+    let batches = table
+        .query()
+        .only_if(predicate)
+        .limit(i64::MAX as usize)
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+    batches_to_rows(batches)
+}
+
 /// Projected read that fetches only scalar metadata columns, skipping the
 /// embedding vector. Callers that only need `file_path`, `file_hash`,
 /// `language`, and `name` should prefer this over [`read_all_rows`] to avoid

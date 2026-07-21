@@ -314,6 +314,28 @@ impl Claudix {
 
         let chunks = self.collect_file_chunks(&file).await?;
         let embedded_chunks = self.embed_chunks(chunks).await?;
+
+        let surface_related =
+            !embedded_chunks.is_empty() && self.config.hooks.surface_related_on_edit;
+        // Snapshot the pre-edit chunk contents before the replace below drops
+        // them; the neighbor pass then queries with what this edit introduced
+        // instead of the whole file. An empty set means "everything is new",
+        // which is both the brand-new-file case and the fail-open one: losing
+        // the narrowing is better than losing the hint.
+        let previous_contents: HashSet<FileHash> = if surface_related {
+            self.store
+                .read_file_chunks(&relative_path)
+                .await
+                .map(|rows| {
+                    rows.iter()
+                        .map(|row| enumeration::hash_bytes(row.content.as_bytes()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+
         let stats = if embedded_chunks.is_empty() {
             let stats = self
                 .store
@@ -341,9 +363,13 @@ impl Claudix {
 
         // Compute change-neighbors using the fresh vectors — no extra embed call.
         // Fail-open: neighbor computation errors are discarded; the index is already updated.
-        if !embedded_chunks.is_empty() && self.config.hooks.surface_related_on_edit {
-            self.write_change_neighbors_marker(&relative_path, &embedded_chunks)
-                .await;
+        if surface_related {
+            self.write_change_neighbors_marker(
+                &relative_path,
+                &embedded_chunks,
+                &previous_contents,
+            )
+            .await;
         }
 
         Ok(IndexStats {
@@ -352,17 +378,51 @@ impl Claudix {
         })
     }
 
-    /// Compute semantic neighbors of the freshly-embedded chunks and write the
-    /// marker. Runs inside the detached reindex-file child — ONNX is already
+    /// Compute semantic neighbors of the chunks this edit introduced (those
+    /// whose content is absent from `previous_contents`) and write the marker.
+    /// Runs inside the detached reindex-file child — ONNX is already
     /// warm, `read_chunks` is a fast LanceDB scan. Fail-open: any error is
     /// silently discarded so the hook session continues normally.
+    ///
+    /// Ceiling: the narrowing rides on chunk content being stable across an
+    /// unrelated edit, which holds for the tree-sitter chunkers but not for
+    /// `chunk_fallback` — it windows on line index, so inserting or deleting a
+    /// line rewrites every later window and the whole file reads as changed.
+    /// Files without a grammar (markdown, toml, yaml, shell) therefore keep the
+    /// old file-wide query. Upgrade path is content-defined chunk boundaries.
     async fn write_change_neighbors_marker(
         &self,
         relative_path: &RelativePath,
         embedded_chunks: &[EmbeddedChunk],
+        previous_contents: &HashSet<FileHash>,
     ) {
-        let query_vectors: Vec<Vec<f32>> =
-            embedded_chunks.iter().map(|ec| ec.vector.clone()).collect();
+        // Query with the chunks this edit actually introduced. Every chunk of
+        // the file makes the neighbor set a property of the file rather than of
+        // the edit, so every save re-injects the same "related code" list.
+        let changed: Vec<&EmbeddedChunk> = embedded_chunks
+            .iter()
+            .filter(|ec| {
+                !previous_contents.contains(&enumeration::hash_bytes(ec.chunk.content.as_bytes()))
+            })
+            .collect();
+
+        // Chunkers emit a container (impl, class, inline mod) alongside the
+        // items inside it, and the container's bytes cover theirs — so editing
+        // one method marks the enclosing block changed too. Its vector is a
+        // whole-block blur that reproduces the file-wide neighbor set this
+        // filter exists to kill. Keep only the innermost changed chunks.
+        let query_vectors: Vec<Vec<f32>> = changed
+            .iter()
+            .filter(|outer| {
+                !changed.iter().any(|inner| {
+                    strictly_contains(&outer.chunk.byte_range, &inner.chunk.byte_range)
+                })
+            })
+            .map(|ec| ec.vector.clone())
+            .collect();
+        if query_vectors.is_empty() {
+            return;
+        }
 
         let Ok(all_rows) = self.store.read_chunks().await else {
             return;
@@ -555,6 +615,18 @@ impl Claudix {
     }
 }
 
+/// True when `outer` covers `inner` and is strictly larger.
+///
+/// Strictness carries the whole edge case: two chunks over the identical range
+/// would each read the other as contained, eliminate each other, and leave the
+/// edit with nothing to query. Equal ranges keep both — neither is the
+/// narrower signal.
+fn strictly_contains(outer: &ByteRange, inner: &ByteRange) -> bool {
+    outer.start <= inner.start
+        && inner.end <= outer.end
+        && (outer.start < inner.start || inner.end < outer.end)
+}
+
 pub(crate) async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>> {
     let dimensions = Dimension(config.embedding.dimensions);
 
@@ -738,6 +810,52 @@ mod tests {
                 })
                 .collect();
             Ok(result)
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Three mutually orthogonal axes, picked by a marker word in the text.
+    /// Identical text always maps to the same axis, so which chunks seeded a
+    /// neighbor query is directly readable off the resulting neighbor list.
+    fn content_keyed_vector(text: &str) -> Vec<f32> {
+        let axis = if text.contains("alpha") {
+            0
+        } else if text.contains("beta") {
+            1
+        } else {
+            2
+        };
+        let mut vector = vec![0.0_f32; 8];
+        vector[axis] = 1.0;
+        vector
+    }
+
+    /// Provider whose output depends only on the chunk text, so a chunk that
+    /// survives an edit unchanged re-embeds to the vector already in the store.
+    struct ContentKeyedProvider;
+
+    #[async_trait]
+    impl Provider for ContentKeyedProvider {
+        fn name(&self) -> &str {
+            "content-keyed"
+        }
+
+        fn dimensions(&self) -> Dimension {
+            Dimension(8)
+        }
+
+        fn model_id(&self) -> &str {
+            "stub-v1"
+        }
+
+        async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Ok(batch
+                .iter()
+                .map(|text| content_keyed_vector(text))
+                .collect())
         }
 
         async fn health_check(&self) -> Result<()> {
@@ -1504,20 +1622,36 @@ mod tests {
         name: &str,
         vector: Vec<f32>,
     ) -> Result<()> {
+        seed_chunks(store, config, &[(file_path, name, vector)]).await
+    }
+
+    /// Multi-file form of [`seed_chunk`]. `replace_chunks` rewrites the whole
+    /// table, so seeding several files needs one call, not one call per file.
+    async fn seed_chunks(
+        store: &Store,
+        config: &Config,
+        entries: &[(&str, &str, Vec<f32>)],
+    ) -> Result<()> {
         use crate::types::{ByteRange, ChunkId, ChunkKind, EmbeddedChunk, FileHash, LineRange};
-        let chunk = Chunk {
-            id: ChunkId(1),
-            file_path: RelativePath::new(file_path),
-            language: crate::types::Language::Rust,
-            kind: ChunkKind::Function,
-            name: Some(name.to_owned()),
-            line_range: LineRange { start: 1, end: 5 },
-            byte_range: ByteRange { start: 0, end: 50 },
-            file_hash: FileHash([0u8; 16]),
-            content: format!("pub fn {name}() {{}}"),
-        };
-        let embedded = EmbeddedChunk { chunk, vector };
-        store.replace_chunks(&[embedded], config).await?;
+        let embedded: Vec<EmbeddedChunk> = entries
+            .iter()
+            .enumerate()
+            .map(|(index, (file_path, name, vector))| EmbeddedChunk {
+                chunk: Chunk {
+                    id: ChunkId(index as u64 + 1),
+                    file_path: RelativePath::new(*file_path),
+                    language: crate::types::Language::Rust,
+                    kind: ChunkKind::Function,
+                    name: Some((*name).to_owned()),
+                    line_range: LineRange { start: 1, end: 5 },
+                    byte_range: ByteRange { start: 0, end: 50 },
+                    file_hash: FileHash([0u8; 16]),
+                    content: format!("pub fn {name}() {{}}"),
+                },
+                vector: vector.clone(),
+            })
+            .collect();
+        store.replace_chunks(&embedded, config).await?;
         Ok(())
     }
 
@@ -1659,6 +1793,236 @@ mod tests {
         assert!(
             !claudix.store.change_neighbors_marker_path().exists(),
             "no marker must be written when surface_related_on_edit = false"
+        );
+        Ok(())
+    }
+
+    const ALPHA_FN: &str = "pub fn alpha() {\n    1\n}\n";
+    const BETA_FN: &str = "pub fn beta() {\n    2\n}\n";
+
+    /// Store + provider wired so each chunk of the edited file maps to exactly
+    /// one seeded neighbor file. Which chunks seeded the neighbor query is then
+    /// readable straight off the marker's file list.
+    async fn changed_chunk_fixture() -> Result<(TestFixture, Claudix)> {
+        let fixture = TestFixture::new("small_rust")?;
+        let mut config = stub_config();
+        config.hooks.surface_related_on_edit = true;
+        config.hooks.related_top_k = 5;
+        config.hooks.related_min_similarity = 0.5;
+
+        let claudix = test_claudix_with_embedder(
+            fixture.root().to_path_buf(),
+            config,
+            Arc::new(ContentKeyedProvider),
+        )?;
+        claudix.store.ensure_layout()?;
+
+        seed_chunks(
+            &claudix.store,
+            claudix.config.as_ref(),
+            &[
+                (
+                    "src/near_alpha.rs",
+                    "near_alpha",
+                    content_keyed_vector("alpha"),
+                ),
+                (
+                    "src/near_beta.rs",
+                    "near_beta",
+                    content_keyed_vector("beta"),
+                ),
+            ],
+        )
+        .await?;
+        // Both must exist on disk: the reindex-time prune drops chunks for
+        // missing files before neighbor surfacing runs.
+        for path in ["src/near_alpha.rs", "src/near_beta.rs"] {
+            fs::write(fixture.root().join(path), b"pub fn seeded() {}\n").await?;
+        }
+        Ok((fixture, claudix))
+    }
+
+    fn marker_neighbor_paths(marker_path: &Path) -> Vec<String> {
+        cn_marker::read(marker_path)
+            .map(|marker| {
+                marker
+                    .neighbors
+                    .iter()
+                    .map(|n| n.file_path.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The neighbor query must be seeded by the chunks the edit introduced, not
+    /// by every chunk in the file — otherwise the surfaced set is a property of
+    /// the file and every save re-injects the same list.
+    #[tokio::test]
+    async fn reindex_file_queries_only_chunks_whose_content_changed() -> Result<()> {
+        let (fixture, claudix) = changed_chunk_fixture().await?;
+        let edited = fixture.root().join("src/edited.rs");
+        let marker_path = claudix.store.change_neighbors_marker_path();
+
+        fs::write(&edited, format!("{ALPHA_FN}\n{BETA_FN}")).await?;
+        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+
+        // Control: with nothing stored for the file, both chunks are new and
+        // both neighbors are reachable. Without it the assertion below could
+        // pass on a fixture where `near_alpha` never surfaces at all.
+        assert_eq!(
+            marker_neighbor_paths(&marker_path),
+            vec!["src/near_alpha.rs", "src/near_beta.rs"],
+            "control: every chunk of an unindexed file seeds the query"
+        );
+        fs::remove_file(&marker_path).await?;
+
+        // Rewrite only the beta function; the alpha function's bytes are
+        // byte-identical across the edit.
+        fs::write(
+            &edited,
+            format!("{ALPHA_FN}\npub fn beta() {{\n    22\n}}\n"),
+        )
+        .await?;
+        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+
+        assert_eq!(
+            marker_neighbor_paths(&marker_path),
+            vec!["src/near_beta.rs"],
+            "only the chunk whose content changed may seed the neighbor query"
+        );
+        Ok(())
+    }
+
+    /// An edit that leaves every chunk's content intact (here: reordering two
+    /// functions) introduces nothing to surface, so no marker is written.
+    #[tokio::test]
+    async fn reindex_file_writes_no_marker_when_no_chunk_content_changed() -> Result<()> {
+        let (fixture, claudix) = changed_chunk_fixture().await?;
+        let edited = fixture.root().join("src/edited.rs");
+        let marker_path = claudix.store.change_neighbors_marker_path();
+
+        fs::write(&edited, format!("{ALPHA_FN}\n{BETA_FN}")).await?;
+        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        assert!(marker_path.exists(), "control: the first index surfaces");
+        fs::remove_file(&marker_path).await?;
+
+        fs::write(&edited, format!("{BETA_FN}\n{ALPHA_FN}")).await?;
+        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+
+        // Liveness control: the file hash changed, so the reindex re-chunked
+        // rather than short-circuiting on an unchanged hash. Rows sort by byte
+        // offset, so beta leading proves the swap landed in the store.
+        let rows = claudix
+            .store
+            .read_file_chunks(&RelativePath::new("src/edited.rs"))
+            .await?;
+        assert_eq!(
+            rows.first().and_then(|row| row.name.clone()),
+            Some("beta".to_owned()),
+            "the reindex must have re-chunked the reordered file"
+        );
+        assert!(
+            !marker_path.exists(),
+            "an edit that changes no chunk content must surface nothing"
+        );
+        Ok(())
+    }
+
+    /// The shape that dominates real code: an `impl` is stored as its own chunk
+    /// covering every method inside it, so editing one method marks the whole
+    /// block changed too. That block's vector is a file-level blur — if it
+    /// reaches the query, the narrowing is undone on almost every real edit.
+    #[tokio::test]
+    async fn reindex_file_drops_container_chunks_wrapping_a_changed_chunk() -> Result<()> {
+        let (fixture, claudix) = changed_chunk_fixture().await?;
+        let edited = fixture.root().join("src/edited.rs");
+        let marker_path = claudix.store.change_neighbors_marker_path();
+
+        // The `impl` chunk's content spans both methods, so it contains the
+        // word "alpha" and embeds onto the alpha axis. Leaking it into the
+        // query is therefore directly visible as a near_alpha hit.
+        let with_body = |beta_body: &str| {
+            format!(
+                "pub struct Thing;\n\nimpl Thing {{\n    pub fn alpha(&self) -> u32 {{\n        1\n    }}\n\n    pub fn beta(&self) -> u32 {{\n        {beta_body}\n    }}\n}}\n"
+            )
+        };
+
+        fs::write(&edited, with_body("2")).await?;
+        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+
+        // Control: the impl block really is stored as its own chunk covering
+        // both methods, so the test is exercising the container shape and not
+        // a flat file the filter would handle trivially.
+        let rows = claudix
+            .store
+            .read_file_chunks(&RelativePath::new("src/edited.rs"))
+            .await?;
+        let impl_row = rows
+            .iter()
+            .find(|row| row.kind == "impl")
+            .ok_or_else(|| ClaudixError::Store("fixture lost its impl chunk".to_owned()))?;
+        assert!(
+            impl_row.content.contains("fn alpha") && impl_row.content.contains("fn beta"),
+            "the impl chunk must span both methods for this test to mean anything"
+        );
+        fs::remove_file(&marker_path).await?;
+
+        // Change only beta's body. The method chunk and the enclosing impl
+        // chunk both change; alpha's own chunk does not.
+        fs::write(&edited, with_body("22")).await?;
+        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+
+        assert_eq!(
+            marker_neighbor_paths(&marker_path),
+            vec!["src/near_beta.rs"],
+            "the enclosing impl chunk must not seed the query alongside the edited method"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn strictly_contains_keeps_both_chunks_on_an_identical_range() {
+        let outer = ByteRange { start: 0, end: 100 };
+        let inner = ByteRange { start: 10, end: 50 };
+        assert!(strictly_contains(&outer, &inner));
+        assert!(!strictly_contains(&inner, &outer));
+
+        // Equal ranges must not eliminate each other: mutual containment would
+        // drop both and leave the edit with no query vectors at all.
+        let same = ByteRange { start: 0, end: 100 };
+        assert!(!strictly_contains(&outer, &same));
+        assert!(!strictly_contains(&same, &outer));
+
+        // Sharing one edge is still strict containment on the other.
+        let flush_start = ByteRange { start: 0, end: 40 };
+        assert!(strictly_contains(&outer, &flush_start));
+        let flush_end = ByteRange {
+            start: 60,
+            end: 100,
+        };
+        assert!(strictly_contains(&outer, &flush_end));
+
+        // Overlap without containment eliminates nothing.
+        let overlapping = ByteRange {
+            start: 50,
+            end: 150,
+        };
+        assert!(!strictly_contains(&outer, &overlapping));
+        assert!(!strictly_contains(&overlapping, &outer));
+    }
+
+    #[tokio::test]
+    async fn reindex_file_new_file_queries_every_chunk() -> Result<()> {
+        let (fixture, claudix) = changed_chunk_fixture().await?;
+        let fresh = fixture.root().join("src/fresh.rs");
+
+        fs::write(&fresh, format!("{ALPHA_FN}\n{BETA_FN}")).await?;
+        claudix.reindex_file(Path::new("src/fresh.rs")).await?;
+
+        assert_eq!(
+            marker_neighbor_paths(&claudix.store.change_neighbors_marker_path()),
+            vec!["src/near_alpha.rs", "src/near_beta.rs"],
+            "a file with no stored chunks has every chunk seed the query"
         );
         Ok(())
     }

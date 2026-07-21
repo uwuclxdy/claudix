@@ -25,7 +25,9 @@ use crate::types::{Dimension, EmbeddedChunk, RelativePath, reject_path_escape};
 use crate::util::now_rfc3339;
 use crate::{IndexFileStatus, IndexProgress};
 
-use arrow::{chunk_schema, read_all_rows, read_metadata_rows, record_batch_from_rows};
+use arrow::{
+    chunk_schema, read_all_rows, read_metadata_rows, read_rows_matching, record_batch_from_rows,
+};
 
 pub(crate) use chunk_row::stored_chunks_from_embedded;
 pub use chunk_row::{ChunkMetadata, StoredChunk};
@@ -246,6 +248,25 @@ impl Store {
         };
 
         let mut rows = read_all_rows(&table).await?;
+        sort_rows(&mut rows);
+        Ok(rows)
+    }
+
+    /// Read the stored chunks of a single file, pushing the `file_path` filter
+    /// into LanceDB so rows for other files never materialize as
+    /// [`StoredChunk`]. There is no scalar index on `file_path`, so this is a
+    /// filtered scan, not a seek — cheaper than [`Self::read_chunks`] because
+    /// the vector column is never deserialized for non-matching rows.
+    ///
+    /// File paths come from repo contents, so the predicate goes through the
+    /// same quote escape as the delete path.
+    pub async fn read_file_chunks(&self, relative_path: &RelativePath) -> Result<Vec<StoredChunk>> {
+        let Some(table) = self.open_chunks_table().await? else {
+            return Ok(Vec::new());
+        };
+
+        let predicate = format!("file_path = {}", sql_string_literal(relative_path.as_str()));
+        let mut rows = read_rows_matching(&table, &predicate).await?;
         sort_rows(&mut rows);
         Ok(rows)
     }
@@ -1429,6 +1450,44 @@ mod tests {
                 file_count: 1,
             }
         );
+        Ok(())
+    }
+
+    /// `read_file_chunks` builds the same kind of `file_path` predicate the
+    /// delete path does, so a quote in the path must select exactly that file's
+    /// rows — never a syntax error and never another file's rows.
+    #[tokio::test]
+    async fn read_file_chunks_handles_quote_in_path() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        let quoted_path = "src/it's.rs";
+        let seeded = vec![
+            sample_chunk(1, quoted_path, "alpha", "pub fn alpha() {}", &[1.0; 384]),
+            sample_chunk(2, quoted_path, "beta", "pub fn beta() {}", &[2.0; 384]),
+            sample_chunk(3, "src/other.rs", "omega", "pub fn omega() {}", &[3.0; 384]),
+        ];
+        store.replace_chunks(&seeded, &config).await?;
+
+        let rows = store
+            .read_file_chunks(&RelativePath::new(quoted_path))
+            .await?;
+        let names: Vec<&str> = rows.iter().filter_map(|row| row.name.as_deref()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+        assert!(
+            rows.iter().all(|row| row.file_path == quoted_path),
+            "the quoted predicate must not match other files"
+        );
+        assert!(
+            rows.iter().any(|row| row.content == "pub fn alpha() {}"),
+            "content must round-trip; the reindex path hashes it"
+        );
+
+        let none = store
+            .read_file_chunks(&RelativePath::new("src/absent.rs"))
+            .await?;
+        assert!(none.is_empty());
         Ok(())
     }
 
