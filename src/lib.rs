@@ -429,7 +429,23 @@ impl Claudix {
         };
 
         let exclude = relative_path.clone();
-        let top_k = self.config.hooks.related_top_k;
+        // Over-fetch the candidate pool. The per-session seen-filter runs later, at
+        // ack time in hooks::post_tool_use, and can only subtract — so a marker cut
+        // to top_k here goes silent for an edit whose every entry was already
+        // surfaced, even while unshown candidates ranked below the cut qualify.
+        // Depth gives that filter a tail to fall through to; it does not widen how
+        // many hints an edit shows, which stays capped at top_k where the filter runs.
+        //
+        // Measured on this repo (88 files, 1344 chunks) the pool tops out near 23
+        // neighbor files at the 0.80 floor, so 5x covers it outright. That ceiling is
+        // a small-repo figure — re-measure before assuming it holds on a much larger
+        // codebase, where this multiplier could truncate again.
+        const NEIGHBOR_CANDIDATE_DEPTH: usize = 5;
+        let top_k = self
+            .config
+            .hooks
+            .related_top_k
+            .saturating_mul(NEIGHBOR_CANDIDATE_DEPTH);
         let min_similarity = self.config.hooks.related_min_similarity;
         let Ok(hits) = task::spawn_blocking(move || {
             neighbors(&all_rows, &query_vectors, &exclude, top_k, min_similarity)
@@ -1802,12 +1818,14 @@ mod tests {
 
     /// Store + provider wired so each chunk of the edited file maps to exactly
     /// one seeded neighbor file. Which chunks seeded the neighbor query is then
-    /// readable straight off the marker's file list.
-    async fn changed_chunk_fixture() -> Result<(TestFixture, Claudix)> {
+    /// readable straight off the marker's file list. `top_k` is a parameter so a
+    /// caller can set a budget below the two seeded neighbors and observe the
+    /// candidate pool independently of it.
+    async fn changed_chunk_fixture(top_k: usize) -> Result<(TestFixture, Claudix)> {
         let fixture = TestFixture::new("small_rust")?;
         let mut config = stub_config();
         config.hooks.surface_related_on_edit = true;
-        config.hooks.related_top_k = 5;
+        config.hooks.related_top_k = top_k;
         config.hooks.related_min_similarity = 0.5;
 
         let claudix = test_claudix_with_embedder(
@@ -1854,12 +1872,38 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The marker is a candidate pool, not the hint list. The per-session
+    /// seen-filter runs later (at ack, in `hooks::post_tool_use`) and can only
+    /// subtract, so a pool cut to `related_top_k` here leaves an edit whose every
+    /// entry was already surfaced with nothing to fall through to.
+    #[tokio::test]
+    async fn reindex_file_over_fetches_neighbor_pool_beyond_top_k() -> Result<()> {
+        // A budget below the two seeded neighbors: without the over-fetch the
+        // marker holds one path, with it both.
+        let (fixture, claudix) = changed_chunk_fixture(1).await?;
+        let edited = fixture.root().join("src/edited.rs");
+
+        fs::write(&edited, format!("{ALPHA_FN}\n{BETA_FN}")).await?;
+        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+
+        // Count, not identity: on an exact score tie `neighbor_rank` still orders
+        // deterministically by path, but which entry survives a budget of 1 is not
+        // the property under test.
+        let pooled = marker_neighbor_paths(&claudix.store.change_neighbors_marker_path()).len();
+        assert_eq!(
+            pooled, 2,
+            "marker must pool both qualifying neighbors despite a top_k of 1, so the \
+             ack-time seen-filter has a tail to fall through to; got {pooled}"
+        );
+        Ok(())
+    }
+
     /// The neighbor query must be seeded by the chunks the edit introduced, not
     /// by every chunk in the file — otherwise the surfaced set is a property of
     /// the file and every save re-injects the same list.
     #[tokio::test]
     async fn reindex_file_queries_only_chunks_whose_content_changed() -> Result<()> {
-        let (fixture, claudix) = changed_chunk_fixture().await?;
+        let (fixture, claudix) = changed_chunk_fixture(5).await?;
         let edited = fixture.root().join("src/edited.rs");
         let marker_path = claudix.store.change_neighbors_marker_path();
 
@@ -1897,7 +1941,7 @@ mod tests {
     /// functions) introduces nothing to surface, so no marker is written.
     #[tokio::test]
     async fn reindex_file_writes_no_marker_when_no_chunk_content_changed() -> Result<()> {
-        let (fixture, claudix) = changed_chunk_fixture().await?;
+        let (fixture, claudix) = changed_chunk_fixture(5).await?;
         let edited = fixture.root().join("src/edited.rs");
         let marker_path = claudix.store.change_neighbors_marker_path();
 
@@ -1934,7 +1978,7 @@ mod tests {
     /// reaches the query, the narrowing is undone on almost every real edit.
     #[tokio::test]
     async fn reindex_file_drops_container_chunks_wrapping_a_changed_chunk() -> Result<()> {
-        let (fixture, claudix) = changed_chunk_fixture().await?;
+        let (fixture, claudix) = changed_chunk_fixture(5).await?;
         let edited = fixture.root().join("src/edited.rs");
         let marker_path = claudix.store.change_neighbors_marker_path();
 
@@ -2013,7 +2057,7 @@ mod tests {
 
     #[tokio::test]
     async fn reindex_file_new_file_queries_every_chunk() -> Result<()> {
-        let (fixture, claudix) = changed_chunk_fixture().await?;
+        let (fixture, claudix) = changed_chunk_fixture(5).await?;
         let fresh = fixture.root().join("src/fresh.rs");
 
         fs::write(&fresh, format!("{ALPHA_FN}\n{BETA_FN}")).await?;

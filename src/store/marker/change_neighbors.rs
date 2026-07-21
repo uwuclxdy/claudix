@@ -55,18 +55,13 @@ pub(crate) fn read_and_remove(marker_path: &Path) -> Option<ChangeNeighborsMarke
     Some(marker)
 }
 
-/// Per-session dedup key for a surfaced (edited file → neighbor) pair. Keyed on
-/// edited path + neighbor file + symbol so re-editing the same file won't repeat
-/// the same neighbor, while a different edited file still can.
-pub(crate) fn seen_key(
-    edited_path: &str,
-    neighbor_file: &str,
-    neighbor_name: Option<&str>,
-) -> String {
-    format!(
-        "{edited_path}\t{neighbor_file}\t{}",
-        neighbor_name.unwrap_or("")
-    )
+/// Per-session dedup key for a surfaced neighbor: once shown, it is never shown
+/// again this session. The edited path is deliberately not part of the key — a
+/// related-code hint is only worth its context while the symbol is still unknown
+/// to the agent, and a hub file that neighbors most of the tree would otherwise
+/// resurface once per distinct file edited.
+pub(crate) fn seen_key(neighbor_file: &str, neighbor_name: Option<&str>) -> String {
+    format!("{neighbor_file}\t{}", neighbor_name.unwrap_or(""))
 }
 
 /// Read the "already surfaced this session" ledger into a key set. Absent or
@@ -78,7 +73,7 @@ pub(crate) fn read_seen(seen_path: &Path) -> HashSet<String> {
 }
 
 /// Append newly-surfaced keys to the ledger (one per line). Best-effort: a write
-/// failure just means a pair may surface again (fail-open).
+/// failure just means a neighbor may surface again (fail-open).
 pub(crate) fn append_seen(seen_path: &Path, keys: &[String]) {
     if keys.is_empty() {
         return;
@@ -92,5 +87,48 @@ pub(crate) fn append_seen(seen_path: &Path, keys: &[String]) {
         for key in keys {
             let _ = writeln!(file, "{key}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn seen_key_separates_distinct_symbols_in_one_file() {
+        assert_ne!(
+            seen_key("src/math.rs", Some("add")),
+            seen_key("src/math.rs", Some("multiply"))
+        );
+    }
+
+    #[test]
+    fn seen_key_is_stable_for_the_same_neighbor() {
+        assert_eq!(
+            seen_key("src/math.rs", Some("add")),
+            seen_key("src/math.rs", Some("add"))
+        );
+        assert_eq!(seen_key("src/math.rs", Some("add")), "src/math.rs\tadd");
+    }
+
+    #[test]
+    fn stale_three_field_ledger_lines_never_match_a_key() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let seen_path = dir.path().join("change-neighbors-seen");
+        // What the previous build wrote: {edited}\t{neighbor}\t{name}.
+        let _ = fs::write(&seen_path, "src/lib.rs\tsrc/math.rs\tadd\n");
+
+        let seen = read_seen(&seen_path);
+        assert!(
+            !seen.contains(&seen_key("src/math.rs", Some("add"))),
+            "a stale line must simply miss, never be treated as a match"
+        );
+    }
+
+    #[test]
+    fn absent_ledger_reads_as_empty() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        assert!(read_seen(&dir.path().join("nope")).is_empty());
     }
 }

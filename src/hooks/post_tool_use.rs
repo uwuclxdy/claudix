@@ -285,9 +285,9 @@ pub(super) fn take_change_neighbors_context(
     let marker_path = store.change_neighbors_marker_path();
     let marker = change_neighbors::read_and_remove(&marker_path)?;
 
-    // Per-session dedup: suppress an (edited file → neighbor) pair already
-    // surfaced this session so re-editing the same file doesn't repeat the same
-    // related code. The ledger is reset on SessionStart. Fail-open: an unreadable
+    // Per-session dedup: a neighbor already surfaced this session is suppressed
+    // whatever file the edit touched, so a hub file can't be re-injected once per
+    // edited path. The ledger is reset on SessionStart. Fail-open: an unreadable
     // ledger reads as empty, so nothing is wrongly suppressed.
     let seen_path = store.change_neighbors_seen_path();
     let seen = change_neighbors::read_seen(&seen_path);
@@ -299,14 +299,20 @@ pub(super) fn take_change_neighbors_context(
         .filter(|n| n.file_path != marker.edited_path)
         .filter(|n| neighbor_file_exists(project_root, &n.file_path))
         .filter(|n| {
-            let key =
-                change_neighbors::seen_key(&marker.edited_path, &n.file_path, n.name.as_deref());
+            let key = change_neighbors::seen_key(&n.file_path, n.name.as_deref());
             if seen.contains(&key) {
                 return false;
             }
             fresh_keys.push(key);
             true
         })
+        // Lazily, so the filter above never runs for the tail this drops: it pushes
+        // into `fresh_keys`, and a key recorded for a neighbor that was truncated
+        // away would suppress a hint nobody ever saw. The marker is over-fetched
+        // (see `write_change_neighbors_marker`), so this is where a hint budget of
+        // top_k is actually applied — against unseen candidates rather than against
+        // a pool the seen-filter has already eaten into.
+        .take(cfg.hooks.related_top_k)
         .map(|n| {
             prompts::hooks::edit_neighbor_line(
                 &n.file_path,
@@ -322,7 +328,7 @@ pub(super) fn take_change_neighbors_context(
         return None;
     }
 
-    // Record only the pairs actually surfaced.
+    // Record only the neighbors actually surfaced.
     change_neighbors::append_seen(&seen_path, &fresh_keys);
 
     let context = prompts::hooks::edit_related_context(&marker.edited_path, &hits);
@@ -1036,13 +1042,13 @@ mod tests {
         let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
         assert!(
             response.is_none(),
-            "identical (edited → neighbor) pair already surfaced this session must be suppressed"
+            "a neighbor already surfaced this session must be suppressed on re-edit"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn same_neighbor_via_different_edited_file_still_surfaces() -> Result<()> {
+    async fn same_neighbor_via_different_edited_file_is_suppressed() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;
         let config = stub_config();
         write_config(fixture.root(), &config);
@@ -1055,23 +1061,194 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let _ = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let first = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
+            .unwrap_or(serde_json::Value::Null);
+        assert!(
+            first["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("src/math.rs"),
+            "first take must surface the neighbor, got: {first}"
+        );
 
-        // Same neighbor, different edited file → different dedup key → surfaces.
+        // Same neighbor, different edited file: the agent has already been shown
+        // this symbol, so the hint has no value left to pay for its context.
         write_neighbors_marker(
             &store,
             "src/other.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
         let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
-        let response = response.unwrap_or(serde_json::Value::Null);
+        assert!(
+            response.is_none(),
+            "a neighbor surfaced once must not resurface via a different edited file, got: {response:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinct_symbols_in_one_neighbor_file_stay_separate_keys() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+        let _ = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+
+        // Same neighbor file, different symbol → still unknown to the agent.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "multiply", 0.82)],
+        );
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
+            .unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
         assert!(
-            context.contains("src/math.rs"),
-            "same neighbor via a different edited file must still surface, got: {context}"
+            context.contains("multiply"),
+            "a different symbol in an already-surfaced file must still surface, got: {context}"
         );
+        Ok(())
+    }
+
+    /// Create `count` real neighbor files (so `neighbor_file_exists` passes) plus
+    /// the marker entries pointing at them, descending by score so marker order is
+    /// rank order.
+    fn seed_neighbor_files(
+        root: &Path,
+        count: usize,
+    ) -> Vec<crate::store::marker::change_neighbors::NeighborEntry> {
+        (0..count)
+            .map(|i| {
+                let file = format!("nbr{i:02}.rs");
+                assert!(fs::write(root.join(&file), "fn placeholder() {}").is_ok());
+                let score = 0.99 - (i as f32) * 0.01;
+                make_neighbor_entry(&file, &format!("sym{i:02}"), score)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn surfaced_hints_are_capped_at_top_k_and_ledger_records_only_those() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // An over-fetched marker: far more candidates than the hint budget.
+        let top_k = config.hooks.related_top_k;
+        let entries = seed_neighbor_files(fixture.root(), top_k * 3);
+        write_neighbors_marker(&store, "src/lib.rs", entries);
+
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
+            .unwrap_or(serde_json::Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(
+            context.matches("nbr").count(),
+            top_k,
+            "over-fetching must not widen how many hints an edit shows, got: {context}"
+        );
+
+        // A key recorded for a neighbor that was truncated away would suppress a
+        // hint nobody ever saw — the failure mode of truncating after collecting.
+        let ledger = fs::read_to_string(store.change_neighbors_seen_path()).unwrap_or_default();
+        let recorded = ledger.lines().filter(|line| !line.is_empty()).count();
+        assert_eq!(
+            recorded, top_k,
+            "ledger must record exactly the surfaced hints, got: {ledger}"
+        );
+        assert!(
+            !ledger.contains(&format!("nbr{top_k:02}")),
+            "a truncated-away neighbor must never reach the ledger, got: {ledger}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn over_fetched_tail_surfaces_when_leading_candidates_are_seen() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        let top_k = config.hooks.related_top_k;
+        let entries = seed_neighbor_files(fixture.root(), top_k * 3);
+
+        // The whole leading rank is already spent by earlier edits this session.
+        let spent: Vec<String> = entries
+            .iter()
+            .take(top_k)
+            .map(|e| {
+                crate::store::marker::change_neighbors::seen_key(&e.file_path, e.name.as_deref())
+            })
+            .collect();
+        crate::store::marker::change_neighbors::append_seen(
+            &store.change_neighbors_seen_path(),
+            &spent,
+        );
+
+        write_neighbors_marker(&store, "src/lib.rs", entries);
+        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
+            .unwrap_or(serde_json::Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(
+            context.contains(&format!("nbr{top_k:02}")),
+            "an edit whose leading candidates are all seen must fall through to the \
+             unseen tail instead of going silent, got: {context}"
+        );
+        assert_eq!(
+            context.matches("nbr").count(),
+            top_k,
+            "the tail must still be capped at the hint budget, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unreadable_seen_ledger_suppresses_nothing() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // A directory where the ledger file belongs: every read AND every append
+        // fails, exercising both fail-open branches at once.
+        let seen_path = store.change_neighbors_seen_path();
+        fs::create_dir_all(&seen_path)?;
+
+        for take in 1..=2 {
+            write_neighbors_marker(
+                &store,
+                "src/lib.rs",
+                vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+            );
+            let response =
+                take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
+                    .unwrap_or(serde_json::Value::Null);
+            let context = response["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(
+                context.contains("src/math.rs"),
+                "take {take}: an unreadable ledger must suppress nothing, got: {context}"
+            );
+        }
         Ok(())
     }
 
@@ -1085,7 +1262,7 @@ mod tests {
 
         // Seed a dummy key into the per-session dedup ledger.
         let seen_path = store.change_neighbors_seen_path();
-        fs::write(&seen_path, "src/lib.rs\tsrc/math.rs\tadd\n")?;
+        fs::write(&seen_path, "src/math.rs\tadd\n")?;
         assert!(seen_path.exists(), "ledger must exist before SessionStart");
 
         run(fixture.root(), HookEvent::SessionStart, "{}").await?;
