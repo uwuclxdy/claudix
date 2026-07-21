@@ -440,7 +440,6 @@ impl Claudix {
         // neighbor files at the 0.80 floor, so 5x covers it outright. That ceiling is
         // a small-repo figure — re-measure before assuming it holds on a much larger
         // codebase, where this multiplier could truncate again.
-        const NEIGHBOR_CANDIDATE_DEPTH: usize = 5;
         let top_k = self
             .config
             .hooks
@@ -631,6 +630,12 @@ impl Claudix {
     }
 }
 
+/// How far past the hint budget the neighbor candidate pool is fetched. The
+/// per-session seen-filter runs at ack time and can only subtract, so the
+/// marker needs a ranked tail to fall through to. Re-derive it with the
+/// hint-distribution harness rather than editing it against intuition.
+pub(crate) const NEIGHBOR_CANDIDATE_DEPTH: usize = 5;
+
 /// True when `outer` covers `inner` and is strictly larger.
 ///
 /// Strictness carries the whole edge case: two chunks over the identical range
@@ -677,6 +682,12 @@ pub(crate) async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>>
         }
     }
 }
+
+/// Measurement harness, not a correctness test — kept out of `src/` but linked
+/// in so it can reach crate internals. Every case in it is `#[ignore]`d.
+#[cfg(test)]
+#[path = "../tests/measure/hint_distribution.rs"]
+mod hint_distribution;
 
 #[cfg(test)]
 mod tests {
