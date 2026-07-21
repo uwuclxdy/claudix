@@ -198,7 +198,7 @@ Heuristics for passthrough: regex anchors/character classes, explicit file globs
 
 ### Related-Code Surfacing
 
-After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` and `related_min_similarity` control volume; a (file, neighbor) pair already surfaced this session is not repeated.
+After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` and `related_min_similarity` control volume; a neighbor already surfaced this session is not repeated, whichever file you were editing at the time.
 
 ### MCP Tool: `search_code`
 
