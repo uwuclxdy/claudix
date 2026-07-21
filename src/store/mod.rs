@@ -723,6 +723,18 @@ impl Store {
     }
 
     async fn open_chunks_table(&self) -> Result<Option<Table>> {
+        // `lancedb::connect` creates the directory it is pointed at, laying down
+        // a `__manifest` table with its own transaction log. Every caller of this
+        // is a reader, so connecting to an absent index would write into a repo
+        // that was only ever meant to be read — the cross-repo readers reach
+        // foreign roots. A missing index directory cannot hold a chunks table,
+        // so answering `None` from the path check alone is the same answer
+        // without the write. Writers call `ensure_layout` and go through
+        // `open_connection` directly, so they are unaffected.
+        if !self.paths.index_dir.exists() {
+            return Ok(None);
+        }
+
         let connection = self.open_connection().await?;
         if !self.chunks_table_exists(&connection).await? {
             return Ok(None);
@@ -1488,6 +1500,33 @@ mod tests {
             .read_file_chunks(&RelativePath::new("src/absent.rs"))
             .await?;
         assert!(none.is_empty());
+        Ok(())
+    }
+
+    /// The cross-repo readers open stores under foreign roots, so a read that
+    /// creates its own index directory is a write outside the project boundary.
+    /// `lancedb::connect` does exactly that, which is why the reader checks the
+    /// path before connecting.
+    #[tokio::test]
+    async fn reading_an_unindexed_repo_writes_nothing_into_it() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+        let state_dir = project_root.path().join(".claudix");
+
+        assert!(store.read_chunks().await?.is_empty());
+        assert!(
+            store
+                .read_file_chunks(&RelativePath::new("src/a.rs"))
+                .await?
+                .is_empty()
+        );
+
+        assert!(
+            !state_dir.exists(),
+            "reading an unindexed repo must leave no trace in it, found {}",
+            state_dir.display()
+        );
         Ok(())
     }
 
