@@ -86,6 +86,31 @@ impl MultiLanguageChunker {
     }
 }
 
+/// The grammar backing a language's first-class chunker, for callers that need
+/// to re-parse chunk text rather than produce chunks from it. Kept here so the
+/// language-to-grammar mapping has one home; a copy in the measurement harness
+/// would silently go stale the next time a language is added.
+///
+/// Test-only: production code reaches grammars through the per-language
+/// `chunk` entry points, which carry the kind and name resolvers too.
+#[cfg(test)]
+pub(crate) fn grammar_for(language: Language) -> Option<tree_sitter::Language> {
+    Some(match language {
+        Language::Rust => tree_sitter_rust::LANGUAGE.into(),
+        Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::TypeScript | Language::JavaScript => {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Language::Sql => tree_sitter_sequel::LANGUAGE.into(),
+        Language::Java => tree_sitter_java::LANGUAGE.into(),
+        Language::C => tree_sitter_c::LANGUAGE.into(),
+        Language::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Language::Unknown => return None,
+    })
+}
+
 /// Resolves a chunk node's symbol name from the source. Most grammars expose a
 /// `name` field (see `default_name`); SQL doesn't, so it supplies its own.
 type NameFn = fn(Node<'_>, &str) -> Option<String>;

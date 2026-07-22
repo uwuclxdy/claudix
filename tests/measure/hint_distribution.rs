@@ -361,6 +361,75 @@ fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
+/// Identifiers a chunk actually references in code, with comment and string
+/// content excluded.
+///
+/// Plain text matching counts a symbol named in a doc comment, a log message,
+/// or an unrelated prose mention as a reference, and those are exactly the
+/// matches a related-code hint should not be rewarded for. Re-parsing with the
+/// language's own grammar and keeping only identifier tokens removes them.
+///
+/// Returns `None` when the chunk cannot be parsed as code at all, which is the
+/// signal to fall back rather than to treat the chunk as referencing nothing.
+/// Chunk text is a fragment of a file, so the parse is expected to contain
+/// error nodes; tree-sitter still tokenizes around them, which is all this
+/// needs.
+fn code_identifiers(content: &str, language: Language) -> Option<BTreeSet<String>> {
+    let grammar = crate::chunking::grammar_for(language)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(content, None)?;
+
+    let mut found = BTreeSet::new();
+    let mut cursor = tree.walk();
+    let mut pending = vec![tree.root_node()];
+
+    while let Some(node) = pending.pop() {
+        let kind = node.kind();
+        // Whole subtree is prose or literal text, so nothing inside it is a
+        // reference to anything.
+        if kind.contains("comment") || kind.contains("string") || kind.contains("char_literal") {
+            continue;
+        }
+
+        if kind.contains("identifier")
+            && node.child_count() == 0
+            && let Ok(text) = node.utf8_text(content.as_bytes())
+        {
+            found.insert(text.to_owned());
+        }
+
+        pending.extend(node.children(&mut cursor));
+    }
+
+    Some(found)
+}
+
+/// Every chunk's referenced identifiers, parsed once. Doing this inside the
+/// query loop would re-parse the whole corpus for every symbol evaluated.
+/// Chunks whose language has no grammar are absent and fall back to text.
+fn index_references(rows: &[StoredChunk]) -> BTreeMap<u64, BTreeSet<String>> {
+    rows.iter()
+        .filter_map(|row| {
+            let language = Language::from_storage(&row.language);
+            code_identifiers(&row.content, language).map(|ids| (row.chunk_id, ids))
+        })
+        .collect()
+}
+
+/// Whether a chunk references `symbol` in code, falling back to whole-word text
+/// matching for languages with no first-class grammar.
+fn references_symbol(
+    references: &BTreeMap<u64, BTreeSet<String>>,
+    chunk: &StoredChunk,
+    symbol: &str,
+) -> bool {
+    match references.get(&chunk.chunk_id) {
+        Some(identifiers) => identifiers.contains(symbol),
+        None => mentions_identifier(&chunk.content, symbol),
+    }
+}
+
 /// Whether `content` references `symbol` as a whole identifier rather than as a
 /// substring of a longer name.
 fn mentions_identifier(content: &str, symbol: &str) -> bool {
@@ -449,6 +518,7 @@ const GENERIC_SYMBOLS: &[&str] = &[
 fn report_symbol_precision(
     rows: &[StoredChunk],
     by_file: &BTreeMap<String, Vec<&StoredChunk>>,
+    references: &BTreeMap<u64, BTreeSet<String>>,
     top_k: usize,
 ) {
     let mut precision_sum = 0.0f64;
@@ -483,7 +553,7 @@ fn report_symbol_precision(
             other_files += 1;
             if chunks
                 .iter()
-                .any(|c| mentions_identifier(&c.content, symbol))
+                .any(|c| references_symbol(references, c, symbol))
             {
                 mentioning.insert(path.as_str());
             }
@@ -641,6 +711,7 @@ fn scan(rows: &[StoredChunk], edits: Vec<(String, Vec<Vec<f32>>)>, floor: f32) -
 #[cfg(test)]
 mod identifier_tests {
     use super::mentions_identifier;
+    use crate::types::Language;
 
     #[test]
     fn matches_only_whole_identifiers() {
@@ -662,6 +733,36 @@ mod identifier_tests {
     #[test]
     fn finds_a_real_match_after_a_rejected_substring() {
         assert!(mentions_identifier("my_render() then render()", "render"));
+    }
+
+    /// The reason for parsing instead of text-matching: a symbol named in
+    /// prose or in a log line is not a reference to it, and counting it as one
+    /// credits a model for retrieving a chunk that cannot need matching edits.
+    #[test]
+    fn code_references_exclude_comments_and_strings() {
+        let source = r#"
+            // calls parse_config to do the thing
+            fn caller() {
+                let msg = "parse_config failed";
+                real_call();
+            }
+        "#;
+
+        let found = super::code_identifiers(source, Language::Rust)
+            .unwrap_or_else(|| unreachable!("rust grammar is available"));
+
+        assert!(found.contains("real_call"), "code identifier must be found");
+        assert!(
+            !found.contains("parse_config"),
+            "comment and string mentions must not count as references"
+        );
+    }
+
+    /// A language with no first-class chunker has no grammar, and the caller
+    /// needs to tell that apart from a chunk that references nothing.
+    #[test]
+    fn unknown_language_yields_no_reference_set() {
+        assert!(super::code_identifiers("anything", Language::Unknown).is_none());
     }
 }
 
@@ -720,7 +821,13 @@ async fn hint_distribution_over_the_live_index() {
 
     println!("\n=== changed-chunk query, provider score scale ===");
     report_score_distribution(&rows, &by_file, top_k, floor);
-    report_symbol_precision(&rows, &by_file, top_k);
+    let references = index_references(&rows);
+    println!(
+        "reference labels: {} of {} chunks parsed with a grammar, rest fall back to text",
+        references.len(),
+        rows.len()
+    );
+    report_symbol_precision(&rows, &by_file, &references, top_k);
 
     let order = shuffled_order(by_file.len());
     for mode in [Mode::WholeFile, Mode::ChangedChunk] {
