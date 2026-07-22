@@ -246,7 +246,7 @@ Vector width follows the model: 768 for the bundled `gte-modernbert-base`, 384 f
 
 ### Choosing a Model
 
-The bundled `gte-modernbert-base` is a general-purpose English text model with a long context window. It is a solid zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases.
+The bundled `gte-modernbert-base` is a general-purpose English text model with a long context window. It is a solid zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases. For how the bundled models were measured against each other, why an absolute similarity floor is not portable across models, and why public code-retrieval benchmarks do not measure this use case, see [wiki/embedding-findings.md](wiki/embedding-findings.md).
 
 The `http` provider speaks the OpenAI `/v1/embeddings` format and sends no authorization header, so it connects to keyless servers: LM Studio, Ollama, a local vLLM instance, or a local proxy such as LiteLLM. Hosted APIs that require a key (Voyage, OpenAI, Gemini) are reachable only by fronting them with a local proxy that injects the key. Set `dimensions` to the model's output size, or to a smaller Matryoshka size it supports; changing the dimension requires a `claudix index --force` rebuild.
 
