@@ -45,6 +45,18 @@ fn session_edits() -> usize {
         .unwrap_or(10)
 }
 
+/// How many changed chunks a simulated multi-seed edit fans out over. A real
+/// k-hunk edit seeds the neighbor query with every changed chunk at once, so the
+/// pool it faces is the union of the per-chunk pools. `CLAUDIX_MEASURE_K`,
+/// default 3.
+fn multi_seed_k() -> usize {
+    std::env::var("CLAUDIX_MEASURE_K")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(3)
+}
+
 /// What seeds the neighbor query for one edit.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -236,8 +248,9 @@ fn replay(pools: &[EditPool], top_k: usize, dedup: bool, order: &[usize]) -> Run
 }
 
 /// Distinct qualifying neighbor files per edit, uncapped — the pool ceiling
-/// `NEIGHBOR_CANDIDATE_DEPTH` has to cover. Single-seed, so it is a floor on the
-/// true ceiling rather than the ceiling (`docs/todo.md` item 2).
+/// `NEIGHBOR_CANDIDATE_DEPTH` has to cover. A single-seed caller reports a floor
+/// on the true ceiling; the multi-seed caller reports the union pool a k-hunk
+/// edit actually faces.
 fn report_pool_ceiling(label: &str, pools: &[EditPool], top_k: usize) {
     let marker_cap = top_k.saturating_mul(NEIGHBOR_CANDIDATE_DEPTH);
     let mut sizes: Vec<usize> = pools.iter().map(|p| p.pool.len()).collect();
@@ -823,6 +836,47 @@ fn build_edits(
         .collect()
 }
 
+/// Build one edit per indexed file, seeded with up to `k` changed chunks spread
+/// across the file — the multi-seed model of a k-hunk edit. `neighbors` takes
+/// the max score across query vectors, so this pool is the union of the per-seed
+/// pools and is at least as wide as the single-seed pool `build_edits` produces.
+/// Fallback files stay whole-file, as production still queries them file-wide.
+fn build_multi_seed_edits(
+    by_file: &BTreeMap<String, Vec<&StoredChunk>>,
+    k: usize,
+) -> Vec<(String, Vec<Vec<f32>>)> {
+    by_file
+        .iter()
+        .map(|(path, chunks)| {
+            let seeds = if is_fallback_chunked(chunks) {
+                chunks.iter().map(|c| c.vector.clone()).collect()
+            } else {
+                spread_indices(chunks.len(), k)
+                    .into_iter()
+                    .map(|i| chunks[i].vector.clone())
+                    .collect()
+            };
+            (path.clone(), seeds)
+        })
+        .collect()
+}
+
+/// Up to `k` distinct indices spread across `0..len` (endpoints included), fewer
+/// when the file has fewer than `k` chunks. Deterministic so the run reproduces;
+/// `k == 1` returns the median chunk `build_edits` seeds with.
+fn spread_indices(len: usize, k: usize) -> Vec<usize> {
+    if len == 0 || k == 0 {
+        return Vec::new();
+    }
+    let k = k.min(len);
+    if k == 1 {
+        return vec![len / 2];
+    }
+    let mut idx: Vec<usize> = (0..k).map(|i| i * (len - 1) / (k - 1)).collect();
+    idx.dedup();
+    idx
+}
+
 /// Deterministic permutation of `0..len`, so sessions group files that are not
 /// directory siblings. A real session's edits are not path-contiguous, and
 /// path-contiguous ones hand the seen-filter its best case.
@@ -989,9 +1043,9 @@ async fn hint_distribution_over_the_live_index() {
     }
 
     // Every chunk as its own edit: the per-file median pick above is one draw
-    // from this, and the pool ceiling item 3 needs is the max over all of them.
-    // Fallback-chunked files are excluded — production never seeds them from a
-    // single chunk, so their entry here would be a shape that cannot occur.
+    // from this, and its max is the widest single-seed pool. Fallback-chunked
+    // files are excluded — production never seeds them from a single chunk, so
+    // their entry here would be a shape that cannot occur.
     let all_chunk_edits: Vec<(String, Vec<Vec<f32>>)> = rows
         .iter()
         .filter(|c| c.language != Language::Unknown.as_str())
@@ -1000,4 +1054,14 @@ async fn hint_distribution_over_the_live_index() {
     let pools = scan(&rows, all_chunk_edits, floor);
     println!("\n=== changed-chunk query, every first-class chunk as an edit ===");
     report_pool_ceiling("every chunk", &pools, top_k);
+
+    // Multi-seed: one edit per file seeded with up to k changed chunks at once,
+    // the model of a k-hunk edit. Its pool is the union of the per-seed pools,
+    // so it is the ceiling the single-seed sections above only lower-bound
+    // (`docs/todo.md` item 3). Read the over-cap and starvation counts here.
+    let k = multi_seed_k();
+    let multi_pools = scan(&rows, build_multi_seed_edits(&by_file, k), floor);
+    println!("\n=== multi-seed query, up to k={k} changed chunks per edit ===");
+    replay(&multi_pools, top_k, true, &order).report("with cross-file dedup (shipped)");
+    report_pool_ceiling("multi-seed, one edit per file", &multi_pools, top_k);
 }

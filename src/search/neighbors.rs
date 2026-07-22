@@ -329,4 +329,38 @@ mod tests {
             "neighbor hits must not depend on chunk content"
         );
     }
+
+    #[test]
+    fn neighbors_pool_grows_with_added_seeds() {
+        // The multi-seed harness models a k-hunk edit by seeding with several
+        // changed chunks at once. Because `neighbors` keeps the best score per
+        // file across query vectors, adding a seed can only raise a file's score,
+        // never drop it below the floor — so the multi-seed pool is a superset of
+        // the single-seed pool. Pins the invariant `docs/todo.md` item 3 verifies.
+        let rows = vec![
+            make_row("src/a.rs", "a", vec![1.0, 0.0, 0.0, 0.0]),
+            make_row("src/b.rs", "b", vec![0.0, 1.0, 0.0, 0.0]),
+            make_row("src/c.rs", "c", vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let exclude = RelativePath::new("src/edited.rs");
+        // top_k = rows.len() leaves the heap effectively unbounded, so each call
+        // returns the full above-floor pool rather than a capped view.
+        let single = vec![vec![1.0, 0.0, 0.0, 0.0]];
+        let multi = vec![vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]];
+
+        let files = |hits: Vec<Neighbor>| -> std::collections::HashSet<String> {
+            hits.into_iter().map(|n| n.file_path).collect()
+        };
+        let single_files = files(neighbors(&rows, &single, &exclude, rows.len(), 0.65));
+        let multi_files = files(neighbors(&rows, &multi, &exclude, rows.len(), 0.65));
+
+        assert!(
+            single_files.is_subset(&multi_files),
+            "multi-seed pool must contain the single-seed pool: {single_files:?} vs {multi_files:?}"
+        );
+        assert!(
+            multi_files.len() > single_files.len(),
+            "the added seed must admit at least one more file"
+        );
+    }
 }
