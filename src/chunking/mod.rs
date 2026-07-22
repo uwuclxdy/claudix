@@ -227,7 +227,9 @@ pub fn chunk_fallback(
     // collapsing to one chunk or shattering into thousands: below `min_lines`
     // no boundary is accepted, at `max_lines` one is forced. Expected segment
     // length is `min_lines + divisor`, so the divisor is sized to land the
-    // average on `chunk_size`.
+    // average on `chunk_size`. Ceiling: a `chunk_size` of a handful of lines
+    // drives `divisor` toward 1, degrading to near-per-line chunking; production
+    // always passes `DEFAULT_CHUNK_LINES` (60), well clear of that.
     let target = chunk_size.max(1);
     let min_lines = (target / 4).max(1);
     let max_lines = target.saturating_mul(2).max(min_lines + 1);
@@ -1217,7 +1219,11 @@ mod tests {
 
         // Chunks whose exact content vanished after the insert. Content-defined
         // boundaries hold this to the touched chunk (and at most its overlap
-        // neighbor); the line-index splitter drops nearly all of them.
+        // neighbor) in the common case; the line-index splitter drops nearly all
+        // of them. This fixture exercises that common case — a top insert has a
+        // ~1/divisor chance of shifting the first segment's boundary and dropping
+        // more (the residual documented in `subsystems/chunking.md`), so the
+        // bound is typical behavior, not a universal proof.
         let dropped = before.difference(&after).count();
         assert!(
             dropped <= 2,
