@@ -836,10 +836,11 @@ fn build_edits(
         .collect()
 }
 
-/// Build one edit per indexed file, seeded with up to `k` changed chunks spread
-/// across the file — the multi-seed model of a k-hunk edit. `neighbors` takes
-/// the max score across query vectors, so this pool is the union of the per-seed
-/// pools and is at least as wide as the single-seed pool `build_edits` produces.
+/// Build one edit per indexed file, seeded with `k` changed chunks spread across
+/// the file plus the median (`spread_indices`) — the multi-seed model of a k-hunk
+/// edit. `neighbors` takes the max score across query vectors, so this pool is
+/// the union of the per-seed pools; because the seeds include the single-seed
+/// median, it is a superset of the single-seed pool `build_edits` produces.
 /// Fallback files stay whole-file, as production still queries them file-wide.
 fn build_multi_seed_edits(
     by_file: &BTreeMap<String, Vec<&StoredChunk>>,
@@ -861,20 +862,24 @@ fn build_multi_seed_edits(
         .collect()
 }
 
-/// Up to `k` distinct indices spread across `0..len` (endpoints included), fewer
-/// when the file has fewer than `k` chunks. Deterministic so the run reproduces;
-/// `k == 1` returns the median chunk `build_edits` seeds with.
+/// Indices spread across `0..len`, always including the median `len / 2` — the
+/// chunk `build_edits` seeds a single-seed edit with — so the multi-seed seed
+/// set is a superset of the single-seed's and its uncapped pool is a superset of
+/// the single-seed pool (`neighbors` scores best-per-file across query vectors).
+/// `k` evenly-spread positions plus the median, so `k` or `k + 1` seeds; fewer
+/// when the file has fewer chunks. Deterministic so the run reproduces.
 fn spread_indices(len: usize, k: usize) -> Vec<usize> {
     if len == 0 || k == 0 {
         return Vec::new();
     }
     let k = k.min(len);
-    if k == 1 {
-        return vec![len / 2];
-    }
-    let mut idx: Vec<usize> = (0..k).map(|i| i * (len - 1) / (k - 1)).collect();
-    idx.dedup();
-    idx
+    let mut idx: BTreeSet<usize> = if k == 1 {
+        std::iter::once(len / 2).collect()
+    } else {
+        (0..k).map(|i| i * (len - 1) / (k - 1)).collect()
+    };
+    idx.insert(len / 2);
+    idx.into_iter().collect()
 }
 
 /// Deterministic permutation of `0..len`, so sessions group files that are not

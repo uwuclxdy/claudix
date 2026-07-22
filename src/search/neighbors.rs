@@ -332,11 +332,14 @@ mod tests {
 
     #[test]
     fn neighbors_pool_grows_with_added_seeds() {
-        // The multi-seed harness models a k-hunk edit by seeding with several
-        // changed chunks at once. Because `neighbors` keeps the best score per
-        // file across query vectors, adding a seed can only raise a file's score,
-        // never drop it below the floor — so the multi-seed pool is a superset of
-        // the single-seed pool. Pins the invariant `docs/todo.md` item 3 verifies.
+        // The uncapped pool grows monotonically as seeds are added: `neighbors`
+        // keeps the best score per file across query vectors, so an extra seed
+        // can only raise a file's score, never drop it below the floor. That is
+        // why the multi-seed harness pool supersets the single-seed pool — the
+        // harness seeds a superset of the single-seed's chunks (`spread_indices`
+        // always includes the median) and measures at an uncapped `top_k`. It
+        // says nothing about production's *capped* hint set, where a rising
+        // competitor can still evict a file whose own score is unchanged.
         let rows = vec![
             make_row("src/a.rs", "a", vec![1.0, 0.0, 0.0, 0.0]),
             make_row("src/b.rs", "b", vec![0.0, 1.0, 0.0, 0.0]),
