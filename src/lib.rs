@@ -561,10 +561,13 @@ impl Claudix {
         // Depth gives that filter a tail to fall through to; it does not widen how
         // many hints an edit shows, which stays capped at top_k where the filter runs.
         //
-        // Measured on this repo (88 files, 1344 chunks) the pool tops out near 23
-        // neighbor files at the 0.80 floor, so 5x covers it outright. That ceiling is
-        // a small-repo figure — re-measure before assuming it holds on a much larger
-        // codebase, where this multiplier could truncate again.
+        // Depth 13 (65 candidates at the default top_k) holds the widest pool
+        // measured, 63 neighbor files on the densest corpus, so nothing is truncated
+        // there at all. It is the smallest depth whose starvation count reads zero
+        // in every regime the harness replays. Raising the depth is not
+        // monotone: a deeper marker feeds the ack-time seen-filter faster, so
+        // intermediate depths starve edits that both a shallower and a deeper one
+        // clear. Numbers and method: `docs/subsystems/hooks.md`.
         let top_k = self
             .config
             .hooks
@@ -854,8 +857,11 @@ impl Claudix {
 /// How far past the hint budget the neighbor candidate pool is fetched. The
 /// per-session seen-filter runs at ack time and can only subtract, so the
 /// marker needs a ranked tail to fall through to. Re-derive it with the
-/// hint-distribution harness rather than editing it against intuition.
-pub(crate) const NEIGHBOR_CANDIDATE_DEPTH: usize = 5;
+/// hint-distribution harness rather than editing it against intuition: its
+/// `report_depth_sweep` prints the starvation count per candidate depth, and the
+/// value to ship is the smallest one reading zero across every repo and session
+/// length it is pointed at.
+pub(crate) const NEIGHBOR_CANDIDATE_DEPTH: usize = 13;
 
 /// Ceiling on the vector bytes the corpus-floor readback may materialize.
 ///
