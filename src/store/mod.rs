@@ -26,8 +26,8 @@ use crate::util::now_rfc3339;
 use crate::{IndexFileStatus, IndexProgress};
 
 use arrow::{
-    chunk_schema, read_all_rows, read_metadata_rows, read_rows_matching, read_rows_without_content,
-    record_batch_from_rows,
+    chunk_schema, read_all_rows, read_metadata_rows, read_path_rows, read_rows_matching,
+    read_rows_without_content, record_batch_from_rows,
 };
 
 pub(crate) use chunk_row::stored_chunks_from_embedded;
@@ -333,6 +333,17 @@ impl Store {
         read_metadata_rows(&table).await
     }
 
+    /// Projected read returning only each row's `file_path` — the lightest read
+    /// the table supports, for callers that need just a row count and a distinct
+    /// file count. Reach for [`Self::read_chunk_metadata`] when `file_hash`,
+    /// `language`, or `name` is also needed.
+    pub(crate) async fn read_chunk_paths(&self) -> Result<Vec<String>> {
+        let Some(table) = self.open_chunks_table().await? else {
+            return Ok(Vec::new());
+        };
+        read_path_rows(&table).await
+    }
+
     pub async fn stored_file_hash_and_stats(
         &self,
         relative_path: &RelativePath,
@@ -511,8 +522,11 @@ impl Store {
         config: &Config,
         current_files: &[(String, [u8; 16])],
     ) -> Result<StoreStats> {
-        let metadata = self.read_chunk_metadata().await?;
-        let stats = stats_from_metadata(&metadata);
+        // Only a row count and a distinct-file count are needed here — the
+        // manifest's `file_hashes` come from `current_files`, not the store — so
+        // read the path column alone rather than four metadata columns.
+        let paths = self.read_chunk_paths().await?;
+        let stats = stats_from_paths(&paths);
         let file_hashes = current_files.iter().cloned().collect();
         self.sync_manifest_with_timestamp(config, &stats, file_hashes, true)?;
         Ok(stats)
@@ -948,6 +962,14 @@ fn stats_from_metadata(metadata: &[ChunkMetadata]) -> StoreStats {
     let distinct: HashSet<&str> = metadata.iter().map(|m| m.file_path.as_str()).collect();
     StoreStats {
         chunk_count: metadata.len(),
+        file_count: distinct.len(),
+    }
+}
+
+fn stats_from_paths(paths: &[String]) -> StoreStats {
+    let distinct: HashSet<&str> = paths.iter().map(String::as_str).collect();
+    StoreStats {
+        chunk_count: paths.len(),
         file_count: distinct.len(),
     }
 }
@@ -2432,6 +2454,74 @@ mod tests {
 
         // Vectors must NOT be present in metadata rows (they don't exist on the type).
         // This is enforced by ChunkMetadata not having a vector field — compile-time guarantee.
+    }
+
+    #[tokio::test]
+    async fn read_chunk_paths_yields_one_path_per_row_and_matching_stats() {
+        // Pins the path-only projection the full-index manifest sync uses: it
+        // returns exactly one `file_path` per stored row (so row count and
+        // distinct-file count are recoverable), and the stats derived from it
+        // equal those from the full and the metadata reads. An equal-stats
+        // check alone would pass whether or not the projection was in effect,
+        // so the per-row-length assertion pins the projection itself.
+        let project_root = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+
+        // Two files, three chunks: distinct-file count must not equal row count.
+        let chunks = vec![
+            sample_chunk(
+                1,
+                "src/lib.rs",
+                "alpha",
+                "pub fn alpha() {}",
+                &sample_vector(1.0),
+            ),
+            sample_chunk(
+                2,
+                "src/util.rs",
+                "beta",
+                "pub fn beta() {}",
+                &sample_vector(2.0),
+            ),
+            sample_chunk(
+                3,
+                "src/util.rs",
+                "gamma",
+                "pub fn gamma() {}",
+                &sample_vector(3.0),
+            ),
+        ];
+        assert!(store.replace_chunks(&chunks, &config).await.is_ok());
+
+        let paths = store
+            .read_chunk_paths()
+            .await
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        let full_rows = store
+            .read_chunks()
+            .await
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        let metadata = store
+            .read_chunk_metadata()
+            .await
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+
+        assert_eq!(
+            paths.len(),
+            full_rows.len(),
+            "one projected path per stored row"
+        );
+        let distinct: HashSet<&str> = paths.iter().map(String::as_str).collect();
+        assert_eq!(distinct.len(), 2, "two distinct files across three rows");
+
+        assert_eq!(stats_from_paths(&paths), stats_from_rows(&full_rows));
+        assert_eq!(stats_from_paths(&paths), stats_from_metadata(&metadata));
     }
 
     mod config_support {

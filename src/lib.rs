@@ -501,9 +501,9 @@ impl Claudix {
 
     /// Compute semantic neighbors of the chunks this edit introduced (those
     /// whose content is absent from `previous_contents`) and write the marker.
-    /// Runs inside the detached reindex-file child — ONNX is already
-    /// warm, `read_chunks` is a fast LanceDB scan. Fail-open: any error is
-    /// silently discarded so the hook session continues normally.
+    /// Runs inside the detached reindex-file child — ONNX is already warm, and
+    /// the scan scores vectors only, so it reads rows without chunk text.
+    /// Fail-open: any error is silently discarded so the hook session continues.
     ///
     /// The narrowing rides on chunk content being stable across an unrelated
     /// edit. That holds for the tree-sitter chunkers and, since `chunk_fallback`
@@ -546,7 +546,10 @@ impl Claudix {
             return;
         }
 
-        let Ok(all_rows) = self.store.read_chunks().await else {
+        // Content-free read: the neighbor scan scores vectors and reads a few
+        // scalars, never chunk text — the column that scales with the source
+        // tree rather than the embedding width.
+        let Ok(all_rows) = self.store.read_chunks_without_content().await else {
             return;
         };
 

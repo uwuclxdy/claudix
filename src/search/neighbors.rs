@@ -303,4 +303,30 @@ mod tests {
         );
         assert!((hits[0].score - 1.0).abs() < 1e-6);
     }
+
+    #[test]
+    fn neighbors_output_is_invariant_to_chunk_content() {
+        // The change-neighbor and read-surfacing hooks feed `neighbors` rows read
+        // without chunk text (`read_chunks_without_content`). This pins the
+        // contract that makes that safe: the scan scores vectors and reads only
+        // file_path / line / name, never `content`. If a future change makes it
+        // depend on content, this test reds instead of those consumers silently
+        // degrading against content-blanked rows.
+        let with_content = vec![
+            make_row("src/a.rs", "foo", vec![0.9, 0.1, 0.0, 0.0]),
+            make_row("src/b.rs", "bar", vec![0.8, 0.2, 0.0, 0.0]),
+        ];
+        let mut blanked = with_content.clone();
+        for row in &mut blanked {
+            row.content = String::new();
+        }
+        let query = vec![vec![1.0, 0.0, 0.0, 0.0]];
+        let exclude = RelativePath::new("src/edited.rs");
+
+        assert_eq!(
+            neighbors(&with_content, &query, &exclude, 5, 0.0),
+            neighbors(&blanked, &query, &exclude, 5, 0.0),
+            "neighbor hits must not depend on chunk content"
+        );
+    }
 }

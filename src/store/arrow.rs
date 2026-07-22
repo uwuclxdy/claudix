@@ -189,6 +189,31 @@ fn batches_to_metadata_rows(batches: Vec<RecordBatch>) -> Result<Vec<ChunkMetada
     Ok(rows)
 }
 
+/// Projected read that fetches only the `file_path` column — the lightest read
+/// the table supports. For callers that need just a row count and a distinct
+/// file count (the full-index manifest sync); [`read_metadata_rows`] would also
+/// pull `file_hash`/`language`/`name` for nothing.
+pub(super) async fn read_path_rows(table: &Table) -> Result<Vec<String>> {
+    let columns = vec![FIELD_FILE_PATH.to_owned()];
+
+    let batches = table
+        .query()
+        .select(lancedb::query::Select::Columns(columns))
+        .limit(i64::MAX as usize)
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut paths = Vec::new();
+    for batch in batches {
+        for row_index in 0..batch.num_rows() {
+            paths.push(read_string(&batch, FIELD_FILE_PATH, row_index)?);
+        }
+    }
+    Ok(paths)
+}
+
 /// Projected read that fetches every column except `content`.
 ///
 /// The corpus-floor pass scores vectors and never touches the chunk text, which

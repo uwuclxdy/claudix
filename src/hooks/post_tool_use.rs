@@ -163,14 +163,15 @@ async fn read_surfacing_context(
     let end = input
         .limit
         .map(|count| start.saturating_add(count.saturating_sub(1)));
-    // Read-time surfacing rides the hot `Read` path. `read_chunks` deserializes
-    // every vector and the cosine scan is O(n²); on a large repo (or while a full
-    // reindex holds the write lock) either can block for seconds and stall the
-    // session. Bound the whole load+scan in a timeout and skip outright when the
-    // corpus is too large to scan cheaply. Fail-open: any elapse/error → noop.
+    // Read-time surfacing rides the hot `Read` path. The scan needs vectors,
+    // not chunk text, so it reads rows without the text column; the cosine scan
+    // is still O(n²) and, on a large repo (or while a full reindex holds the
+    // write lock), either the load or the scan can block for seconds and stall
+    // the session. Bound the whole load+scan in a timeout and skip outright when
+    // the corpus is too large to scan cheaply. Fail-open: any elapse/error → noop.
     let all_rows = match tokio::time::timeout(
         Duration::from_millis(READ_SURFACING_TIMEOUT_MS),
-        store.read_chunks(),
+        store.read_chunks_without_content(),
     )
     .await
     {
