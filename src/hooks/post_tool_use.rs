@@ -790,6 +790,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_git_dir_edit_creates_no_state() -> Result<()> {
+        // A non-git working directory is not indexable, so an edit's PostToolUse
+        // hook must passthrough without laying down `.claudix/` — the reindex
+        // queue append used to `create_dir_all` it unconditionally.
+        let fixture = TestFixture::without_git("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+
+        let payload = json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/math.rs") }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+
+        assert!(response.is_none(), "non-git edit must passthrough");
+        assert!(
+            !fixture.root().join(".claudix").exists(),
+            "no state dir may be created outside a git repo"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn user_prompt_submit_surfaces_indexing_completion() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;
         let config = stub_config();

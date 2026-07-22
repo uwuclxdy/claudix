@@ -822,6 +822,7 @@ pub async fn run_reindex_file(
     path: impl AsRef<Path>,
 ) -> Result<IndexOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
+    require_git_repo(&project_root)?;
     let config = config::load(&project_root)?;
     let store = Store::new(&project_root, &config)?;
 

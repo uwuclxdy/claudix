@@ -26,6 +26,13 @@ pub enum HookEvent {
 }
 
 pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result<Option<Value>> {
+    // claudix only indexes git repositories: outside one there is nothing to
+    // index and no reason to lay down `.claudix/`. Passthrough (fail open) so no
+    // hook touches disk in a non-git directory.
+    if !crate::enumeration::is_git_repo(project_root) {
+        return Ok(None);
+    }
+
     let payload: HookPayload = if payload.trim().is_empty() {
         HookPayload {
             tool_name: None,

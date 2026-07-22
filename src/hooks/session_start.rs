@@ -19,15 +19,12 @@ pub(super) async fn handle_session_start(
 
     let indexing_spawned = if let Some(ref config) = config
         && config.hooks.auto_index_on_session_start
-        && crate::enumeration::is_git_repo(project_root)
     {
         spawn_background_index(project_root, config)
     } else {
         false
     };
-    if let Some(ref config) = config
-        && crate::enumeration::is_git_repo(project_root)
-    {
+    if let Some(ref config) = config {
         let _ = spawn_background_watch(project_root, config);
     }
 

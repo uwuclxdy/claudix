@@ -29,6 +29,7 @@ const DRAIN_MIN_SLEEP_MS: u64 = 50;
 
 pub async fn run_drain_reindex_queue(project_root: impl AsRef<Path>) -> Result<()> {
     let project_root = canonical_project_root(project_root.as_ref())?;
+    super::require_git_repo(&project_root)?;
     let config = config::load(&project_root)?;
     // The worker is only ever spawned in the no-watcher path; guard anyway so a
     // stale spawn under a flipped config exits cleanly instead of fighting the

@@ -19,6 +19,7 @@ pub(super) const WATCH_HEARTBEAT_SECS: u64 = 30;
 
 pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
     let project_root = canonical_project_root(project_root.as_ref())?;
+    super::require_git_repo(&project_root)?;
     let config = config::load(&project_root)?;
     if !config.watch {
         return Ok(());

@@ -200,9 +200,12 @@ pub async fn run(project_root: impl AsRef<Path>) -> crate::error::Result<()> {
     // Warm-embed side channel for hook processes: fail-open, the MCP server
     // must serve normally when the listener or marker cannot be set up. The
     // marker path needs a Store (config + canonical root); any failure along
-    // the way just means hooks stay on their cold path.
-    let embed_marker = config::load(&project_root)
-        .ok()
+    // the way just means hooks stay on their cold path. Skipped outside a git
+    // repo, where there is nothing to index and `ensure_layout` would create a
+    // stray `.claudix/`.
+    let embed_marker = crate::enumeration::is_git_repo(&project_root)
+        .then(|| config::load(&project_root).ok())
+        .flatten()
         .and_then(|config| Store::new(&project_root, &config).ok())
         // On a never-indexed repo the state dir doesn't exist yet and the
         // marker write would silently fail, muting the warm channel for the
