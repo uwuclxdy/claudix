@@ -105,16 +105,20 @@ fn hit_id(n: &Neighbor) -> String {
 /// Replay the ack-time consumer over an edit's pool.
 ///
 /// Order matters and mirrors `take_change_neighbors_context`: the marker holds
-/// at most `top_k * NEIGHBOR_CANDIDATE_DEPTH` candidates, the seen-filter
-/// subtracts from those, and only then is the `top_k` hint budget applied. The
-/// on-disk existence check is skipped: every neighbor here comes from the live
-/// index of the repo being measured, so it exists by construction.
+/// at most `top_k * depth` candidates, the seen-filter subtracts from those, and
+/// only then is the `top_k` hint budget applied. The on-disk existence check is
+/// skipped: every neighbor here comes from the live index of the repo being
+/// measured, so it exists by construction.
+///
+/// `depth` is [`NEIGHBOR_CANDIDATE_DEPTH`] for every reported run; only
+/// [`report_depth_sweep`] passes anything else.
 fn consume(
     pool: &[Neighbor],
     top_k: usize,
+    depth: usize,
     seen: Option<&mut HashSet<(String, Option<String>)>>,
 ) -> Vec<Neighbor> {
-    let marker_cap = top_k.saturating_mul(NEIGHBOR_CANDIDATE_DEPTH);
+    let marker_cap = top_k.saturating_mul(depth);
     let candidates = pool.iter().take(marker_cap);
 
     match seen {
@@ -198,7 +202,13 @@ impl RunStats {
 /// `order` decides which edits share a session. Index order groups directory
 /// siblings, which is the seen-filter's best case and inflates every dedup
 /// number; the shuffled order is the one to read.
-fn replay(pools: &[EditPool], top_k: usize, dedup: bool, order: &[usize]) -> RunStats {
+fn replay(
+    pools: &[EditPool],
+    top_k: usize,
+    depth: usize,
+    dedup: bool,
+    order: &[usize],
+) -> RunStats {
     let mut stats = RunStats::default();
 
     for session in order.chunks(session_edits()) {
@@ -209,6 +219,7 @@ fn replay(pools: &[EditPool], top_k: usize, dedup: bool, order: &[usize]) -> Run
             let hits = consume(
                 &edit.pool,
                 top_k,
+                depth,
                 if dedup { Some(&mut seen) } else { None },
             );
 
@@ -220,8 +231,9 @@ fn replay(pools: &[EditPool], top_k: usize, dedup: bool, order: &[usize]) -> Run
                 // seen-filter had not already eaten. A pool that fits under the
                 // cap and comes back empty is the filter working as designed;
                 // this counts the edits where the over-fetch depth is what cost
-                // the hint. Measured at zero everywhere; see `hooks.md`.
-                let cap = top_k.saturating_mul(NEIGHBOR_CANDIDATE_DEPTH);
+                // the hint. Non-zero only under a multi-seed edit on a dense
+                // corpus; see `hooks.md` and [`report_depth_sweep`].
+                let cap = top_k.saturating_mul(depth);
                 if edit.pool.len() > cap
                     && edit.pool[cap..]
                         .iter()
@@ -277,6 +289,33 @@ fn report_pool_ceiling(label: &str, pools: &[EditPool], top_k: usize) {
             "    widest pool: {} ({} neighbor files)",
             worst.edited_path,
             worst.pool.len()
+        );
+    }
+}
+
+/// Over-fetch depths to trial when the shipped one starves an edit. Spans the
+/// shipped 5 up to enough to hold the widest multi-seed pool measured (63 files
+/// at `top_k` 5, so 13x covers it outright).
+const DEPTH_SWEEP: &[usize] = &[5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 20];
+
+/// What each candidate over-fetch depth does to starvation, holding the pools,
+/// the session length, and the seen-ledger reset fixed. This is how
+/// `NEIGHBOR_CANDIDATE_DEPTH` gets picked: the smallest depth whose starvation
+/// column reads zero, with the next row down showing the margin.
+///
+/// Read it off the multi-seed pools, since a single-seed pool is a lower bound
+/// on what a real k-hunk edit faces and has never starved at any depth.
+fn report_depth_sweep(pools: &[EditPool], top_k: usize, order: &[usize]) {
+    println!("\n  over-fetch depth sweep (multi-seed pools, dedup on)");
+    println!("    depth  cap  hints/edit  silent  starved");
+    for &depth in DEPTH_SWEEP {
+        let stats = replay(pools, top_k, depth, true, order);
+        println!(
+            "    {depth:<5}  {:<3}  {:>10.2}  {:>6}  {:>7}",
+            top_k.saturating_mul(depth),
+            stats.emitted as f64 / stats.edits.max(1) as f64,
+            stats.silent_edits,
+            stats.starved_by_cap
         );
     }
 }
@@ -1042,8 +1081,10 @@ async fn hint_distribution_over_the_live_index() {
         let pools = scan(&rows, build_edits(&by_file, mode), floor);
 
         println!("\n=== {} ===", mode.label());
-        replay(&pools, top_k, false, &order).report("without cross-file dedup");
-        replay(&pools, top_k, true, &order).report("with cross-file dedup (shipped)");
+        replay(&pools, top_k, NEIGHBOR_CANDIDATE_DEPTH, false, &order)
+            .report("without cross-file dedup");
+        replay(&pools, top_k, NEIGHBOR_CANDIDATE_DEPTH, true, &order)
+            .report("with cross-file dedup (shipped)");
         report_pool_ceiling("one edit per file", &pools, top_k);
     }
 
@@ -1067,6 +1108,8 @@ async fn hint_distribution_over_the_live_index() {
     let k = multi_seed_k();
     let multi_pools = scan(&rows, build_multi_seed_edits(&by_file, k), floor);
     println!("\n=== multi-seed query, up to k={k} changed chunks per edit ===");
-    replay(&multi_pools, top_k, true, &order).report("with cross-file dedup (shipped)");
+    replay(&multi_pools, top_k, NEIGHBOR_CANDIDATE_DEPTH, true, &order)
+        .report("with cross-file dedup (shipped)");
     report_pool_ceiling("multi-seed, one edit per file", &multi_pools, top_k);
+    report_depth_sweep(&multi_pools, top_k, &order);
 }
