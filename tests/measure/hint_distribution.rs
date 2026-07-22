@@ -357,6 +357,154 @@ fn report_score_distribution(
     );
 }
 
+/// Candidate percentiles of the best-neighbor distribution to trial as the
+/// corpus-relative floor. The shipped floor stores one such percentile in the
+/// manifest, so this sweep is how that percentile gets picked: read the row
+/// where volume drops to the target while gated precision holds.
+const FLOOR_SWEEP_PERCENTILES: &[usize] = &[10, 15, 20, 25, 30, 35, 40];
+
+/// Trial each candidate floor = P-th percentile of the best-neighbor-per-file
+/// distribution, exactly what the shipped `similarity_floor` will store, and
+/// report what that floor does to hint volume and to the precision of the hints
+/// it admits.
+///
+/// A single model, choosing its own cutoff — so unlike [`report_symbol_precision`]
+/// this gates precision at the floor. That is the point here: a good floor is the
+/// highest one whose admitted hints stay as correct as the floor-free set while
+/// volume falls toward the target. Raising a floor only removes weak neighbors,
+/// so admitted precision should hold or rise; the cost of raising it too far is
+/// coverage (symbols left with no hit at all), which the clear-rate column shows.
+fn report_floor_sweep(
+    rows: &[StoredChunk],
+    by_file: &BTreeMap<String, Vec<&StoredChunk>>,
+    references: &BTreeMap<u64, BTreeSet<String>>,
+    top_k: usize,
+) {
+    // The distribution the floor is a percentile of: best neighbor per edit,
+    // changed-chunk query, floor removed. Identical to the shipped computation.
+    let pools = scan(rows, build_edits(by_file, Mode::ChangedChunk), 0.0);
+    let mut best: Vec<f32> = pools
+        .iter()
+        .map(|edit| edit.pool.first().map_or(0.0, |n| n.score))
+        .collect();
+    best.sort_by(f32::total_cmp);
+    let total_edits = pools.len().max(1);
+
+    // Precompute each evaluable symbol's floor-free ranked hits plus its answer
+    // set once. A higher floor only trims the tail of a floor-free top-k, so
+    // filtering these by score is exact and avoids re-ranking per floor.
+    struct Evaluable<'a> {
+        hits: Vec<Neighbor>,
+        mentioning: BTreeSet<&'a str>,
+    }
+    let mut evaluables: Vec<Evaluable> = Vec::new();
+    for row in rows {
+        let Some(symbol) = row.name.as_deref() else {
+            continue;
+        };
+        if symbol.len() < 4 || GENERIC_SYMBOLS.contains(&symbol) {
+            continue;
+        }
+        let mut mentioning: BTreeSet<&str> = BTreeSet::new();
+        let mut other_files = 0usize;
+        for (path, chunks) in by_file {
+            if path == &row.file_path {
+                continue;
+            }
+            other_files += 1;
+            if chunks
+                .iter()
+                .any(|c| references_symbol(references, c, symbol))
+            {
+                mentioning.insert(path.as_str());
+            }
+        }
+        if mentioning.is_empty() || other_files == 0 {
+            continue;
+        }
+        let exclude = RelativePath::new(&row.file_path);
+        let hits = neighbors(
+            rows,
+            std::slice::from_ref(&row.vector),
+            &exclude,
+            top_k,
+            0.0,
+        );
+        if hits.is_empty() {
+            continue;
+        }
+        evaluables.push(Evaluable { hits, mentioning });
+    }
+    let total_symbols = evaluables.len().max(1);
+
+    println!("\n  corpus-relative floor sweep (single model, choosing a cutoff)");
+    println!(
+        "    {total_edits} edits, {} evaluable symbols, top_k {top_k}",
+        evaluables.len()
+    );
+    println!("    pctl  floor  clear%  hints/edit  cover%  prec@{top_k}  prec@1");
+    for &p in FLOOR_SWEEP_PERCENTILES {
+        let floor = percentile(&best, p);
+
+        // Volume: hits above the floor per edit, capped at top_k.
+        let mut clearing = 0usize;
+        let mut emitted = 0usize;
+        for edit in &pools {
+            let admitted = edit
+                .pool
+                .iter()
+                .filter(|n| n.score >= floor)
+                .take(top_k)
+                .count();
+            if admitted > 0 {
+                clearing += 1;
+            }
+            emitted += admitted;
+        }
+
+        // Gated precision: of the hits still admitted at this floor, the share
+        // that reference the edited symbol, averaged over symbols keeping a hit.
+        let mut precision_sum = 0.0f64;
+        let mut top1_hits = 0usize;
+        let mut evaluated = 0usize;
+        for symbol in &evaluables {
+            let admitted: Vec<&Neighbor> =
+                symbol.hits.iter().filter(|n| n.score >= floor).collect();
+            let Some(first) = admitted.first() else {
+                continue;
+            };
+            let relevant = admitted
+                .iter()
+                .filter(|hit| symbol.mentioning.contains(hit.file_path.as_str()))
+                .count();
+            precision_sum += relevant as f64 / admitted.len() as f64;
+            if symbol.mentioning.contains(first.file_path.as_str()) {
+                top1_hits += 1;
+            }
+            evaluated += 1;
+        }
+        let prec = if evaluated > 0 {
+            precision_sum / evaluated as f64
+        } else {
+            0.0
+        };
+        let prec1 = if evaluated > 0 {
+            top1_hits as f64 / evaluated as f64
+        } else {
+            0.0
+        };
+
+        println!(
+            "    p{p:<3} {floor:.3}  {:>5.0}  {:>9.2}  {:>5.0}  {:.3}  {:.3}",
+            100.0 * clearing as f64 / total_edits as f64,
+            emitted as f64 / total_edits as f64,
+            100.0 * evaluated as f64 / total_symbols as f64,
+            prec,
+            prec1,
+        );
+    }
+}
+
 fn is_identifier_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
@@ -828,6 +976,7 @@ async fn hint_distribution_over_the_live_index() {
         rows.len()
     );
     report_symbol_precision(&rows, &by_file, &references, top_k);
+    report_floor_sweep(&rows, &by_file, &references, top_k);
 
     let order = shuffled_order(by_file.len());
     for mode in [Mode::WholeFile, Mode::ChangedChunk] {
