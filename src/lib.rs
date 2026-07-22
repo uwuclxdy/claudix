@@ -505,12 +505,13 @@ impl Claudix {
     /// warm, `read_chunks` is a fast LanceDB scan. Fail-open: any error is
     /// silently discarded so the hook session continues normally.
     ///
-    /// Ceiling: the narrowing rides on chunk content being stable across an
-    /// unrelated edit, which holds for the tree-sitter chunkers but not for
-    /// `chunk_fallback` — it windows on line index, so inserting or deleting a
-    /// line rewrites every later window and the whole file reads as changed.
-    /// Files without a grammar (markdown, toml, yaml, shell) therefore keep the
-    /// old file-wide query. Upgrade path is content-defined chunk boundaries.
+    /// The narrowing rides on chunk content being stable across an unrelated
+    /// edit. That holds for the tree-sitter chunkers and, since `chunk_fallback`
+    /// cuts on content-defined boundaries, for grammarless files (markdown,
+    /// toml, yaml, shell) too: an insert perturbs the chunk holding it and at
+    /// most its overlap neighbor, not the whole file. Residual: a symbol
+    /// deletion can leave only the enclosing container chunk changed, which
+    /// still queries wider than the edit.
     async fn write_change_neighbors_marker(
         &self,
         relative_path: &RelativePath,

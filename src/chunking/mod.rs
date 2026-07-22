@@ -185,12 +185,22 @@ fn default_name(node: Node<'_>, content: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Split `content` into overlapping line-based chunks. Used for languages
-/// without a tree-sitter grammar and for `chunk_as_text` (force-included
-/// files).
+/// Split `content` into line-based chunks on content-defined boundaries. Used
+/// for languages without a tree-sitter grammar and for `chunk_as_text`
+/// (force-included files).
 ///
-/// `chunk_size` — number of lines per chunk.
-/// `overlap`    — lines shared between adjacent chunks.
+/// A segment ends where a line's content hash lands on the target residue, so a
+/// boundary depends on what a line says rather than where it sits. That is the
+/// whole point: an edit above a boundary leaves the boundary's line untouched,
+/// so it stays a boundary and every chunk below the edit keeps its exact bytes.
+/// A fixed line stride instead shifts every later window, re-hashing the file
+/// and defeating the change-neighbor snapshot's per-chunk narrowing.
+///
+/// `chunk_size` — target segment length in lines (average, not a hard period).
+/// `overlap`    — lines each chunk shares with the segment before it, pulled in
+///                as a leading prefix. The shared lines come from a
+///                content-defined boundary, so overlap does not reintroduce the
+///                line-shift fragility. It changes chunk boundaries, not count.
 pub fn chunk_fallback(
     path: &RelativePath,
     language: Language,
@@ -203,14 +213,8 @@ pub fn chunk_fallback(
         return Ok(Vec::new());
     }
 
-    let chunk_size = chunk_size.max(1);
-    let step = if overlap < chunk_size {
-        chunk_size - overlap
-    } else {
-        1
-    };
-
-    // Collect byte offsets of the start of every line.
+    // Collect byte offsets of the start of every line. A trailing newline does
+    // not open an empty final line.
     let mut line_starts: Vec<usize> = vec![0];
     for (offset, byte) in content.bytes().enumerate() {
         if byte == b'\n' && offset + 1 < content.len() {
@@ -219,14 +223,41 @@ pub fn chunk_fallback(
     }
     let total_lines = line_starts.len();
 
-    let mut chunks = Vec::new();
-    let mut window_start = 0_usize;
+    // Bounds that keep a pathological file (thousands of identical lines) from
+    // collapsing to one chunk or shattering into thousands: below `min_lines`
+    // no boundary is accepted, at `max_lines` one is forced. Expected segment
+    // length is `min_lines + divisor`, so the divisor is sized to land the
+    // average on `chunk_size`.
+    let target = chunk_size.max(1);
+    let min_lines = (target / 4).max(1);
+    let max_lines = target.saturating_mul(2).max(min_lines + 1);
+    let divisor = u64::try_from(target.saturating_sub(min_lines).max(1)).unwrap_or(u64::MAX);
 
-    while window_start < total_lines {
-        let window_end = (window_start + chunk_size).min(total_lines);
-        let byte_start = line_starts[window_start];
-        let byte_end = if window_end < total_lines {
-            line_starts[window_end]
+    // Content-defined segmentation over line indices: (start, end) inclusive.
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0_usize;
+    for line in 0..total_lines {
+        let len = line - seg_start + 1;
+        let forced = len >= max_lines;
+        let boundary =
+            len >= min_lines && line_is_boundary(content, &line_starts, total_lines, line, divisor);
+        if forced || boundary {
+            segments.push((seg_start, line));
+            seg_start = line + 1;
+        }
+    }
+    if seg_start < total_lines {
+        segments.push((seg_start, total_lines - 1));
+    }
+
+    let mut chunks = Vec::with_capacity(segments.len());
+    for (seg_start, seg_end) in segments {
+        // Honor `overlap` as a shared prefix pulled from the previous segment's
+        // (content-defined, stable) tail.
+        let start_line = seg_start.saturating_sub(overlap);
+        let byte_start = line_starts[start_line];
+        let byte_end = if seg_end + 1 < total_lines {
+            line_starts[seg_end + 1]
         } else {
             content.len()
         };
@@ -238,9 +269,9 @@ pub fn chunk_fallback(
             })?
             .to_owned();
 
-        let start_line = u32::try_from(window_start + 1)
+        let start_line_no = u32::try_from(start_line + 1)
             .map_err(|_| ClaudixError::TreeSitter("line number overflowed u32".to_owned()))?;
-        let end_line = u32::try_from(window_end)
+        let end_line_no = u32::try_from(seg_end + 1)
             .map_err(|_| ClaudixError::TreeSitter("line number overflowed u32".to_owned()))?;
 
         let byte_range = ByteRange {
@@ -257,21 +288,37 @@ pub fn chunk_fallback(
             kind: ChunkKind::Other,
             name: None,
             line_range: LineRange {
-                start: start_line,
-                end: end_line,
+                start: start_line_no,
+                end: end_line_no,
             },
             byte_range,
             file_hash,
             content: chunk_content,
         });
-
-        if window_end == total_lines {
-            break;
-        }
-        window_start += step;
     }
 
     Ok(chunks)
+}
+
+/// Whether `line` ends a content-defined segment: its content hash (newline
+/// included) lands on the target residue. Per-line hashing is enough for
+/// shift-tolerance because a boundary line keeps its bytes across an unrelated
+/// edit; a windowed rolling hash would only add robustness to single-line
+/// duplication, which `min`/`max` already bound.
+fn line_is_boundary(
+    content: &str,
+    line_starts: &[usize],
+    total_lines: usize,
+    line: usize,
+    divisor: u64,
+) -> bool {
+    let start = line_starts[line];
+    let end = if line + 1 < total_lines {
+        line_starts[line + 1]
+    } else {
+        content.len()
+    };
+    xxhash_rust::xxh3::xxh3_64(&content.as_bytes()[start..end]) % divisor == divisor - 1
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -432,9 +479,12 @@ mod tests {
             "tree-sitter chunk count must not change with overlap"
         );
 
-        // Force-indexed content routes through the sliding window, where overlap
-        // adds chunks.
-        let text = "line\n".repeat(30);
+        // Force-indexed content routes through the content-defined fallback,
+        // where overlap shares a leading prefix between adjacent chunks: same
+        // chunk count, more total bytes once the shared lines are duplicated.
+        let text: String = (0..40)
+            .map(|i| format!("distinct fallback line {i}\n"))
+            .collect();
         let text_no = no_overlap
             .chunk_as_text(
                 &RelativePath::new("notes.txt"),
@@ -453,11 +503,17 @@ mod tests {
             )
             .ok()
             .unwrap_or_else(|| unreachable!());
-        assert!(
-            text_ov.len() > text_no.len(),
-            "fallback overlap must add chunks: no={}, ov={}",
+        assert_eq!(
             text_no.len(),
-            text_ov.len()
+            text_ov.len(),
+            "overlap must not change fallback chunk count"
+        );
+        let bytes = |cs: &[Chunk]| cs.iter().map(|c| c.content.len()).sum::<usize>();
+        assert!(
+            bytes(&text_ov) > bytes(&text_no),
+            "fallback overlap must duplicate boundary lines: no={}, ov={}",
+            bytes(&text_no),
+            bytes(&text_ov)
         );
     }
 
@@ -1044,52 +1100,130 @@ mod tests {
     }
 
     #[test]
-    fn fallback_10_lines_chunk_size_5_no_overlap_returns_2_chunks() {
-        let source = (1..=10)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        let result = chunk_fallback(
+    fn fallback_covers_every_line_and_partitions_without_overlap() {
+        // Content-defined boundaries land where the content puts them, so assert
+        // coverage and ordering rather than exact windows: with no overlap the
+        // segments partition the file — first chunk at line 1, last at the final
+        // line, each chunk resuming exactly where the previous ended, none over
+        // the max bound.
+        let source: String = (0..200)
+            .map(|i| format!("distinct fallback line number {i}\n"))
+            .collect();
+        let chunks = chunk_fallback(
             &RelativePath::new("file.txt"),
             Language::Unknown,
             hash_for(&source),
             &source,
-            5,
+            30,
             0,
+        )
+        .ok()
+        .unwrap_or_else(|| unreachable!());
+
+        assert!(
+            chunks.len() >= 2,
+            "fixture must split, got {}",
+            chunks.len()
         );
-        assert!(result.is_ok());
-        let chunks = result.ok().unwrap_or_else(|| unreachable!());
-        assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].line_range.start, 1);
-        assert_eq!(chunks[0].line_range.end, 5);
-        assert_eq!(chunks[1].line_range.start, 6);
-        assert_eq!(chunks[1].line_range.end, 10);
+        assert_eq!(chunks[chunks.len() - 1].line_range.end, 200);
+        for pair in chunks.windows(2) {
+            assert_eq!(
+                pair[1].line_range.start,
+                pair[0].line_range.end + 1,
+                "no-overlap segments must partition without gaps or overlap"
+            );
+            let span = pair[0].line_range.end - pair[0].line_range.start + 1;
+            assert!(
+                span <= 60,
+                "segment of {span} lines exceeds the 2×target max"
+            );
+        }
     }
 
     #[test]
-    fn fallback_overlap_produces_overlapping_chunks() {
-        // 10 lines, chunk_size=6, overlap=2 → step=4 → windows at 0,4
-        let source = (1..=10)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        let result = chunk_fallback(
+    fn fallback_overlap_shares_a_prefix_with_the_previous_chunk() {
+        // Overlap pulls the previous segment's last `overlap` lines into each
+        // chunk as a leading prefix, so adjacent chunks share exactly that many
+        // lines. Segmentation (and thus chunk count) is unaffected by overlap.
+        let source: String = (0..200)
+            .map(|i| format!("distinct fallback line number {i}\n"))
+            .collect();
+        let overlap = 4_u32;
+        let chunks = chunk_fallback(
             &RelativePath::new("file.txt"),
             Language::Unknown,
             hash_for(&source),
             &source,
-            6,
-            2,
+            30,
+            overlap as usize,
+        )
+        .ok()
+        .unwrap_or_else(|| unreachable!());
+
+        assert!(
+            chunks.len() >= 2,
+            "fixture must split, got {}",
+            chunks.len()
         );
-        assert!(result.is_ok());
-        let chunks = result.ok().unwrap_or_else(|| unreachable!());
-        // window 0..6 and 4..10
-        assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].line_range.start, 1);
-        assert_eq!(chunks[0].line_range.end, 6);
-        assert_eq!(chunks[1].line_range.start, 5);
+        for pair in chunks.windows(2) {
+            let shared = pair[0].line_range.end - pair[1].line_range.start + 1;
+            assert_eq!(
+                shared, overlap,
+                "each chunk must share exactly `overlap` lines with the prior"
+            );
+        }
+    }
+
+    #[test]
+    fn fallback_insert_at_top_perturbs_a_bounded_chunk_set() {
+        // Content-defined boundaries track what a line says, not where it sits,
+        // so a one-line insert at the top of a fallback-chunked file leaves
+        // every chunk below the insert byte-identical. Only the chunk holding
+        // the insert re-hashes, which is what lets the change-neighbor snapshot
+        // narrow to the edit. The old line-index splitter shifted every window
+        // and re-hashed the whole file; this test reds against it.
+        let base: String = (0..300)
+            .map(|i| format!("unique fallback content line number {i} lorem ipsum dolor\n"))
+            .collect();
+        let inserted = format!("a freshly inserted top line that did not exist before\n{base}");
+
+        let content_hashes = |src: &str| -> std::collections::HashSet<u128> {
+            chunk_fallback(
+                &RelativePath::new("notes.md"),
+                Language::Unknown,
+                hash_for(src),
+                src,
+                DEFAULT_CHUNK_LINES,
+                DEFAULT_OVERLAP_LINES,
+            )
+            .ok()
+            .unwrap_or_else(|| unreachable!())
+            .iter()
+            .map(|c| xxhash_rust::xxh3::xxh3_128(c.content.as_bytes()))
+            .collect()
+        };
+
+        let before = content_hashes(&base);
+        let after = content_hashes(&inserted);
+
+        // A single-chunk file would pass the bound trivially, so require the
+        // fixture to have split into several chunks first.
+        assert!(
+            before.len() >= 4,
+            "fixture must produce several fallback chunks, got {}",
+            before.len()
+        );
+
+        // Chunks whose exact content vanished after the insert. Content-defined
+        // boundaries hold this to the touched chunk (and at most its overlap
+        // neighbor); the line-index splitter drops nearly all of them.
+        let dropped = before.difference(&after).count();
+        assert!(
+            dropped <= 2,
+            "a top insert must perturb a bounded chunk set, dropped {dropped} of {}",
+            before.len()
+        );
     }
 
     #[test]
