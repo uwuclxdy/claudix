@@ -884,6 +884,7 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tempfile::tempdir;
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     #[ignore = "hits huggingface network"]
@@ -1188,6 +1189,27 @@ mod tests {
         );
     }
 
+    /// Read the client's request off the socket before responding. Windows
+    /// treats a close with unread bytes still in the receive buffer as an
+    /// abortive close (RST), which reqwest surfaces mid-send as WSAECONNABORTED
+    /// (os error 10053); draining the request first lets the close be graceful.
+    /// The client keeps its write half open awaiting a response, so stop at the
+    /// header terminator rather than reading to EOF.
+    async fn drain_request(socket: &mut tokio::net::TcpStream) {
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !seen.windows(4).any(|window| window == b"\r\n\r\n") {
+            match socket.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(read) => seen.extend_from_slice(&buf[..read]),
+                Err(_) => break,
+            }
+            if seen.len() > 64 * 1024 {
+                break;
+            }
+        }
+    }
+
     /// Serve `body` once over loopback and return its URL, so the download path
     /// is exercised end to end without reaching the network.
     async fn serve_once(body: &'static [u8]) -> String {
@@ -1202,6 +1224,7 @@ mod tests {
 
         tokio::spawn(async move {
             if let Ok((mut socket, _)) = listener.accept().await {
+                drain_request(&mut socket).await;
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
@@ -1229,6 +1252,7 @@ mod tests {
 
         tokio::spawn(async move {
             if let Ok((mut socket, _)) = listener.accept().await {
+                drain_request(&mut socket).await;
                 let header = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
