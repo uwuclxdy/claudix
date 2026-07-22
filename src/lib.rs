@@ -981,6 +981,45 @@ mod tests {
         assert_eq!(manifest.chunk_count, 3);
     }
 
+    /// The whole feature end to end: a full index over a corpus large enough to
+    /// estimate one must store a similarity floor. Every other fixture sits under
+    /// MIN_FILES_FOR_FLOOR, so this is the only test exercising index_full's
+    /// compute-and-store wiring — without it, deleting both lines would make the
+    /// feature a silent no-op on every real repo while each piece's unit test
+    /// stayed green.
+    #[tokio::test]
+    async fn index_full_stores_a_corpus_similarity_floor() {
+        let fixture = TestFixture::new("floor_repo").unwrap_or_else(|_| unreachable!());
+        let config = stub_config();
+        let claudix =
+            test_claudix(fixture.root().to_path_buf(), config).unwrap_or_else(|_| unreachable!());
+
+        assert!(claudix.index_full(&mut ()).await.is_ok());
+
+        let manifest = claudix
+            .store
+            .read_manifest()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| unreachable!());
+        assert!(
+            manifest.similarity_floor.is_some(),
+            "index_full must store a corpus floor for a >=8-file repo"
+        );
+
+        // Pin the value to a fresh computation over the persisted rows, so a
+        // mutation to the percentile or the stored value diverges rather than
+        // silently passing on the mere presence of some floor.
+        let rows = claudix
+            .store
+            .read_chunks()
+            .await
+            .unwrap_or_else(|_| unreachable!());
+        let expected =
+            crate::search::corpus_similarity_floor(&rows, crate::search::FLOOR_PERCENTILE);
+        assert_eq!(manifest.similarity_floor, expected);
+    }
+
     #[tokio::test]
     async fn index_full_replaces_stale_chunks() {
         let fixture = TestFixture::new("small_rust");
