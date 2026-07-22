@@ -19,30 +19,34 @@ pub fn validate(config: &Config) -> Result<()> {
         });
     }
 
+    // Model id and dimensions are checked against one table entry rather than
+    // two independent constants, so a config naming one model with another's
+    // width cannot pass.
     if matches!(config.embedding.provider, EmbeddingProvider::Bundled)
         && !allow_stub_embedding_model
-        && config.embedding.model != crate::embedding::bundled::BUNDLED_MODEL_ID
     {
-        return Err(ClaudixError::ConfigInvalid {
-            message: format!(
-                "embedding.model must be {} when embedding.provider = \"bundled\"",
-                crate::embedding::bundled::BUNDLED_MODEL_ID
-            ),
-            recovery: RecoveryHint(hints::SET_MODEL_BUNDLED),
-        });
-    }
-
-    if matches!(config.embedding.provider, EmbeddingProvider::Bundled)
-        && !allow_stub_embedding_model
-        && config.embedding.dimensions != crate::embedding::bundled::BUNDLED_DIMENSIONS.0
-    {
-        return Err(ClaudixError::ConfigInvalid {
-            message: format!(
-                "embedding.dimensions must be {} when embedding.provider = \"bundled\"",
-                crate::embedding::bundled::BUNDLED_DIMENSIONS.0
-            ),
-            recovery: RecoveryHint(hints::BUNDLED_DIMENSIONS_384),
-        });
+        match crate::embedding::bundled::bundled_model(&config.embedding.model) {
+            None => {
+                return Err(ClaudixError::ConfigInvalid {
+                    message: format!(
+                        "embedding.model must be one of [{}] when embedding.provider = \"bundled\", got {}",
+                        crate::embedding::bundled::bundled_model_ids(),
+                        config.embedding.model
+                    ),
+                    recovery: RecoveryHint(hints::SET_MODEL_BUNDLED),
+                });
+            }
+            Some(model) if model.dimensions.0 != config.embedding.dimensions => {
+                return Err(ClaudixError::ConfigInvalid {
+                    message: format!(
+                        "embedding.dimensions must be {} for embedding.model = \"{}\"",
+                        model.dimensions.0, model.id
+                    ),
+                    recovery: RecoveryHint(hints::BUNDLED_DIMENSIONS),
+                });
+            }
+            Some(_) => {}
+        }
     }
 
     if config.embedding.dimensions == 0 {

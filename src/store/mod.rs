@@ -914,6 +914,17 @@ mod tests {
         manifest
     }
 
+    /// Vector width the default config declares. Derived rather than restated
+    /// so these tests follow whichever model is the bundled default instead of
+    /// pinning the one that happened to be default when they were written.
+    fn default_dimensions() -> usize {
+        usize::from(Config::default().embedding.dimensions)
+    }
+
+    fn sample_vector(value: f32) -> Vec<f32> {
+        vec![value; default_dimensions()]
+    }
+
     fn sample_chunk(
         chunk_id: u64,
         file_path: &str,
@@ -1140,8 +1151,20 @@ mod tests {
         let store = store.ok().unwrap_or_else(|| unreachable!());
 
         let chunks = vec![
-            sample_chunk(1, "src/lib.rs", "alpha", "pub fn alpha() {}", &[1.0; 384]),
-            sample_chunk(2, "src/lib.rs", "beta", "pub fn beta() {}", &[2.0; 384]),
+            sample_chunk(
+                1,
+                "src/lib.rs",
+                "alpha",
+                "pub fn alpha() {}",
+                &sample_vector(1.0),
+            ),
+            sample_chunk(
+                2,
+                "src/lib.rs",
+                "beta",
+                "pub fn beta() {}",
+                &sample_vector(2.0),
+            ),
         ];
 
         let stats = store.replace_chunks(&chunks, &config).await;
@@ -1160,7 +1183,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name.as_deref(), Some("alpha"));
         assert_eq!(rows[1].name.as_deref(), Some("beta"));
-        assert_eq!(rows[0].vector.len(), 384);
+        assert_eq!(rows[0].vector.len(), default_dimensions());
 
         let manifest = store.read_manifest();
         assert!(manifest.is_ok());
@@ -1189,7 +1212,7 @@ mod tests {
             "src/lib.rs",
             "alpha",
             "pub fn alpha() {}",
-            &[f32::INFINITY; 384],
+            &sample_vector(f32::INFINITY),
         )];
 
         let error = store.replace_chunks(&chunks, &config).await;
@@ -1289,7 +1312,7 @@ mod tests {
             "src/lib.rs",
             "alpha",
             "pub fn alpha() {}",
-            &[1.0; 384],
+            &sample_vector(1.0),
         )];
         assert!(store.replace_chunks(&initial, &config).await.is_ok());
 
@@ -1310,7 +1333,7 @@ mod tests {
             "src/lib.rs",
             "beta",
             "pub fn beta() {}",
-            &[2.0; 384],
+            &sample_vector(2.0),
         )];
         assert!(
             store
@@ -1344,8 +1367,20 @@ mod tests {
         let store = store.ok().unwrap_or_else(|| unreachable!());
 
         let initial = vec![
-            sample_chunk(1, "src/lib.rs", "alpha", "pub fn alpha() {}", &[1.0; 384]),
-            sample_chunk(2, "src/other.rs", "omega", "pub fn omega() {}", &[2.0; 384]),
+            sample_chunk(
+                1,
+                "src/lib.rs",
+                "alpha",
+                "pub fn alpha() {}",
+                &sample_vector(1.0),
+            ),
+            sample_chunk(
+                2,
+                "src/other.rs",
+                "omega",
+                "pub fn omega() {}",
+                &sample_vector(2.0),
+            ),
         ];
         assert!(store.replace_chunks(&initial, &config).await.is_ok());
 
@@ -1354,7 +1389,7 @@ mod tests {
             "src/lib.rs",
             "beta",
             "pub fn beta() {}",
-            &[3.0; 384],
+            &sample_vector(3.0),
         )];
 
         let stats = store.replace_file_chunks(&replacement, &config).await;
@@ -1388,8 +1423,20 @@ mod tests {
         let store = store.ok().unwrap_or_else(|| unreachable!());
 
         let initial = vec![
-            sample_chunk(1, "src/lib.rs", "alpha", "pub fn alpha() {}", &[1.0; 384]),
-            sample_chunk(2, "src/other.rs", "omega", "pub fn omega() {}", &[2.0; 384]),
+            sample_chunk(
+                1,
+                "src/lib.rs",
+                "alpha",
+                "pub fn alpha() {}",
+                &sample_vector(1.0),
+            ),
+            sample_chunk(
+                2,
+                "src/other.rs",
+                "omega",
+                "pub fn omega() {}",
+                &sample_vector(2.0),
+            ),
         ];
         assert!(store.replace_chunks(&initial, &config).await.is_ok());
 
@@ -1423,8 +1470,20 @@ mod tests {
 
         let quoted_path = "src/it's.rs";
         let initial = vec![
-            sample_chunk(1, quoted_path, "alpha", "pub fn alpha() {}", &[1.0; 384]),
-            sample_chunk(2, "src/other.rs", "omega", "pub fn omega() {}", &[2.0; 384]),
+            sample_chunk(
+                1,
+                quoted_path,
+                "alpha",
+                "pub fn alpha() {}",
+                &sample_vector(1.0),
+            ),
+            sample_chunk(
+                2,
+                "src/other.rs",
+                "omega",
+                "pub fn omega() {}",
+                &sample_vector(2.0),
+            ),
         ];
         assert!(store.replace_chunks(&initial, &config).await.is_ok());
 
@@ -1433,7 +1492,7 @@ mod tests {
             quoted_path,
             "beta",
             "pub fn beta() {}",
-            &[3.0; 384],
+            &sample_vector(3.0),
         )];
         let stats = store.replace_file_chunks(&replacement, &config).await?;
         assert_eq!(
@@ -1476,9 +1535,27 @@ mod tests {
 
         let quoted_path = "src/it's.rs";
         let seeded = vec![
-            sample_chunk(1, quoted_path, "alpha", "pub fn alpha() {}", &[1.0; 384]),
-            sample_chunk(2, quoted_path, "beta", "pub fn beta() {}", &[2.0; 384]),
-            sample_chunk(3, "src/other.rs", "omega", "pub fn omega() {}", &[3.0; 384]),
+            sample_chunk(
+                1,
+                quoted_path,
+                "alpha",
+                "pub fn alpha() {}",
+                &sample_vector(1.0),
+            ),
+            sample_chunk(
+                2,
+                quoted_path,
+                "beta",
+                "pub fn beta() {}",
+                &sample_vector(2.0),
+            ),
+            sample_chunk(
+                3,
+                "src/other.rs",
+                "omega",
+                "pub fn omega() {}",
+                &sample_vector(3.0),
+            ),
         ];
         store.replace_chunks(&seeded, &config).await?;
 
@@ -1547,9 +1624,15 @@ mod tests {
                 "src/present.rs",
                 "present",
                 "fn present() {}",
-                &[1.0; 384],
+                &sample_vector(1.0),
             ),
-            sample_chunk(2, "src/gone.rs", "gone", "fn gone() {}", &[2.0; 384]),
+            sample_chunk(
+                2,
+                "src/gone.rs",
+                "gone",
+                "fn gone() {}",
+                &sample_vector(2.0),
+            ),
         ];
         store.replace_chunks(&initial, &config).await?;
 
@@ -1595,7 +1678,7 @@ mod tests {
             "src/lib.rs",
             "alpha",
             "pub fn alpha() {}",
-            &[1.0; 384],
+            &sample_vector(1.0),
         )];
         assert!(store.replace_chunks(&chunks, &config).await.is_ok());
 
@@ -1726,7 +1809,7 @@ mod tests {
                     &format!("src/f{i}.rs"),
                     &format!("fn{i}"),
                     "fn body",
-                    &[i as f32 / 15.0; 384],
+                    &sample_vector(i as f32 / 15.0),
                 )
             })
             .collect();
@@ -1750,8 +1833,8 @@ mod tests {
 
         // Seed: two files, file_hash = chunk_id byte repeated
         let initial = vec![
-            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
-            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
+            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &sample_vector(1.0)),
+            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &sample_vector(2.0)),
         ];
         store.replace_chunks(&initial, &config).await?;
 
@@ -1808,8 +1891,8 @@ mod tests {
         let store = Store::new(project_root.path(), &config)?;
 
         let initial = vec![
-            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
-            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
+            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &sample_vector(1.0)),
+            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &sample_vector(2.0)),
         ];
         store.replace_chunks(&initial, &config).await?;
 
@@ -1842,7 +1925,7 @@ mod tests {
                     "src/a.rs",
                     "fn_a",
                     "fn a() {}",
-                    &[1.0; 384],
+                    &sample_vector(1.0),
                 )],
                 &config,
             )
@@ -1900,7 +1983,7 @@ mod tests {
             "src/a.rs",
             "fn_a",
             "fn a() {}",
-            &[1.0; 384],
+            &sample_vector(1.0),
         )];
         store.replace_file_chunks(&chunks, &config).await?;
 
@@ -1927,8 +2010,8 @@ mod tests {
         store.write_manifest(&manifest)?;
 
         let chunks = vec![
-            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &[1.0; 384]),
-            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &[2.0; 384]),
+            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &sample_vector(1.0)),
+            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &sample_vector(2.0)),
         ];
         store.replace_chunks(&chunks, &config).await?;
         // Patch the manifest to include the no-chunk entry (replace_chunks doesn't merge).
@@ -1963,7 +2046,7 @@ mod tests {
             "src/a.rs",
             "fn_a",
             "fn a() {}",
-            &[1.0; 384],
+            &sample_vector(1.0),
         )];
         store.replace_chunks(&chunks, &config).await?;
 
@@ -1996,7 +2079,7 @@ mod tests {
             "src/lib.rs",
             "foo",
             "pub fn foo() {}",
-            &[1.0; 384],
+            &sample_vector(1.0),
         )];
         assert!(store.replace_chunks(&chunks, &config).await.is_ok());
 
@@ -2059,9 +2142,27 @@ mod tests {
         let store = store.ok().unwrap_or_else(|| unreachable!());
 
         let chunks = vec![
-            sample_chunk(1, "src/lib.rs", "alpha", "pub fn alpha() {}", &[1.0; 384]),
-            sample_chunk(2, "src/util.rs", "beta", "pub fn beta() {}", &[2.0; 384]),
-            sample_chunk(3, "src/util.rs", "gamma", "pub fn gamma() {}", &[3.0; 384]),
+            sample_chunk(
+                1,
+                "src/lib.rs",
+                "alpha",
+                "pub fn alpha() {}",
+                &sample_vector(1.0),
+            ),
+            sample_chunk(
+                2,
+                "src/util.rs",
+                "beta",
+                "pub fn beta() {}",
+                &sample_vector(2.0),
+            ),
+            sample_chunk(
+                3,
+                "src/util.rs",
+                "gamma",
+                "pub fn gamma() {}",
+                &sample_vector(3.0),
+            ),
         ];
         assert!(store.replace_chunks(&chunks, &config).await.is_ok());
 

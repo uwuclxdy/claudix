@@ -82,6 +82,16 @@ pub enum ClaudixError {
         recovery: RecoveryHint,
     },
 
+    #[error(
+        "bundled asset from {url} failed verification: expected sha256 {expected}, got {actual}"
+    )]
+    BundledAssetCorrupt {
+        url: String,
+        expected: String,
+        actual: String,
+        recovery: RecoveryHint,
+    },
+
     #[error("embedding error: {0}")]
     Embedding(String),
 
@@ -133,6 +143,7 @@ impl ClaudixError {
             Self::NotAGitRepository { recovery, .. } => Some(recovery.0),
             Self::PathTraversal { recovery, .. } => Some(recovery.0),
             Self::BundledAssetsMissing { recovery, .. } => Some(recovery.0),
+            Self::BundledAssetCorrupt { recovery, .. } => Some(recovery.0),
             // High-frequency runtime variants: return actionable hints.
             Self::Io(_) => Some(hints::IO_CHECK_DISK),
             Self::Store(_) => Some(hints::STORE_DOCTOR),

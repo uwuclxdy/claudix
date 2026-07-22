@@ -89,8 +89,11 @@ dirs = "6.0.0"
 # Shell-aware tokenisation for hook command parsing
 shell-words = "1.1.1"
 
-# Hashing
+# Hashing. xxh3 for content addressing; sha2 verifies downloaded bundled model
+# assets against their published digests (already in the tree via datafusion, so
+# this is a direct edge on an existing crate, not a new build).
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+sha2 = "0.10.9"
 
 # ONNX inference for bundled embedder
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }

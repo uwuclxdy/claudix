@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use crate::Claudix;
 use crate::config::{self, Config, EmbeddingProvider};
-use crate::embedding::bundled::{BUNDLED_DIMENSIONS, BUNDLED_MODEL_ID};
+use crate::embedding::bundled::bundled_model;
 use crate::embedding::side_channel;
 use crate::error::Result;
 use crate::prompts::hooks::pre_tool_use_search_response;
@@ -173,10 +173,8 @@ fn cold_provider_is_bundled(config: &Config) -> bool {
     }
     match config.embedding.provider {
         EmbeddingProvider::Bundled => true,
-        EmbeddingProvider::Http => {
-            config.embedding.model == BUNDLED_MODEL_ID
-                && Dimension(config.embedding.dimensions) == BUNDLED_DIMENSIONS
-        }
+        EmbeddingProvider::Http => bundled_model(&config.embedding.model)
+            .is_some_and(|model| model.dimensions == Dimension(config.embedding.dimensions)),
     }
 }
 
@@ -213,6 +211,7 @@ mod tests {
 
     use crate::Claudix;
     use crate::config::Config;
+    use crate::embedding::bundled::DEFAULT_BUNDLED_MODEL;
     use crate::hooks::{HookEvent, run};
 
     mod fixture {
@@ -548,8 +547,8 @@ mod tests {
         // passthrough here.
         let mut bundled = stub;
         bundled.embedding.provider = crate::config::EmbeddingProvider::Bundled;
-        bundled.embedding.model = BUNDLED_MODEL_ID.to_owned();
-        bundled.embedding.dimensions = BUNDLED_DIMENSIONS.0;
+        bundled.embedding.model = DEFAULT_BUNDLED_MODEL.id.to_owned();
+        bundled.embedding.dimensions = DEFAULT_BUNDLED_MODEL.dimensions.0;
         write_config(fixture.root(), &bundled);
 
         let payload = json!({
@@ -590,8 +589,8 @@ mod tests {
 
         let mut bundled = stub;
         bundled.embedding.provider = crate::config::EmbeddingProvider::Bundled;
-        bundled.embedding.model = BUNDLED_MODEL_ID.to_owned();
-        bundled.embedding.dimensions = BUNDLED_DIMENSIONS.0;
+        bundled.embedding.model = DEFAULT_BUNDLED_MODEL.id.to_owned();
+        bundled.embedding.dimensions = DEFAULT_BUNDLED_MODEL.dimensions.0;
         write_config(fixture.root(), &bundled);
 
         let payload = json!({

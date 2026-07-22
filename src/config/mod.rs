@@ -107,8 +107,10 @@ impl Default for Config {
             embedding: EmbeddingConfig {
                 provider: EmbeddingProvider::Bundled,
                 endpoint: String::new(),
-                model: "bge-small-en-v1.5".into(),
-                dimensions: 384,
+                model: crate::embedding::bundled::DEFAULT_BUNDLED_MODEL.id.into(),
+                dimensions: crate::embedding::bundled::DEFAULT_BUNDLED_MODEL
+                    .dimensions
+                    .0,
                 batch_size: 32,
                 timeout_ms: 30_000,
             },

@@ -245,8 +245,8 @@ fn default_global_config() -> &'static str {
 
 [embedding]
 # provider = \"bundled\"           # bundled | http
-# model = \"bge-small-en-v1.5\"    # only used by bundled provider
-# dimensions = 384               # must match the model
+# model = \"gte-modernbert-base\"  # bundled: gte-modernbert-base | bge-small-en-v1.5
+# dimensions = 768               # must match the model (gte 768, bge-small 384)
 # endpoint = \"http://localhost:11434\"  # for http provider (LM Studio / Ollama)
 
 [indexing]

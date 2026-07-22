@@ -21,10 +21,8 @@ pub const FIX_CIRRUS_CONFIG: &str = "Fix the config file that CIRRUS_CONFIG poin
 pub const PROJECT_RELATIVE_PATH: &str =
     "Set the path to a project-relative value such as .claudix/index";
 pub const SET_ENDPOINT: &str = "Set [embedding].endpoint or switch provider to bundled";
-pub const SET_MODEL_BUNDLED: &str =
-    "Set [embedding].model = \"bge-small-en-v1.5\" for the bundled provider";
-pub const BUNDLED_DIMENSIONS_384: &str =
-    "Set [embedding].dimensions = 384 for the bundled provider";
+pub const SET_MODEL_BUNDLED: &str = "Set [embedding].model to a bundled model id: \"gte-modernbert-base\" (768 dims) or \"bge-small-en-v1.5\" (384 dims)";
+pub const BUNDLED_DIMENSIONS: &str = "Set [embedding].dimensions to what the chosen bundled model publishes: 768 for gte-modernbert-base, 384 for bge-small-en-v1.5";
 pub const SET_DIMENSIONS_POSITIVE: &str = "Set [embedding].dimensions to a positive integer";
 pub const SET_BATCH_SIZE: &str = "Set [embedding].batch_size to a positive integer";
 pub const SET_TIMEOUT_MS: &str = "Set [embedding].timeout_ms to a positive integer";
@@ -62,8 +60,9 @@ pub const SET_ENDPOINT_URL: &str = "Set [embedding].endpoint to the base URL for
 pub const REBUILD_INDEX_DIMENSIONS: &str =
     "Rebuild the index with the configured embedding dimensions or fix the endpoint model";
 pub const DOWNLOAD_BUNDLED_ASSETS: &str = "Run claudix again after restoring network access, or switch to [embedding] provider = \"http\"";
-pub const BUNDLED_HIDDEN_STATES_384: &str =
-    "Use the bundled bge-small-en-v1.5 export with 384-dimensional hidden states";
+pub const BUNDLED_HIDDEN_STATES: &str =
+    "Use a bundled ONNX export whose hidden-state width matches [embedding].dimensions";
+pub const BUNDLED_ASSET_CORRUPT: &str = "The downloaded model asset did not match its published checksum; retry, and if it repeats check for a proxy rewriting downloads or switch to [embedding] provider = \"http\"";
 
 // --- store --------------------------------------------------------------
 pub const REINDEX_SCHEMA_VERSION: &str =

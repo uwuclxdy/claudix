@@ -27,7 +27,7 @@ use chunking::MultiLanguageChunker;
 use config::{Config, EmbeddingProvider};
 #[cfg(any(test, feature = "test-stub"))]
 use embedding::StubProvider;
-use embedding::bundled::{BUNDLED_DIMENSIONS, BUNDLED_MODEL_ID};
+use embedding::bundled::bundled_model;
 use embedding::{BundledProvider, FallbackProvider, HttpProvider, Provider};
 use enumeration::{EnumeratedFile, FileEnumerator, PathFilters, WatchFilter};
 use error::RecoveryHint;
@@ -671,7 +671,9 @@ pub(crate) async fn build_provider(config: &Config) -> Result<Arc<dyn Provider>>
                 Duration::from_millis(config.embedding.timeout_ms),
                 None,
             )?) as Arc<dyn Provider>;
-            if config.embedding.model == BUNDLED_MODEL_ID && dimensions == BUNDLED_DIMENSIONS {
+            if bundled_model(&config.embedding.model)
+                .is_some_and(|model| model.dimensions == dimensions)
+            {
                 let fallback = Arc::new(
                     BundledProvider::new(config.embedding.model.clone(), dimensions).await?,
                 ) as Arc<dyn Provider>;
