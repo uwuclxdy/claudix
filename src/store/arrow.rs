@@ -189,7 +189,45 @@ fn batches_to_metadata_rows(batches: Vec<RecordBatch>) -> Result<Vec<ChunkMetada
     Ok(rows)
 }
 
+/// Projected read that fetches every column except `content`.
+///
+/// The corpus-floor pass scores vectors and never touches the chunk text, which
+/// is the column that makes a full read scale with the size of the source tree.
+/// The omitted field comes back as an empty string.
+pub(super) async fn read_rows_without_content(table: &Table) -> Result<Vec<StoredChunk>> {
+    let columns = [
+        FIELD_CHUNK_ID,
+        FIELD_FILE_PATH,
+        FIELD_LANGUAGE,
+        FIELD_KIND,
+        FIELD_NAME,
+        FIELD_LINE_START,
+        FIELD_LINE_END,
+        FIELD_BYTE_START,
+        FIELD_BYTE_END,
+        FIELD_FILE_HASH,
+        FIELD_VECTOR,
+    ]
+    .map(str::to_owned)
+    .to_vec();
+
+    let batches = table
+        .query()
+        .select(lancedb::query::Select::Columns(columns))
+        .limit(i64::MAX as usize)
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    rows_from_batches(batches, false)
+}
+
 pub(super) fn batches_to_rows(batches: Vec<RecordBatch>) -> Result<Vec<StoredChunk>> {
+    rows_from_batches(batches, true)
+}
+
+fn rows_from_batches(batches: Vec<RecordBatch>, with_content: bool) -> Result<Vec<StoredChunk>> {
     let mut rows = Vec::new();
 
     for batch in batches {
@@ -197,6 +235,11 @@ pub(super) fn batches_to_rows(batches: Vec<RecordBatch>) -> Result<Vec<StoredChu
         for row_index in 0..batch.num_rows() {
             let vector = read_vector(&batch, row_index)?;
             validate_vector(&vector, dimension)?;
+            let content = if with_content {
+                read_string(&batch, FIELD_CONTENT, row_index)?
+            } else {
+                String::new()
+            };
             rows.push(StoredChunk {
                 chunk_id: read_u64(&batch, FIELD_CHUNK_ID, row_index)?,
                 file_path: read_string(&batch, FIELD_FILE_PATH, row_index)?,
@@ -208,7 +251,7 @@ pub(super) fn batches_to_rows(batches: Vec<RecordBatch>) -> Result<Vec<StoredChu
                 byte_start: read_u32(&batch, FIELD_BYTE_START, row_index)?,
                 byte_end: read_u32(&batch, FIELD_BYTE_END, row_index)?,
                 file_hash: read_file_hash(&batch, row_index)?,
-                content: read_string(&batch, FIELD_CONTENT, row_index)?,
+                content,
                 vector,
             });
         }

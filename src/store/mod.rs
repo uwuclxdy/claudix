@@ -26,7 +26,8 @@ use crate::util::now_rfc3339;
 use crate::{IndexFileStatus, IndexProgress};
 
 use arrow::{
-    chunk_schema, read_all_rows, read_metadata_rows, read_rows_matching, record_batch_from_rows,
+    chunk_schema, read_all_rows, read_metadata_rows, read_rows_matching, read_rows_without_content,
+    record_batch_from_rows,
 };
 
 pub(crate) use chunk_row::stored_chunks_from_embedded;
@@ -37,6 +38,11 @@ pub use manifest::{Manifest, SCHEMA_VERSION};
 const GITIGNORE_FILE_NAME: &str = ".gitignore";
 const GITIGNORE_CONTENTS: &str = "*\n";
 const CHUNKS_TABLE_NAME: &str = "chunks";
+
+/// Paths per `file_path IN (…)` delete predicate. A full reindex can name every
+/// stored file, and one predicate that long is a needless risk when the deletes
+/// are independent anyway.
+const DELETE_PATH_BATCH: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorePaths {
@@ -226,11 +232,18 @@ impl Store {
     /// Returns `true` when the on-disk chunks table actually holds the row
     /// count the manifest claims, or when the manifest claims zero rows.
     ///
-    /// A process crash between `drop_table` and `add` in `persist_rows` leaves
-    /// the table missing/empty while the manifest still records the previous
-    /// run's full `file_hashes` + `chunk_count`.  The manifest-first fast path
-    /// in `index_full` must check this before early-exiting, or a corrupted
-    /// store permanently blinds search until a manual `force` / `clear`.
+    /// A crash during the index write leaves the table holding fewer rows than
+    /// the manifest — which still records the previous run's `file_hashes` +
+    /// `chunk_count`, because the manifest is written only once every row has
+    /// landed. The manifest-first fast path in `index_full` must check this
+    /// before early-exiting, or a corrupted store permanently blinds search
+    /// until a manual `force` / `clear`.
+    ///
+    /// The comparison is exact rather than a mere non-empty test. `index_full`
+    /// streams its rows in windows, each its own append, so a crash can leave
+    /// the table *partially* filled — a state a `> 0` check reads as healthy.
+    /// Every completed write path sets `chunk_count` from a scan of what
+    /// actually landed, so equality holds whenever the store is consistent.
     ///
     /// The check is cheap: a single `count_rows` call with no vector
     /// deserialization.  It runs once at the start of every `index_full`
@@ -248,12 +261,17 @@ impl Store {
             return Ok(true);
         }
 
+        let actual = self.count_chunk_rows().await?;
+        Ok(u64::try_from(actual).unwrap_or(u64::MAX) == manifest_count)
+    }
+
+    /// Live row count of the chunks table, or zero when it does not exist.
+    /// Scalar-only — no vector deserialization.
+    pub async fn count_chunk_rows(&self) -> Result<usize> {
         let Some(table) = self.open_chunks_table().await? else {
-            // Table missing but manifest says we have rows — corrupted.
-            return Ok(false);
+            return Ok(0);
         };
-        let actual = table.count_rows(None).await.map_err(ClaudixError::from)?;
-        Ok(actual > 0)
+        table.count_rows(None).await.map_err(ClaudixError::from)
     }
 
     pub async fn read_chunks(&self) -> Result<Vec<StoredChunk>> {
@@ -285,6 +303,26 @@ impl Store {
         Ok(rows)
     }
 
+    /// Every row with its vector but no chunk text.
+    ///
+    /// The corpus-floor pass scores vectors and never reads `content`, so
+    /// projecting that column away keeps the read proportional to the embedding
+    /// width instead of to the size of the source tree. Rows come back in table
+    /// order: the floor groups by file and sorts within each group itself, and
+    /// the per-file best score it consumes is a max, so nothing downstream
+    /// depends on a global order.
+    ///
+    /// **`content` comes back empty, not absent.** Deliberately `pub(crate)` and
+    /// kept to that one caller: anything that scores or ranks on chunk text
+    /// (BM25 in `search`) would silently degrade rather than fail if handed
+    /// these rows. Reach for [`Self::read_chunks`] unless you only need vectors.
+    pub(crate) async fn read_chunks_without_content(&self) -> Result<Vec<StoredChunk>> {
+        let Some(table) = self.open_chunks_table().await? else {
+            return Ok(Vec::new());
+        };
+        read_rows_without_content(&table).await
+    }
+
     /// Projected read that returns only lightweight scalar metadata, omitting
     /// embedding vectors. Use this when callers only need `file_path`,
     /// `file_hash`, `language`, or `name` — avoids loading large float arrays.
@@ -306,22 +344,30 @@ impl Store {
         Ok((hash, stats))
     }
 
+    /// Split the enumerated files into those needing a re-embed and report which
+    /// paths the table already holds rows for.
+    ///
+    /// Reads metadata only. Rows for unchanged files stay on disk and are never
+    /// materialized: the caller deletes the stale paths and appends replacements
+    /// rather than rewriting the table, so loading the untouched majority would
+    /// be pure cost. `stored_row_paths` comes from the actual rows rather than
+    /// the manifest, because the caller uses it to decide what to delete and
+    /// whether anything in the table is worth preserving at all.
     pub async fn incremental_file_state(
         &self,
         current_files: &[(String, [u8; 16])],
         force_recheck: &HashSet<String>,
         progress: &mut dyn IndexProgress,
-    ) -> Result<(HashSet<String>, Vec<StoredChunk>)> {
+    ) -> Result<(HashSet<String>, HashSet<String>)> {
         // Use the projected metadata read to build the hash map — no vectors needed here.
         let metadata = self.read_chunk_metadata().await?;
         let stored_file_hashes = self.stored_file_hashes_from_metadata(&metadata)?;
         let stored_path_set: HashSet<&str> =
             stored_file_hashes.keys().map(String::as_str).collect();
-
-        // Full rows are still required for the unchanged_rows output (callers
-        // pass them straight into persist_incremental), so we load them after
-        // the cheap hash-comparison pass.
-        let stored_rows = self.read_chunks().await?;
+        let stored_row_paths: HashSet<String> = metadata
+            .iter()
+            .map(|entry| entry.file_path.clone())
+            .collect();
 
         let mut changed_paths: HashSet<String> = HashSet::new();
         for (path, hash) in current_files {
@@ -344,18 +390,7 @@ impl Store {
             }
         }
 
-        let current_path_set: HashSet<&str> =
-            current_files.iter().map(|(p, _)| p.as_str()).collect();
-
-        let unchanged_rows = stored_rows
-            .into_iter()
-            .filter(|row| {
-                current_path_set.contains(row.file_path.as_str())
-                    && !changed_paths.contains(&row.file_path)
-            })
-            .collect();
-
-        Ok((changed_paths, unchanged_rows))
+        Ok((changed_paths, stored_row_paths))
     }
 
     /// Subset of `force_included` whose files have no stored chunk rows.
@@ -429,7 +464,7 @@ impl Store {
     /// hashes) under the active embedding model.
     ///
     /// Returns `Some(stats)` if the fast path applied; `None` if the caller
-    /// must fall through to [`Self::persist_incremental`].
+    /// must fall through to a real indexing pass.
     pub fn touch_manifest_if_in_sync(
         &self,
         current_files: &[(String, [u8; 16])],
@@ -464,23 +499,21 @@ impl Store {
         Ok(Some(stats))
     }
 
-    pub async fn persist_incremental(
+    /// Record the manifest for a completed full index.
+    ///
+    /// Stats come from a projected scan of what actually landed rather than from
+    /// a count the caller carried, so the manifest can only ever claim rows the
+    /// table holds — the invariant the row-count gate checks on the next run.
+    /// `file_hashes` covers every enumerated file, including those that produced
+    /// no chunks, so an unindexable file is not re-read on each pass.
+    pub async fn sync_full_index_manifest(
         &self,
-        new_chunks: &[EmbeddedChunk],
-        unchanged_rows: Vec<StoredChunk>,
         config: &Config,
         current_files: &[(String, [u8; 16])],
     ) -> Result<StoreStats> {
-        let dimension = Dimension(config.embedding.dimensions);
-        let new_rows = stored_chunks_from_embedded(new_chunks, dimension)?;
-
-        let mut merged_rows = unchanged_rows;
-        merged_rows.extend(new_rows);
-        sort_rows(&mut merged_rows);
-
-        let stats = stats_from_rows(&merged_rows);
+        let metadata = self.read_chunk_metadata().await?;
+        let stats = stats_from_metadata(&metadata);
         let file_hashes = current_files.iter().cloned().collect();
-        self.persist_rows(merged_rows, dimension).await?;
         self.sync_manifest_with_timestamp(config, &stats, file_hashes, true)?;
         Ok(stats)
     }
@@ -661,59 +694,51 @@ impl Store {
         new_rows: Vec<StoredChunk>,
         dimension: Dimension,
     ) -> Result<()> {
-        use arrow_array::{RecordBatchIterator, RecordBatchReader};
+        self.delete_paths(paths, dimension).await?;
+        self.append_rows(new_rows, dimension).await
+    }
 
-        self.ensure_layout()?;
-        let connection = self.open_connection().await?;
-        let table = if self.chunks_table_exists(&connection).await? {
-            connection
-                .open_table(CHUNKS_TABLE_NAME)
-                .execute()
-                .await
-                .map_err(ClaudixError::from)?
-        } else {
-            connection
-                .create_empty_table(CHUNKS_TABLE_NAME, chunk_schema(dimension))
-                .execute()
-                .await?
-        };
+    /// Drop every row whose `file_path` is in `paths`, leaving the rest of the
+    /// table untouched.
+    ///
+    /// The predicate is issued in batches: a full reindex names every stored
+    /// file, and the deletes are independent, so bounding the predicate length
+    /// costs nothing but a loop.
+    pub(crate) async fn delete_paths(
+        &self,
+        paths: &BTreeSet<String>,
+        dimension: Dimension,
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let table = self.open_or_create_chunks_table(dimension).await?;
 
-        if !paths.is_empty() {
-            let literals: Vec<String> = paths.iter().map(|p| sql_string_literal(p)).collect();
+        let ordered: Vec<&String> = paths.iter().collect();
+        for batch in ordered.chunks(DELETE_PATH_BATCH) {
+            let literals: Vec<String> = batch.iter().map(|p| sql_string_literal(p)).collect();
             let predicate = format!("file_path IN ({})", literals.join(", "));
             table.delete(&predicate).await?;
         }
-
-        if new_rows.is_empty() {
-            return Ok(());
-        }
-        let batch = record_batch_from_rows(&new_rows, dimension)?;
-        let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
-            vec![Ok(batch)],
-            chunk_schema(dimension),
-        ));
-        table.add(reader).execute().await?;
         Ok(())
     }
 
-    async fn persist_rows(&self, rows: Vec<StoredChunk>, dimension: Dimension) -> Result<()> {
+    /// Append rows to the chunks table without disturbing what is already there.
+    ///
+    /// This is the write the streaming index is built on: each window commits on
+    /// its own, so nothing ever holds the corpus. Rows land in insertion order —
+    /// every reader sorts what it reads.
+    pub(crate) async fn append_rows(
+        &self,
+        rows: Vec<StoredChunk>,
+        dimension: Dimension,
+    ) -> Result<()> {
         use arrow_array::{RecordBatchIterator, RecordBatchReader};
-
-        self.ensure_layout()?;
-        let connection = self.open_connection().await?;
-
-        if self.chunks_table_exists(&connection).await? {
-            connection.drop_table(CHUNKS_TABLE_NAME, &[]).await?;
-        }
-
-        let table = connection
-            .create_empty_table(CHUNKS_TABLE_NAME, chunk_schema(dimension))
-            .execute()
-            .await?;
 
         if rows.is_empty() {
             return Ok(());
         }
+        let table = self.open_or_create_chunks_table(dimension).await?;
 
         let batch = record_batch_from_rows(&rows, dimension)?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
@@ -722,6 +747,47 @@ impl Store {
         ));
         table.add(reader).execute().await?;
         Ok(())
+    }
+
+    /// Drop the chunks table and recreate it empty.
+    ///
+    /// The reset a full rebuild takes when no stored row survives the pass:
+    /// cheaper than a delete predicate naming every file, and it reclaims the
+    /// space instead of tombstoning it.
+    pub(crate) async fn reset_chunks_table(&self, dimension: Dimension) -> Result<()> {
+        self.ensure_layout()?;
+        let connection = self.open_connection().await?;
+        if self.chunks_table_exists(&connection).await? {
+            connection.drop_table(CHUNKS_TABLE_NAME, &[]).await?;
+        }
+        connection
+            .create_empty_table(CHUNKS_TABLE_NAME, chunk_schema(dimension))
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    async fn open_or_create_chunks_table(&self, dimension: Dimension) -> Result<Table> {
+        self.ensure_layout()?;
+        let connection = self.open_connection().await?;
+        if self.chunks_table_exists(&connection).await? {
+            return connection
+                .open_table(CHUNKS_TABLE_NAME)
+                .execute()
+                .await
+                .map_err(ClaudixError::from);
+        }
+        connection
+            .create_empty_table(CHUNKS_TABLE_NAME, chunk_schema(dimension))
+            .execute()
+            .await
+            .map_err(ClaudixError::from)
+    }
+
+    #[cfg(test)]
+    async fn persist_rows(&self, rows: Vec<StoredChunk>, dimension: Dimension) -> Result<()> {
+        self.reset_chunks_table(dimension).await?;
+        self.append_rows(rows, dimension).await
     }
 
     async fn open_connection(&self) -> Result<Connection> {
@@ -820,8 +886,8 @@ impl Store {
         }
 
         // Guard: if the manifest claims chunk rows exist but the metadata read
-        // from the actual table is empty, the table was truncated or deleted
-        // mid-rewrite (crash between `drop_table` and `add` in `persist_rows`).
+        // from the actual table is empty, the table was truncated or deleted by
+        // a crash during an index write.
         // Trusting the manifest hashes here would mark every file "Verified"
         // and produce zero changed_paths, so the rebuild loop never re-embeds
         // anything.  Fall back to deriving hashes from the actual rows (empty
@@ -1914,6 +1980,41 @@ mod tests {
         Ok(())
     }
 
+    /// The state a crash mid-stream leaves: the table holds some of the rows,
+    /// the manifest still claims the count from before the pass. A non-empty
+    /// check reads that as healthy and lets the fast path early-exit on a
+    /// half-written index, so the gate compares counts exactly.
+    #[tokio::test]
+    async fn partial_table_fails_the_row_count_gate() -> Result<()> {
+        let project_root = tempdir()?;
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config)?;
+
+        let chunks = vec![
+            sample_chunk(1, "src/a.rs", "fn_a", "fn a() {}", &sample_vector(1.0)),
+            sample_chunk(2, "src/b.rs", "fn_b", "fn b() {}", &sample_vector(2.0)),
+        ];
+        store.replace_chunks(&chunks, &config).await?;
+        assert!(
+            store.table_matches_manifest_chunk_count().await?,
+            "a consistent store must pass the gate"
+        );
+
+        // Drop one file's rows without touching the manifest, leaving the table
+        // short of what the manifest records.
+        let dimension = Dimension(config.embedding.dimensions);
+        store
+            .delete_paths(&BTreeSet::from(["src/b.rs".to_owned()]), dimension)
+            .await?;
+
+        assert_eq!(store.count_chunk_rows().await?, 1);
+        assert!(
+            !store.table_matches_manifest_chunk_count().await?,
+            "a table holding fewer rows than the manifest claims must fail the gate"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn incremental_file_state_splits_changed_and_unchanged() -> Result<()> {
         let project_root = tempdir()?;
@@ -1933,7 +2034,7 @@ mod tests {
             ("src/b.rs".to_owned(), [9u8; 16]),
         ];
 
-        let (changed_paths, unchanged_rows) = store
+        let (changed_paths, stored_row_paths) = store
             .incremental_file_state(&current_files, &HashSet::new(), &mut ())
             .await?;
 
@@ -1945,8 +2046,13 @@ mod tests {
             changed_paths.contains("src/b.rs"),
             "changed file must be in changed_paths"
         );
-        assert_eq!(unchanged_rows.len(), 1);
-        assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
+        // Both files hold rows. The caller subtracts changed_paths from this to
+        // learn that a.rs is worth preserving, which is what keeps a full table
+        // rewrite off the incremental path.
+        assert_eq!(
+            stored_row_paths,
+            HashSet::from(["src/a.rs".to_owned(), "src/b.rs".to_owned()])
+        );
         Ok(())
     }
 
@@ -1964,17 +2070,24 @@ mod tests {
         store.write_manifest(&manifest)?;
 
         let current_files = vec![("src/empty.rs".to_owned(), [7u8; 16])];
-        let (changed_paths, unchanged_rows) = store
+        let (changed_paths, stored_row_paths) = store
             .incremental_file_state(&current_files, &HashSet::new(), &mut ())
             .await?;
 
         assert!(changed_paths.is_empty());
-        assert!(unchanged_rows.is_empty());
+        // Tracked by the manifest but holding no rows, so it is not a path the
+        // caller has anything to delete for.
+        assert!(stored_row_paths.is_empty());
         Ok(())
     }
 
+    /// A file that vanished from the enumeration still holds rows, and the
+    /// caller only learns to delete them from `stored_row_paths`. The whole-table
+    /// rewrite this replaced dropped such rows implicitly by never carrying them
+    /// forward; reporting the path is what keeps that pruning working now that
+    /// untouched rows stay in place.
     #[tokio::test]
-    async fn incremental_file_state_drops_deleted_files() -> Result<()> {
+    async fn incremental_file_state_reports_stored_path_absent_from_current() -> Result<()> {
         let project_root = tempdir()?;
         let config = Config::default();
         let store = Store::new(project_root.path(), &config)?;
@@ -1988,13 +2101,16 @@ mod tests {
         // b.rs is not present in current_files (deleted)
         let current_files = vec![("src/a.rs".to_owned(), [1u8; 16])];
 
-        let (changed_paths, unchanged_rows) = store
+        let (changed_paths, stored_row_paths) = store
             .incremental_file_state(&current_files, &HashSet::new(), &mut ())
             .await?;
 
         assert!(changed_paths.is_empty());
-        assert_eq!(unchanged_rows.len(), 1);
-        assert_eq!(unchanged_rows[0].file_path, "src/a.rs");
+        assert!(
+            stored_row_paths.contains("src/b.rs"),
+            "a stored path missing from current_files must still be reported so its rows can be deleted"
+        );
+        assert!(stored_row_paths.contains("src/a.rs"));
         Ok(())
     }
 

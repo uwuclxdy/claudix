@@ -18,7 +18,7 @@ pub use types::{
     RelativePath,
 };
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -58,6 +58,84 @@ pub enum IndexFileStatus {
     Indexed,
     Verified,
     Skipped(&'static str),
+}
+
+/// Bounds on how much of the corpus [`Claudix::index_full`] holds at once.
+///
+/// Chunks accumulate until either bound trips, then the window is embedded,
+/// converted to rows, appended, and dropped — so peak memory tracks the window
+/// rather than the repository. Both bounds carry weight: bytes cap the chunk
+/// text, and the chunk count caps the vectors the embed pass returns, which at
+/// 4096 dimensions outweigh the text they came from.
+///
+/// These are thresholds tested at file boundaries, not hard ceilings. A window
+/// takes whole files only, so it overshoots by at most one file's chunks. That
+/// is a small multiple of `indexing.max_file_size_kb` rather than one times it:
+/// a container chunk (impl, class, inline mod) re-covers the bytes of every
+/// item inside it, so a file's chunk text runs past its size on disk. Splitting a file across two
+/// windows would be cheaper, and is wrong: each window commits separately, so a
+/// failure between two of them would leave that file holding part of its chunks
+/// under its current content hash, which a rebuild with no manifest hashes
+/// reads back as already current and never re-chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowCaps {
+    pub max_chunks: usize,
+    pub max_content_bytes: usize,
+}
+
+impl Default for WindowCaps {
+    fn default() -> Self {
+        Self {
+            max_chunks: 2_000,
+            max_content_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+impl WindowCaps {
+    /// True once the accumulated window has reached either threshold.
+    fn is_full(self, window: &Window<'_>) -> bool {
+        window.chunks.len() >= self.max_chunks || window.content_bytes >= self.max_content_bytes
+    }
+}
+
+/// One streaming window: the chunks awaiting embed, the files they came from,
+/// and the text bytes accumulated so far.
+///
+/// The three move together or not at all. Draining the chunks while leaving the
+/// byte count standing would flush every later window after a single file, and
+/// nothing downstream would notice — so [`Window::take`] owns the reset rather
+/// than each call site remembering it.
+#[derive(Default)]
+struct Window<'a> {
+    chunks: Vec<Chunk>,
+    files: Vec<&'a RelativePath>,
+    content_bytes: usize,
+}
+
+impl<'a> Window<'a> {
+    /// Add one file's chunks whole. A window never holds part of a file.
+    fn push_file(&mut self, path: &'a RelativePath, chunks: Vec<Chunk>) {
+        self.content_bytes += chunks
+            .iter()
+            .map(|chunk| chunk.content.len())
+            .sum::<usize>();
+        self.chunks.extend(chunks);
+        self.files.push(path);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    /// Take the contents, leaving the window empty and its byte count reset.
+    fn take(&mut self) -> (Vec<Chunk>, Vec<&'a RelativePath>) {
+        self.content_bytes = 0;
+        (
+            std::mem::take(&mut self.chunks),
+            std::mem::take(&mut self.files),
+        )
+    }
 }
 
 pub trait IndexProgress {
@@ -121,6 +199,17 @@ impl Claudix {
     }
 
     pub async fn index_full(&self, progress: &mut dyn IndexProgress) -> Result<IndexStats> {
+        self.index_full_with_window(progress, WindowCaps::default())
+            .await
+    }
+
+    /// [`Self::index_full`] with the streaming window bounds injected, so a test
+    /// can force a window small enough to observe the flush cadence.
+    pub(crate) async fn index_full_with_window(
+        &self,
+        progress: &mut dyn IndexProgress,
+        caps: WindowCaps,
+    ) -> Result<IndexStats> {
         let enumerator =
             FileEnumerator::new(self.project_root.clone(), self.config.as_ref().clone())?;
         let files = enumerator.enumerate(&mut *progress)?;
@@ -148,12 +237,11 @@ impl Claudix {
             .await?;
 
         // Check once whether the on-disk chunks table actually holds the rows
-        // the manifest claims.  A crash between `drop_table` and `add` in
-        // `persist_rows` leaves the table missing/empty while the manifest
-        // still records the previous run's full file_hashes + chunk_count.
-        // Both fast paths below guard on this result so that neither can
-        // early-exit when the table is corrupt, permanently blinding search
-        // until a manual `force` / `clear`.
+        // the manifest claims.  A crash partway through the windowed write
+        // leaves the table short while the manifest still records the previous
+        // run's full file_hashes + chunk_count.  Both fast paths below guard on
+        // this result so that neither can early-exit on a half-written table,
+        // permanently blinding search until a manual `force` / `clear`.
         let table_matches = self.store.table_matches_manifest_chunk_count().await?;
 
         // Fast path: if the manifest already lists exactly these files with the
@@ -175,7 +263,7 @@ impl Claudix {
             });
         }
 
-        let (changed_paths, unchanged_rows) = self
+        let (changed_paths, stored_row_paths) = self
             .store
             .incremental_file_state(&current_files, &force_recheck, &mut *progress)
             .await?;
@@ -192,15 +280,43 @@ impl Claudix {
             });
         }
 
-        let mut rows = unchanged_rows;
+        let dimension = Dimension(self.config.embedding.dimensions);
+        let current_path_set: HashSet<&str> =
+            current_files.iter().map(|(p, _)| p.as_str()).collect();
 
-        // Collect chunks for all changed files before embedding so the provider
-        // can batch across file boundaries — 10 files × 8 chunks → 1 round-trip
-        // at batch_size=32 instead of 10 serial round-trips.  Vectors for all
-        // changed files are held in memory simultaneously; acceptable because the
-        // total size is bounded by the number of changed chunks × dimension size.
-        let mut file_chunk_counts: Vec<(&EnumeratedFile, usize)> = Vec::new();
-        let mut all_chunks: Vec<Chunk> = Vec::new();
+        // Rows that must not survive this pass: every changed file's previous
+        // chunks, plus every stored file the enumeration no longer yields —
+        // deleted on disk, or newly excluded by a rule change. The whole-table
+        // rewrite this replaced dropped the latter implicitly by never carrying
+        // them over, so they need naming now that untouched rows stay put.
+        let mut stale_paths: BTreeSet<String> = changed_paths.iter().cloned().collect();
+        stale_paths.extend(
+            stored_row_paths
+                .iter()
+                .filter(|path| !current_path_set.contains(path.as_str()))
+                .cloned(),
+        );
+
+        let preserves_rows = stored_row_paths
+            .iter()
+            .any(|path| current_path_set.contains(path.as_str()) && !changed_paths.contains(path));
+        if preserves_rows {
+            self.store.delete_paths(&stale_paths, dimension).await?;
+        } else {
+            // Nothing already stored survives, so resetting beats a delete
+            // predicate that would name every file in the repository.
+            self.store.reset_chunks_table(dimension).await?;
+        }
+
+        // Embed and write in bounded windows. Chunks accumulate only until a cap
+        // trips, at which point the window is embedded, appended, and dropped —
+        // so peak memory tracks `caps`, not the size of the repository. Windows
+        // still span file boundaries, which is what made a single flat embed
+        // pass worth having: 10 files x 8 chunks stays one round-trip rather
+        // than ten. Each window commits on its own; the manifest is written only
+        // once every window has landed, so a crash leaves the table short of
+        // what the manifest claims and the row-count gate forces a rebuild.
+        let mut window = Window::default();
 
         for file in files
             .iter()
@@ -214,41 +330,28 @@ impl Claudix {
                 )?;
                 continue;
             }
-            file_chunk_counts.push((file, chunks.len()));
-            all_chunks.extend(chunks);
+
+            window.push_file(&file.relative_path, chunks);
+            if caps.is_full(&window) {
+                self.flush_window(&mut window, dimension, &mut *progress)
+                    .await?;
+            }
         }
-
-        // Single cross-file embed call; provider's batch_size governs request sizes.
-        let all_embedded = self.embed_chunks(all_chunks).await?;
-
-        // Partition embedded results back per file in original order and write rows.
-        let mut offset = 0;
-        for (file, count) in file_chunk_counts {
-            let embedded_chunks = &all_embedded[offset..offset + count];
-            offset += count;
-
-            rows.retain(|row| row.file_path != file.relative_path.as_str());
-            rows.extend(stored_chunks_from_embedded(
-                embedded_chunks,
-                Dimension(self.config.embedding.dimensions),
-            )?);
-            progress.file(&file.relative_path, IndexFileStatus::Indexed)?;
-        }
-
-        // Derive the corpus-relative similarity floor from the whole corpus.
-        // `corpus_similarity_floor` is total: it only reads vectors and returns
-        // `None` when the corpus is too small or, bounded by MAX_CHUNKS_FOR_FLOOR,
-        // too large. So computing it here can neither fail the index nor cost the
-        // embed pass, and it clones only the sampled seeds, not the corpus.
-        // Deliberately not on `spawn_blocking`: moving `rows` into a task would
-        // tie the corpus's fate to an optional stat, and re-reading it afterward
-        // would double every vector in memory.
-        let similarity_floor = search::corpus_similarity_floor(&rows, search::FLOOR_PERCENTILE);
+        self.flush_window(&mut window, dimension, &mut *progress)
+            .await?;
 
         let stats = self
             .store
-            .persist_incremental(&[], rows, self.config.as_ref(), &current_files)
+            .sync_full_index_manifest(self.config.as_ref(), &current_files)
             .await?;
+
+        // Derive the corpus-relative similarity floor by reading the vectors
+        // back. Streaming leaves no corpus in memory to derive it from, and the
+        // read is content-free, so it costs the embedding width rather than the
+        // size of the source tree. Total by construction: a failed read or a
+        // corpus outside the estimable range leaves the floor unset instead of
+        // failing an index whose rows are already stored.
+        let similarity_floor = self.corpus_floor_from_store().await;
         // Best-effort, after the corpus it describes is persisted. A stale floor
         // is overwritten even when this is `None`, so a corpus that shrank below
         // the estimate threshold clears its floor. A write failure leaves the
@@ -606,6 +709,90 @@ impl Claudix {
         .map_err(|error| ClaudixError::TreeSitter(error.to_string()))?
     }
 
+    /// Embed one streaming window, append its rows, and only then report the
+    /// files it carried as indexed — so a run that dies on a later window has
+    /// never claimed a file whose rows did not land.
+    ///
+    /// Empties both buffers, so the caller can flush unconditionally at the end
+    /// of the stream.
+    async fn flush_window(
+        &self,
+        window: &mut Window<'_>,
+        dimension: Dimension,
+        progress: &mut dyn IndexProgress,
+    ) -> Result<()> {
+        if window.is_empty() {
+            debug_assert!(
+                window.files.is_empty(),
+                "a window with no chunks cannot owe a file an indexed report"
+            );
+            return Ok(());
+        }
+
+        let (chunks, files) = window.take();
+        let embedded = self.embed_chunks(chunks).await?;
+        let rows = stored_chunks_from_embedded(&embedded, dimension)?;
+        drop(embedded);
+        self.store.append_rows(rows, dimension).await?;
+
+        // Best-effort, and deliberately not `?`: these rows are committed, so a
+        // failing progress writer (a closed pipe under `claudix index | head`)
+        // would otherwise discard a good index over a display write. Same stance
+        // as the floor write below.
+        for path in files {
+            if let Err(error) = progress.file(path, IndexFileStatus::Indexed) {
+                tracing::warn!("could not report {} as indexed: {error}", path.as_str());
+            }
+        }
+        Ok(())
+    }
+
+    /// The corpus-relative similarity floor, read back from the store.
+    ///
+    /// Gated twice before reading anything: on the estimator's own chunk ceiling,
+    /// and on the vector bytes the read would materialize. Returns `None` on any
+    /// read failure — the floor is an optional stat and consumers fall open to
+    /// the configured one — but never silently: a failure here is a store
+    /// problem worth seeing, and must not look like "corpus too small".
+    async fn corpus_floor_from_store(&self) -> Option<f32> {
+        let chunk_count = match self.store.count_chunk_rows().await {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!("could not count rows for the corpus similarity floor: {error}");
+                return None;
+            }
+        };
+        if chunk_count == 0 || chunk_count > search::MAX_CHUNKS_FOR_FLOOR {
+            return None;
+        }
+
+        // MAX_CHUNKS_FOR_FLOOR bounds the scan's CPU cost, not its memory: at
+        // 4096 dimensions its 100k rows are 1.6 GB of vectors. This read is
+        // still the high-water mark of an index whose windows peak near 50 MB;
+        // the budget caps how far above them it can go, it does not move the
+        // peak back to the window.
+        let vector_bytes = chunk_count
+            .saturating_mul(usize::from(self.config.embedding.dimensions))
+            .saturating_mul(size_of::<f32>());
+        if vector_bytes > MAX_FLOOR_VECTOR_BYTES {
+            tracing::debug!(
+                "skipping the corpus similarity floor: {chunk_count} rows at \
+                 {} dimensions would read back {vector_bytes} bytes of vectors",
+                self.config.embedding.dimensions
+            );
+            return None;
+        }
+
+        let rows = match self.store.read_chunks_without_content().await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!("could not read vectors for the corpus similarity floor: {error}");
+                return None;
+            }
+        };
+        search::corpus_similarity_floor(&rows, search::FLOOR_PERCENTILE)
+    }
+
     async fn embed_chunks(&self, chunks: Vec<Chunk>) -> Result<Vec<EmbeddedChunk>> {
         let mut embedded_chunks = Vec::with_capacity(chunks.len());
         let batch_size = self.config.embedding.batch_size;
@@ -665,6 +852,15 @@ impl Claudix {
 /// marker needs a ranked tail to fall through to. Re-derive it with the
 /// hint-distribution harness rather than editing it against intuition.
 pub(crate) const NEIGHBOR_CANDIDATE_DEPTH: usize = 5;
+
+/// Ceiling on the vector bytes the corpus-floor readback may materialize.
+///
+/// `MAX_CHUNKS_FOR_FLOOR` was sized against the scan's O(seeds x rows) cost, so
+/// it says nothing about memory: 100k rows at 4096 dimensions is 1.6 GB of
+/// vectors. Sized so the common embedding widths stay governed by that chunk
+/// ceiling, and only models wide enough to make the read the peak of the index
+/// give up their floor instead.
+const MAX_FLOOR_VECTOR_BYTES: usize = 512 * 1024 * 1024;
 
 /// True when `outer` covers `inner` and is strictly larger.
 ///
@@ -817,6 +1013,75 @@ mod tests {
 
         async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
             self.invocations.fetch_add(1, Ordering::Relaxed);
+            self.inner.embed(batch).await
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            self.inner.health_check().await
+        }
+    }
+
+    /// Provider that records the largest batch it was ever handed, plus how
+    /// many times it was called. With `batch_size` set far above the window
+    /// cap, `embed_chunks` never sub-splits a window, so the largest batch the
+    /// provider sees is the window high-water mark.
+    struct BatchRecordingProvider {
+        inner: StubProvider,
+        max_batch: Arc<AtomicUsize>,
+        invocations: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for BatchRecordingProvider {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn dimensions(&self) -> Dimension {
+            self.inner.dimensions()
+        }
+
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+
+        async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            self.invocations.fetch_add(1, Ordering::Relaxed);
+            self.max_batch.fetch_max(batch.len(), Ordering::Relaxed);
+            self.inner.embed(batch).await
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            self.inner.health_check().await
+        }
+    }
+
+    /// Provider that succeeds until its Nth call and then fails, standing in for
+    /// a provider hiccup partway through a streaming index.
+    struct FailOnNthCallProvider {
+        inner: StubProvider,
+        fail_on_call: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for FailOnNthCallProvider {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn dimensions(&self) -> Dimension {
+            self.inner.dimensions()
+        }
+
+        fn model_id(&self) -> &str {
+            self.inner.model_id()
+        }
+
+        async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            if self.calls.fetch_add(1, Ordering::Relaxed) + 1 == self.fail_on_call {
+                return Err(ClaudixError::Embedding("provider hiccup".to_owned()));
+            }
             self.inner.embed(batch).await
         }
 
@@ -1020,6 +1285,132 @@ mod tests {
         assert_eq!(manifest.similarity_floor, expected);
     }
 
+    /// `index_full` must embed in bounded windows instead of collecting the
+    /// whole corpus first. `batch_size` sits far above the cap so a window is
+    /// never sub-split inside `embed_chunks` — every provider call therefore IS
+    /// one window, and the largest batch it sees is the peak number of chunks
+    /// held at once. Collecting all chunks first hands it the entire corpus in a
+    /// single call, which is exactly what this pins against.
+    #[tokio::test]
+    async fn index_full_embeds_in_bounded_windows() -> Result<()> {
+        let fixture = TestFixture::new("floor_repo")?;
+        let mut config = stub_config();
+        config.embedding.batch_size = 1024;
+
+        let max_batch = Arc::new(AtomicUsize::new(0));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let embedder: Arc<dyn Provider> = Arc::new(BatchRecordingProvider {
+            inner: StubProvider::with_model_id(
+                config.embedding.model.clone(),
+                Dimension(config.embedding.dimensions),
+            ),
+            max_batch: max_batch.clone(),
+            invocations: invocations.clone(),
+        });
+        let claudix = test_claudix_with_embedder(fixture.root().to_path_buf(), config, embedder)?;
+
+        const CAP: usize = 2;
+        let caps = WindowCaps {
+            max_chunks: CAP,
+            max_content_bytes: usize::MAX,
+        };
+        let stats = claudix.index_full_with_window(&mut (), caps).await?;
+
+        assert!(
+            stats.chunk_count > CAP * 2,
+            "fixture must produce enough chunks to force several windows, got {}",
+            stats.chunk_count
+        );
+        // Windows take whole files, so the cap is only exact while every file is
+        // a single chunk. Pin that, or a fixture change turns the bound below
+        // into a confusing failure rather than a real one.
+        assert_eq!(
+            stats.chunk_count, stats.file_count,
+            "this fixture must stay one chunk per file for the window bound to be exact"
+        );
+        assert!(
+            max_batch.load(Ordering::Relaxed) <= CAP,
+            "window cap is {CAP} chunks but {} were embedded at once",
+            max_batch.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            invocations.load(Ordering::Relaxed),
+            stats.chunk_count.div_ceil(CAP),
+            "each window must be exactly one embed call"
+        );
+        Ok(())
+    }
+
+    /// A window flush must never split one file's chunks across two commits.
+    ///
+    /// Rows carry their whole file's content hash, and on a rebuild with no
+    /// manifest hashes to consult, stored hashes are derived from the rows
+    /// themselves. A file left holding only some of its chunks therefore reads
+    /// as already current, is never re-chunked, and stays silently truncated for
+    /// as long as its content does not change — while the manifest it then
+    /// writes certifies the truncated count as correct. Reachable on a first
+    /// index and after `clear`, which is the documented recovery path.
+    #[tokio::test]
+    async fn a_failed_window_never_leaves_a_file_partially_indexed() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+
+        // What a clean index of this fixture holds.
+        let clean = test_claudix(fixture.root().to_path_buf(), config.clone())?;
+        clean.index_full(&mut ()).await?;
+        let expected: BTreeSet<(String, Option<String>)> = clean
+            .store
+            .read_chunks()
+            .await?
+            .iter()
+            .map(|row| (row.file_path.clone(), row.name.clone()))
+            .collect();
+        clean.store.clear_chunks(&config).await?;
+
+        // A one-chunk window puts a flush boundary inside any multi-chunk file;
+        // failing the second call aborts the index partway through one.
+        let failing: Arc<dyn Provider> = Arc::new(FailOnNthCallProvider {
+            inner: StubProvider::with_model_id(
+                config.embedding.model.clone(),
+                Dimension(config.embedding.dimensions),
+            ),
+            fail_on_call: 2,
+            calls: Arc::new(AtomicUsize::new(0)),
+        });
+        let broken =
+            test_claudix_with_embedder(fixture.root().to_path_buf(), config.clone(), failing)?;
+        let caps = WindowCaps {
+            max_chunks: 1,
+            max_content_bytes: usize::MAX,
+        };
+        assert!(
+            broken.index_full_with_window(&mut (), caps).await.is_err(),
+            "the failing provider must abort the index"
+        );
+
+        // Retrying must converge on the clean set, not trust a truncated file.
+        let healed = test_claudix(fixture.root().to_path_buf(), config)?;
+        healed.index_full(&mut ()).await?;
+        let healed_rows = healed.store.read_chunks().await?;
+        let actual: BTreeSet<(String, Option<String>)> = healed_rows
+            .iter()
+            .map(|row| (row.file_path.clone(), row.name.clone()))
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "a file left partially written must be re-indexed, not read as current"
+        );
+        // The set comparison above dedupes, so it cannot see the adjacent bug:
+        // healing re-appends a file whose partial rows were never deleted.
+        assert_eq!(
+            healed_rows.len(),
+            expected.len(),
+            "healing must not stack a second copy of a file's rows on the partial ones"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn index_full_replaces_stale_chunks() {
         let fixture = TestFixture::new("small_rust");
@@ -1061,6 +1452,46 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(names.contains("salute"));
         assert!(!names.contains("greet"));
+    }
+
+    /// A file deleted from disk must lose its chunks on the next full index.
+    ///
+    /// This used to hold structurally: the pass rewrote the whole table from the
+    /// rows it chose to carry forward, and a deleted file was simply never
+    /// carried. Streaming leaves untouched rows in place, so the deletion is now
+    /// an explicit predicate over the stored paths the enumeration no longer
+    /// yields — behavior with nothing else backing it up.
+    #[tokio::test]
+    async fn index_full_drops_chunks_for_a_deleted_file() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let claudix = test_claudix(fixture.root().to_path_buf(), config)?;
+
+        claudix.index_full(&mut ()).await?;
+        let before = claudix.store.read_chunks().await?;
+        assert!(
+            before.iter().any(|row| row.file_path == "src/math.rs"),
+            "fixture must index src/math.rs before it is deleted"
+        );
+
+        fs::remove_file(fixture.root().join("src/math.rs")).await?;
+        let stats = claudix.index_full(&mut ()).await?;
+
+        let rows = claudix.store.read_chunks().await?;
+        assert!(
+            rows.iter().all(|row| row.file_path != "src/math.rs"),
+            "chunks for a deleted file must not survive a full index"
+        );
+        assert!(
+            rows.iter().any(|row| row.file_path == "src/lib.rs"),
+            "the surviving file's chunks must be preserved"
+        );
+        assert_eq!(
+            stats.chunk_count,
+            rows.len(),
+            "reported chunk_count must match what the table actually holds"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -2153,12 +2584,11 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test for the manifest-vs-table corruption scenario: if the
-    /// process crashes between `drop_table` and `add` in `persist_rows`, the
-    /// chunks table is left missing/empty while `manifest.json` still records
-    /// the previous run's full `file_hashes` + `chunk_count`.  The
-    /// manifest-first fast path must detect this and fall through to a real
-    /// rebuild, not early-exit with an empty search index.
+    /// Regression test for the manifest-vs-table corruption scenario: a crash
+    /// during the index write can leave the chunks table missing or empty while
+    /// `manifest.json` still records the previous run's full `file_hashes` +
+    /// `chunk_count`.  The manifest-first fast path must detect this and fall
+    /// through to a real rebuild, not early-exit with an empty search index.
     #[tokio::test]
     async fn index_full_rebuilds_after_chunks_table_corruption() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;

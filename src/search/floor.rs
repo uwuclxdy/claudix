@@ -31,8 +31,10 @@ const MIN_FILES_FOR_FLOOR: usize = 8;
 
 /// Above this chunk count the O(seeds x rows) scan is too costly to run at index
 /// time; skip it and fall open. Read-time surfacing caps its own scan at the
-/// same order of magnitude.
-const MAX_CHUNKS_FOR_FLOOR: usize = 100_000;
+/// same order of magnitude. Public so the index can decline to even read the
+/// vectors back for a corpus this size, rather than loading them only to be
+/// handed `None`.
+pub const MAX_CHUNKS_FOR_FLOOR: usize = 100_000;
 
 /// Cap on how many files seed the scan. Beyond this the seed set is strided so
 /// the percentile stays a cheap estimate on a huge repo rather than an
