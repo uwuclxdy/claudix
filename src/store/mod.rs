@@ -193,6 +193,20 @@ impl Store {
         Ok(())
     }
 
+    /// Record the corpus-relative similarity floor on the current manifest.
+    ///
+    /// Called from the full-index path after the manifest is written, since the
+    /// floor is derived from the persisted corpus. A no-op when no manifest
+    /// exists yet. Incremental and per-file writes never touch the field, so it
+    /// carries forward until the next full index recomputes it.
+    pub fn update_similarity_floor(&self, similarity_floor: Option<f32>) -> Result<()> {
+        let Some(mut manifest) = self.read_manifest()? else {
+            return Ok(());
+        };
+        manifest.similarity_floor = similarity_floor;
+        self.write_manifest(&manifest)
+    }
+
     pub fn validate_manifest_compatibility(
         &self,
         expected_model: &str,
@@ -1353,6 +1367,81 @@ mod tests {
             Some("2026-04-26T00:00:00Z".to_owned())
         );
         assert!(manifest.last_incremental_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn update_similarity_floor_sets_then_clears() {
+        let project_root = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config).unwrap_or_else(|_| unreachable!());
+        store
+            .write_manifest(&Manifest::new(
+                &config.embedding.model,
+                config.embedding.dimensions,
+            ))
+            .unwrap_or_else(|_| unreachable!());
+
+        assert!(store.update_similarity_floor(Some(0.75)).is_ok());
+        let floor = store
+            .read_manifest()
+            .ok()
+            .flatten()
+            .and_then(|m| m.similarity_floor);
+        assert_eq!(floor, Some(0.75));
+
+        // A full index whose corpus shrank below the estimate threshold clears
+        // the stale floor rather than leaving it in place.
+        assert!(store.update_similarity_floor(None).is_ok());
+        let cleared = store
+            .read_manifest()
+            .ok()
+            .flatten()
+            .and_then(|m| m.similarity_floor);
+        assert_eq!(cleared, None);
+    }
+
+    /// A per-file reindex must not drop the corpus floor a full index stored, or
+    /// every edit between full reindexes would fall open to the configured floor.
+    #[tokio::test]
+    async fn per_file_write_preserves_the_stored_floor() {
+        let project_root = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let config = Config::default();
+        let store = Store::new(project_root.path(), &config).unwrap_or_else(|_| unreachable!());
+
+        let initial = vec![sample_chunk(
+            1,
+            "src/lib.rs",
+            "alpha",
+            "pub fn alpha() {}",
+            &sample_vector(1.0),
+        )];
+        assert!(store.replace_chunks(&initial, &config).await.is_ok());
+        assert!(store.update_similarity_floor(Some(0.7)).is_ok());
+
+        let replacement = vec![sample_chunk(
+            2,
+            "src/lib.rs",
+            "beta",
+            "pub fn beta() {}",
+            &sample_vector(2.0),
+        )];
+        assert!(
+            store
+                .replace_file_chunks(&replacement, &config)
+                .await
+                .is_ok()
+        );
+
+        let floor = store
+            .read_manifest()
+            .ok()
+            .flatten()
+            .and_then(|m| m.similarity_floor);
+        assert_eq!(
+            floor,
+            Some(0.7),
+            "per-file reindex dropped the corpus floor"
+        );
     }
 
     #[tokio::test]

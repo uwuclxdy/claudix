@@ -10,6 +10,40 @@ use std::path::{Component, Path, PathBuf};
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::prompts::hints;
 
+/// Shipped default for `hooks.related_min_similarity`. Named because
+/// [`resolve_similarity_floor`] treats a config value left at this default as
+/// "unset", letting the corpus-relative floor drive the cutoff in both
+/// directions; any other value is honored as a hard minimum.
+pub const DEFAULT_RELATED_MIN_SIMILARITY: f32 = 0.80;
+
+/// Effective cosine floor for related-code hints.
+///
+/// The corpus-relative floor stored in the manifest at index time (`stored`)
+/// auto-calibrates selectivity across embedding pipelines, whose absolute score
+/// scales differ. The configured `related_min_similarity` is the fallback when
+/// no stat exists, and a hard minimum when a user set it away from the default:
+///
+/// - `stored` absent -> the configured value (fail open, so a missing stat never
+///   costs a hint).
+/// - `stored` present, config at the default -> the corpus floor drives, raising
+///   the cutoff for a noisy-scoring model and lowering it for a quiet one.
+/// - `stored` present, config moved off the default -> `max(corpus, config)`, so
+///   an explicit tightening is never undercut.
+///
+/// The default check is a tolerance compare, so a project TOML that writes the
+/// default value verbatim reads as unset. That is the intended ceiling: the knob
+/// exists to override the corpus floor, and writing the shipped default is not an
+/// override.
+pub fn resolve_similarity_floor(stored: Option<f32>, configured: f32) -> f32 {
+    match stored {
+        None => configured,
+        Some(corpus) if (configured - DEFAULT_RELATED_MIN_SIMILARITY).abs() < f32::EPSILON => {
+            corpus
+        }
+        Some(corpus) => corpus.max(configured),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     pub provider: EmbeddingProvider,
@@ -140,7 +174,7 @@ impl Default for Config {
                 surface_related_on_edit: true,
                 surface_related_on_read: false,
                 related_top_k: 5,
-                related_min_similarity: 0.80,
+                related_min_similarity: DEFAULT_RELATED_MIN_SIMILARITY,
                 reindex_debounce_secs: 10,
                 reindex_max_wait_secs: 60,
             },
@@ -405,6 +439,34 @@ mod tests {
     fn default_config_is_valid() {
         let config = Config::default();
         assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn floor_falls_open_to_config_when_no_stat_stored() {
+        assert_eq!(resolve_similarity_floor(None, 0.80), 0.80);
+        assert_eq!(resolve_similarity_floor(None, 0.95), 0.95);
+    }
+
+    #[test]
+    fn corpus_floor_drives_when_config_is_at_the_default() {
+        // Both directions: a corpus floor below the 0.80 default still wins, so a
+        // quiet-scoring model is not pinned up to the default and starved.
+        assert_eq!(
+            resolve_similarity_floor(Some(0.88), DEFAULT_RELATED_MIN_SIMILARITY),
+            0.88
+        );
+        assert_eq!(
+            resolve_similarity_floor(Some(0.72), DEFAULT_RELATED_MIN_SIMILARITY),
+            0.72
+        );
+    }
+
+    #[test]
+    fn explicit_config_is_a_hard_minimum_over_the_corpus_floor() {
+        // A user who tightened the knob is never undercut by a lower corpus floor.
+        assert_eq!(resolve_similarity_floor(Some(0.72), 0.90), 0.90);
+        // But a corpus floor above the explicit value still wins.
+        assert_eq!(resolve_similarity_floor(Some(0.93), 0.90), 0.93);
     }
 
     #[test]

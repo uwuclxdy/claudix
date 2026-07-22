@@ -193,7 +193,15 @@ async fn read_surfacing_context(
 
     let exclude = read_path.clone();
     let top_k = cfg.hooks.related_top_k;
-    let min_similarity = cfg.hooks.related_min_similarity;
+    // Same effective-floor resolution as the edit path: the index's stored
+    // corpus floor when present, else the configured floor.
+    let stored_floor = store
+        .read_manifest()
+        .ok()
+        .flatten()
+        .and_then(|manifest| manifest.similarity_floor);
+    let min_similarity =
+        config::resolve_similarity_floor(stored_floor, cfg.hooks.related_min_similarity);
     let hits = match tokio::time::timeout(
         Duration::from_millis(READ_SURFACING_TIMEOUT_MS),
         tokio::task::spawn_blocking(move || {
@@ -1594,6 +1602,67 @@ mod tests {
         assert!(
             response.is_none(),
             "full-file read must not surface neighbors"
+        );
+        Ok(())
+    }
+
+    /// The stored corpus floor gates read-time surfacing, not just the config
+    /// value: a neighbor above the config floor but below the stored one is
+    /// suppressed once the index records a floor.
+    #[tokio::test]
+    async fn read_surfacing_honors_the_stored_corpus_floor() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on(); // related_min_similarity = 0.5
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Read chunk and a neighbor whose cosine to it is exactly 0.9.
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.9, 0.436, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 12, "limit": 6 }
+        });
+
+        // No stored floor: the 0.9 neighbor clears the 0.5 config floor.
+        let before = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(
+            before.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("src/bar.rs"),
+            "a 0.9 neighbor must surface when no corpus floor is stored"
+        );
+
+        // A stored floor of 0.95 sits above the neighbor's 0.9 score, so it must
+        // now be suppressed. If resolution ignored the stored floor this would
+        // still surface — that is the mutation this pins.
+        store.update_similarity_floor(Some(0.95))?;
+        let after = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(
+            after.is_none(),
+            "a stored corpus floor above the neighbor's score must suppress it, got: {after:?}"
         );
         Ok(())
     }

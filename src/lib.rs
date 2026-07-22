@@ -235,10 +235,28 @@ impl Claudix {
             progress.file(&file.relative_path, IndexFileStatus::Indexed)?;
         }
 
+        // Derive the corpus-relative similarity floor from the whole corpus.
+        // `corpus_similarity_floor` is total: it only reads vectors and returns
+        // `None` when the corpus is too small or, bounded by MAX_CHUNKS_FOR_FLOOR,
+        // too large. So computing it here can neither fail the index nor cost the
+        // embed pass, and it clones only the sampled seeds, not the corpus.
+        // Deliberately not on `spawn_blocking`: moving `rows` into a task would
+        // tie the corpus's fate to an optional stat, and re-reading it afterward
+        // would double every vector in memory.
+        let similarity_floor = search::corpus_similarity_floor(&rows, search::FLOOR_PERCENTILE);
+
         let stats = self
             .store
             .persist_incremental(&[], rows, self.config.as_ref(), &current_files)
             .await?;
+        // Best-effort, after the corpus it describes is persisted. A stale floor
+        // is overwritten even when this is `None`, so a corpus that shrank below
+        // the estimate threshold clears its floor. A write failure leaves the
+        // prior floor and consumers fall open; it must not fail an index whose
+        // corpus is already stored.
+        if let Err(error) = self.store.update_similarity_floor(similarity_floor) {
+            tracing::warn!("could not store corpus similarity floor: {error}");
+        }
 
         Ok(IndexStats {
             file_count: stats.file_count,
@@ -445,7 +463,19 @@ impl Claudix {
             .hooks
             .related_top_k
             .saturating_mul(NEIGHBOR_CANDIDATE_DEPTH);
-        let min_similarity = self.config.hooks.related_min_similarity;
+        // Prefer the corpus-relative floor this index stored; fall open to the
+        // configured floor when absent. Cheap manifest read on the already-detached
+        // reindex child.
+        let stored_floor = self
+            .store
+            .read_manifest()
+            .ok()
+            .flatten()
+            .and_then(|manifest| manifest.similarity_floor);
+        let min_similarity = config::resolve_similarity_floor(
+            stored_floor,
+            self.config.hooks.related_min_similarity,
+        );
         let Ok(hits) = task::spawn_blocking(move || {
             neighbors(&all_rows, &query_vectors, &exclude, top_k, min_similarity)
         })

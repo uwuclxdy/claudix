@@ -1,5 +1,8 @@
 pub mod duplicates;
+pub mod floor;
 pub mod neighbors;
+
+pub use floor::{FLOOR_PERCENTILE, corpus_similarity_floor};
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
