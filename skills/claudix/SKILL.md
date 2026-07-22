@@ -37,7 +37,7 @@ Edited rule files apply on the next index run, so reindex after changing them.
 
 ## Embedding providers
 
-`[embedding] provider = "bundled"` (default, `bge-small-en-v1.5`, zero setup) or `"http"` (any keyless OpenAI-`/v1/embeddings` server: LM Studio `http://localhost:1234`, Ollama `http://localhost:11434`, vLLM, a LiteLLM proxy). Set `model` to the id the server reports; set `dimensions` to the model's output size. Any model or dimension change requires a force rebuild (previous section). Keyed APIs (Voyage, OpenAI) need a local proxy that injects the key.
+`[embedding] provider = "bundled"` (default, `gte-modernbert-base` at 768 dims; `bge-small-en-v1.5` at 384 dims also selectable, zero setup either way) or `"http"` (any keyless OpenAI-`/v1/embeddings` server: LM Studio `http://localhost:1234`, Ollama `http://localhost:11434`, vLLM, a LiteLLM proxy). Set `model` to the id the server reports; set `dimensions` to the model's output size. Any model or dimension change requires a force rebuild (previous section). Keyed APIs (Voyage, OpenAI) need a local proxy that injects the key.
 
 ## Cross-repo search
 

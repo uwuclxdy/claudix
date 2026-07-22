@@ -23,13 +23,13 @@ Core design goal: never break the session, always recover gracefully.
 - **macOS 11+ (Apple Silicon)** or **Linux x86_64** (glibc 2.28+ or musl) or **Windows 10+ x86_64**
 - **Rust 1.91+**
 - **Windows**: the [Visual C++ 2015-2022 x64 redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe). The MSVC-built prebuilt binary won't launch without it; a stock box may not have it preinstalled.
-- **Optional**: LM Studio or Ollama for a custom embedding backend. The bundled `bge-small-en-v1.5` embedder is statically linked into the binary, so no separate ONNX runtime is needed.
+- **Optional**: LM Studio or Ollama for a custom embedding backend. The bundled `gte-modernbert-base` embedder is statically linked into the binary, so no separate ONNX runtime is needed.
 
 ## Installation
 
 **Requires**: Claude Code 2.1.0+ (plugin skills in the slash menu).
 
-claudix ships the bundled `bge-small-en-v1.5` embedder and uses it as the fallback when no embedding provider is configured. Set `embedding.provider = "http"` if you prefer LM Studio, Ollama, or another OpenAI-compatible embedding server.
+claudix ships the bundled `gte-modernbert-base` embedder and uses it as the fallback when no embedding provider is configured. Set `embedding.provider = "http"` if you prefer LM Studio, Ollama, or another OpenAI-compatible embedding server.
 
 ### Linux / macOS
 
@@ -63,7 +63,7 @@ Configuration lives in two TOML files (project overrides global):
 - **Global**: `~/.claude/claudix.toml`
 - **Project**: `<repo>/.claude/claudix.toml`
 
-Both optional. If neither file sets an embedding provider, bundled defaults and the `bge-small-en-v1.5` embedder are used. Run `/claudix:doctor` to see active configuration.
+Both optional. If neither file sets an embedding provider, bundled defaults and the `gte-modernbert-base` embedder are used. Run `/claudix:doctor` to see active configuration.
 
 ### Full Schema (defaults)
 
@@ -73,8 +73,8 @@ watch = false                       # opt-in file watcher; default off (the Post
 [embedding]
 provider = "bundled"                # bundled | http
 endpoint = ""                       # required if provider = http (e.g., http://localhost:1234)
-model = "bge-small-en-v1.5"
-dimensions = 384
+model = "gte-modernbert-base"
+dimensions = 768
 batch_size = 32
 timeout_ms = 30000
 
@@ -208,7 +208,9 @@ Claude invokes `claudix.search_code(query, language_filter, path_prefix, repos)`
 
 ### Bundled (Default)
 
-`bge-small-en-v1.5` runs via ONNX Runtime on CPU. No external dependencies. ~100ms/chunk on modern hardware.
+`gte-modernbert-base` (768 dims, CLS pooling) runs via ONNX Runtime on CPU. No external dependencies.
+
+`bge-small-en-v1.5` (384 dims) stays selectable via `model = "bge-small-en-v1.5"` with `dimensions = 384`. It is smaller and faster, at lower retrieval quality. Assets download once to `~/.claude/claudix/models`, pinned to a specific upstream revision and verified against a published sha256 before use. Both models' assets can coexist; only unversioned files from older releases are cleared.
 
 Requires: `libonnxruntime` (Linux) or `onnxruntime.dll` (Windows) installed in system library path, or downloaded automatically.
 
@@ -240,11 +242,11 @@ endpoint = "http://localhost:11434"
 model = "nomic-embed-text"
 ```
 
-All three backends return 384-dimensional vectors (for bge-small); other models may differ. After any model or dimension change, rebuild with `claudix index --force` (SessionStart flags the mismatch but never wipes your index on its own).
+Vector width follows the model: 768 for the bundled `gte-modernbert-base`, 384 for `bge-small-en-v1.5`, whatever an `http` model publishes. After any model or dimension change, rebuild with `claudix index --force` (SessionStart flags the mismatch but never wipes your index on its own).
 
 ### Choosing a Model
 
-The bundled `bge-small-en-v1.5` is a small general-purpose English text model. It is a fine zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases.
+The bundled `gte-modernbert-base` is a general-purpose English text model with a long context window. It is a solid zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases.
 
 The `http` provider speaks the OpenAI `/v1/embeddings` format and sends no authorization header, so it connects to keyless servers: LM Studio, Ollama, a local vLLM instance, or a local proxy such as LiteLLM. Hosted APIs that require a key (Voyage, OpenAI, Gemini) are reachable only by fronting them with a local proxy that injects the key. Set `dimensions` to the model's output size, or to a smaller Matryoshka size it supports; changing the dimension requires a `claudix index --force` rebuild.
 
