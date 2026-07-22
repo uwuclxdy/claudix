@@ -2421,6 +2421,64 @@ mod tests {
         Ok(())
     }
 
+    /// The depth above is calibrated, and the test above only pins it at 2 or more.
+    /// Lowering it fails silently in production: the pool just truncates, and a
+    /// truncated pool costs a hint only after a long session has consumed its whole
+    /// tail, which no unit fixture reaches. So the measured value is asserted here
+    /// as a literal rather than read from the constant it guards. Re-run the
+    /// harness's `report_depth_sweep` before moving either number.
+    #[tokio::test]
+    async fn reindex_file_pools_the_measured_candidate_depth() -> Result<()> {
+        const MEASURED_DEPTH: usize = 13;
+
+        let fixture = TestFixture::new("small_rust")?;
+        let mut config = stub_config();
+        config.hooks.surface_related_on_edit = true;
+        config.hooks.related_top_k = 1;
+        config.hooks.related_min_similarity = 0.5;
+
+        let claudix = test_claudix_with_embedder(
+            fixture.root().to_path_buf(),
+            config,
+            Arc::new(ContentKeyedProvider),
+        )?;
+        claudix.store.ensure_layout()?;
+
+        // More qualifying neighbors than the cap admits, so what the marker holds
+        // is bounded by the depth rather than by how many files were seeded.
+        let seeded: Vec<(String, String, Vec<f32>)> = (0..MEASURED_DEPTH + 7)
+            .map(|i| {
+                (
+                    format!("src/near_alpha_{i}.rs"),
+                    format!("near_alpha_{i}"),
+                    content_keyed_vector("alpha"),
+                )
+            })
+            .collect();
+        let entries: Vec<(&str, &str, Vec<f32>)> = seeded
+            .iter()
+            .map(|(path, name, vector)| (path.as_str(), name.as_str(), vector.clone()))
+            .collect();
+        seed_chunks(&claudix.store, claudix.config.as_ref(), &entries).await?;
+        for (path, _, _) in &entries {
+            fs::write(fixture.root().join(path), b"pub fn seeded() {}\n").await?;
+        }
+
+        let edited = fixture.root().join("src/edited.rs");
+        fs::write(&edited, ALPHA_FN).await?;
+        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+
+        let pooled = marker_neighbor_paths(&claudix.store.change_neighbors_marker_path()).len();
+        assert!(
+            pooled >= MEASURED_DEPTH,
+            "marker must pool {MEASURED_DEPTH} candidates per hint of budget, out of {} \
+             qualifying neighbors seeded; a shallower pool re-opens the hint starvation \
+             measured on a dense corpus. got {pooled}",
+            entries.len()
+        );
+        Ok(())
+    }
+
     /// The neighbor query must be seeded by the chunks the edit introduced, not
     /// by every chunk in the file — otherwise the surfaced set is a property of
     /// the file and every save re-injects the same list.
