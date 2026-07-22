@@ -54,7 +54,7 @@ All under `[hooks]`:
 
 - `intercept_grep = false` disables the conceptual-Grep interception (anchored regexes, globs, short queries always pass through anyway).
 - `auto_reembed_on_edit = false` stops re-embedding on Write/Edit; `reindex_debounce_secs` / `reindex_max_wait_secs` tune the edit-burst coalescing.
-- `surface_related_on_edit` (default on) injects semantically related locations after an edit; `surface_related_on_read = true` (opt-in) does the same for ranged Reads. `related_top_k` / `related_min_similarity` control volume.
+- `surface_related_on_edit` (default on) injects semantically related locations after an edit; `surface_related_on_read = true` (opt-in) does the same for ranged Reads. `related_top_k` caps hits per edit; the cosine floor is corpus-relative (each full index stores the p30 of its own best-neighbor distribution), and `related_min_similarity` is the fallback plus a hard minimum.
 - top-level `watch = true` swaps the debounced hook reindex for a live file watcher (`claudix watch`).
 
 ## Verify and troubleshoot

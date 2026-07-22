@@ -66,6 +66,14 @@ Neither shift tracks retrieval quality. If you gate on an absolute cosine anywhe
 distribution after any change to the model, the pooling, or the provider, and prefer a cutoff
 derived from your own corpus's score distribution over a constant.
 
+That is what claudix now does. A full index stores the 30th percentile of its own best-neighbor
+distribution as the hint floor, so ~70% of edits surface at least one hit on any model by
+construction (measured 70% at both qwen3's p30 of 0.748 and gte-modernbert's 0.759, where the fixed
+0.80 cleared 51% and 88% respectively). `related_min_similarity` stays as the fallback when no such
+stat exists and as a hard minimum when a user sets it above the default. The percentile was picked
+from a floor sweep on two models: precision of the admitted hints rose from ~0.43 floor-free to
+~0.63-0.67 at p30 and plateaued there. Coverage kept falling past that point.
+
 ## Public code-retrieval benchmarks do not measure this use case
 
 The question "which embedding model is best for finding code related to what I just edited" has no

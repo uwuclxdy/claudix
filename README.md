@@ -102,7 +102,7 @@ auto_index_on_session_start = true  # background reindex check on session start
 surface_related_on_edit = true      # surface semantically related files after an edit
 surface_related_on_read = false     # surface related files after a ranged Read (opt-in)
 related_top_k = 5                   # max related-code hits per edit or read
-related_min_similarity = 0.80       # cosine floor for related-code hits (0.0-1.0)
+related_min_similarity = 0.80       # fallback cosine floor; active floor is corpus-relative
 
 [paths]
 index_dir = ".claudix/index"        # relative to repo root; committed to .gitignore
@@ -198,7 +198,7 @@ Heuristics for passthrough: regex anchors/character classes, explicit file globs
 
 ### Related-Code Surfacing
 
-After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` and `related_min_similarity` control volume; a neighbor already surfaced this session is not repeated, whichever file you were editing at the time.
+After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` caps hits per edit; the cosine floor is corpus-relative (each full index stores the p30 of its own score distribution), with `related_min_similarity` as the fallback and a hard minimum. A neighbor already surfaced this session is not repeated, whichever file you were editing at the time.
 
 ### MCP Tool: `search_code`
 
@@ -246,7 +246,7 @@ Vector width follows the model: 768 for the bundled `gte-modernbert-base`, 384 f
 
 ### Choosing a Model
 
-The bundled `gte-modernbert-base` is a general-purpose English text model with a long context window. It is a solid zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases. For how the bundled models were measured against each other, why an absolute similarity floor is not portable across models, and why public code-retrieval benchmarks do not measure this use case, see [wiki/embedding-findings.md](wiki/embedding-findings.md).
+The bundled `gte-modernbert-base` is a general-purpose English text model with a long context window. It is a solid zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases. For how the bundled models were measured against each other, why an absolute similarity floor is not portable across models (and how claudix calibrates a corpus-relative one per index), and why public code-retrieval benchmarks do not measure this use case, see [wiki/embedding-findings.md](wiki/embedding-findings.md).
 
 The `http` provider speaks the OpenAI `/v1/embeddings` format and sends no authorization header, so it connects to keyless servers: LM Studio, Ollama, a local vLLM instance, or a local proxy such as LiteLLM. Hosted APIs that require a key (Voyage, OpenAI, Gemini) are reachable only by fronting them with a local proxy that injects the key. Set `dimensions` to the model's output size, or to a smaller Matryoshka size it supports; changing the dimension requires a `claudix index --force` rebuild.
 
