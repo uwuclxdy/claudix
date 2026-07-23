@@ -80,6 +80,11 @@ pub struct SearchOutput {
     /// so a session that never sees a stale hit never pays for the explanation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_hint: Option<&'static str>,
+    /// Set when the embedding endpoint was unreachable and results fell back to
+    /// lexical-only ranking. The MCP layer throttles this to once per session;
+    /// the non-cached CLI path (a fresh process) carries it every time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub degraded_hint: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -999,6 +1004,9 @@ async fn run_search_with_claudix(
         groups,
         repo_errors: found.repo_errors,
         stale_hint: any_stale.then_some(crate::prompts::mcp::STALE_HITS_NOTE),
+        degraded_hint: found
+            .degraded
+            .then_some(crate::prompts::mcp::ENDPOINT_DOWN_NOTE),
     })
 }
 
@@ -1215,6 +1223,84 @@ mod tests {
         let top_hit = &output.groups[0].hits[0];
         assert_eq!(top_hit.name.as_deref(), Some("add"));
         assert_eq!(top_hit.file_path, "src/math.rs");
+    }
+
+    /// A healthy search carries no degradation notice; an endpoint-down search
+    /// over the same indexed corpus returns lexical hits plus the notice.
+    #[tokio::test]
+    async fn search_output_degraded_hint_tracks_endpoint_availability() {
+        let healthy = cli_harness().await;
+        assert!(healthy.is_ok());
+        let healthy = healthy.ok().unwrap_or_else(|| unreachable!());
+        let output = run_search_with_claudix(
+            &healthy.claudix,
+            "add".to_owned(),
+            5,
+            None,
+            None,
+            Vec::new(),
+        )
+        .await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            output.degraded_hint.is_none(),
+            "a healthy search must carry no degradation notice"
+        );
+
+        struct EndpointDownProvider;
+
+        #[async_trait::async_trait]
+        impl Provider for EndpointDownProvider {
+            fn name(&self) -> &str {
+                "endpoint-down"
+            }
+
+            fn dimensions(&self) -> Dimension {
+                Dimension(8)
+            }
+
+            fn model_id(&self) -> &str {
+                "stub-v1"
+            }
+
+            async fn embed(&self, _batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+                Err(ClaudixError::EmbeddingTimedOut {
+                    endpoint: "http://127.0.0.1:1234".to_owned(),
+                    timeout_ms: 50,
+                    recovery: RecoveryHint(hints::EMBEDDING_GENERIC),
+                })
+            }
+
+            async fn health_check(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let (_, root) = shared_fixture_dir();
+        let config = Arc::new(stub_config());
+        let store = Store::new(root, config.as_ref());
+        assert!(store.is_ok());
+        let store = store.ok().unwrap_or_else(|| unreachable!());
+        let embedder: Arc<dyn Provider> = Arc::new(EndpointDownProvider);
+        let degraded = Claudix::from_parts(root.clone(), config, embedder, store);
+
+        let output =
+            run_search_with_claudix(&degraded, "add".to_owned(), 5, None, None, Vec::new()).await;
+        assert!(
+            output.is_ok(),
+            "endpoint-down search must degrade, not error: {output:?}"
+        );
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            !output.groups.is_empty(),
+            "lexical fallback must still return hits"
+        );
+        assert_eq!(
+            output.degraded_hint,
+            Some(crate::prompts::mcp::ENDPOINT_DOWN_NOTE),
+            "an endpoint-down search must carry the degradation notice"
+        );
     }
 
     #[tokio::test]

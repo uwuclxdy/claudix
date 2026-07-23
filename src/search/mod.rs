@@ -52,6 +52,9 @@ pub struct SearchResult {
 pub struct SearchResults {
     pub results: Vec<SearchResult>,
     pub repo_errors: Vec<RepoError>,
+    /// True when the embedding endpoint was unreachable and the ranking fell
+    /// back to lexical-only (BM25 + identifier) over the indexed corpus.
+    pub degraded: bool,
 }
 
 /// Warn when a full search (embed + rank + staleness) exceeds this. Fires at the
@@ -124,6 +127,7 @@ impl Searcher {
             return Ok(SearchResults {
                 results: Vec::new(),
                 repo_errors: Vec::new(),
+                degraded: false,
             });
         }
 
@@ -152,6 +156,7 @@ impl Searcher {
             return Ok(SearchResults {
                 results: Vec::new(),
                 repo_errors: Vec::new(),
+                degraded: false,
             });
         }
 
@@ -160,9 +165,11 @@ impl Searcher {
             return Ok(SearchResults {
                 results: Vec::new(),
                 repo_errors,
+                degraded: false,
             });
         }
 
+        let mut degraded = false;
         let query_vector = match precomputed_vector {
             Some(vector) => vector,
             None => {
@@ -176,16 +183,29 @@ impl Searcher {
                 // cross-repo's vectors must match. When the active provider
                 // has bundled fallback enabled, this call falls back before
                 // ranking the non-empty corpus.
-                let vectors = embedder.embed(&[query.query.as_str()]).await?;
-                if vectors.len() != 1 {
-                    return Err(ClaudixError::Embedding(format!(
-                        "provider returned {} vectors for 1 query",
-                        vectors.len()
-                    )));
+                match embedder.embed(&[query.query.as_str()]).await {
+                    Ok(vectors) => {
+                        if vectors.len() != 1 {
+                            return Err(ClaudixError::Embedding(format!(
+                                "provider returned {} vectors for 1 query",
+                                vectors.len()
+                            )));
+                        }
+                        let query_vector = vectors.into_iter().next().unwrap_or_default();
+                        validate_query_vector(&query_vector, embedder.dimensions())?;
+                        query_vector
+                    }
+                    // Endpoint down (offline / timeout / auth / HTTP error):
+                    // degrade to lexical ranking over the corpus already loaded
+                    // above. An empty query vector zeroes every dense score, so
+                    // `rank_rows` is driven purely by BM25 + identifier hits.
+                    // Non-endpoint embed failures still propagate as errors.
+                    Err(error) if error.is_endpoint_unavailable() => {
+                        degraded = true;
+                        Vec::new()
+                    }
+                    Err(error) => return Err(error),
                 }
-                let query_vector = vectors.into_iter().next().unwrap_or_default();
-                validate_query_vector(&query_vector, embedder.dimensions())?;
-                query_vector
             }
         };
 
@@ -198,6 +218,7 @@ impl Searcher {
         Ok(SearchResults {
             results,
             repo_errors,
+            degraded,
         })
     }
 
@@ -801,6 +822,44 @@ mod tests {
         }
     }
 
+    /// Embeds by failing: `endpoint_down` picks a fresh endpoint-unavailable
+    /// error (drives lexical degradation) vs a plain embedding error (must
+    /// propagate). `ClaudixError` is not `Clone`, so the error is built per call.
+    struct FailingProvider {
+        endpoint_down: bool,
+    }
+
+    #[async_trait]
+    impl Provider for FailingProvider {
+        fn name(&self) -> &str {
+            "failing"
+        }
+
+        fn dimensions(&self) -> Dimension {
+            Dimension(8)
+        }
+
+        fn model_id(&self) -> &str {
+            "failing-model"
+        }
+
+        async fn embed(&self, _batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            if self.endpoint_down {
+                Err(ClaudixError::EmbeddingTimedOut {
+                    endpoint: "http://127.0.0.1:1234".to_owned(),
+                    timeout_ms: 50,
+                    recovery: RecoveryHint(hints::EMBEDDING_GENERIC),
+                })
+            } else {
+                Err(ClaudixError::Embedding("bad payload".to_owned()))
+            }
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn tokenize_splits_snake_case() {
         assert_eq!(
@@ -1228,6 +1287,84 @@ mod tests {
 
         assert!(
             matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("non-finite query"))
+        );
+    }
+
+    /// Endpoint down mid-search: instead of erroring, `search` degrades to a
+    /// lexical (BM25 + identifier) ranking over the already-loaded corpus and
+    /// marks the result `degraded`. The BM25/identifier match for "add" must
+    /// still surface — a degraded path that returns empty reds this test.
+    #[tokio::test]
+    async fn search_degrades_to_lexical_when_endpoint_unavailable() {
+        let harness = search_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        let embedder: Arc<dyn Provider> = Arc::new(FailingProvider {
+            endpoint_down: true,
+        });
+        let searcher = Searcher::new(
+            harness.searcher.project_root,
+            harness.searcher.store,
+            embedder,
+            harness.searcher.config,
+        );
+
+        let results = searcher
+            .search(SearchQuery {
+                query: "add".to_owned(),
+                top_k: 10,
+                language_filter: None,
+                path_prefix: None,
+                repos: Vec::new(),
+            })
+            .await;
+        assert!(
+            results.is_ok(),
+            "endpoint-down search must degrade, not error: {results:?}"
+        );
+        let results = results.ok().unwrap_or_else(|| unreachable!());
+        assert!(
+            results.degraded,
+            "an endpoint-down search must be marked degraded"
+        );
+        assert!(
+            results.results.iter().any(|result| {
+                result.chunk.name.as_deref() == Some("add")
+                    && result.chunk.file_path.as_str() == "src/math.rs"
+            }),
+            "lexical fallback must still surface the 'add' identifier/BM25 hit"
+        );
+    }
+
+    /// A non-endpoint embedding failure is a real bug, not a reason to degrade:
+    /// it must propagate as an error rather than silently returning lexical hits.
+    #[tokio::test]
+    async fn search_does_not_degrade_for_non_endpoint_embed_error() {
+        let harness = search_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        let embedder: Arc<dyn Provider> = Arc::new(FailingProvider {
+            endpoint_down: false,
+        });
+        let searcher = Searcher::new(
+            harness.searcher.project_root,
+            harness.searcher.store,
+            embedder,
+            harness.searcher.config,
+        );
+
+        let error = searcher
+            .search(SearchQuery {
+                query: "add".to_owned(),
+                top_k: 10,
+                language_filter: None,
+                path_prefix: None,
+                repos: Vec::new(),
+            })
+            .await;
+        assert!(
+            matches!(error, Err(ClaudixError::Embedding(message)) if message == "bad payload"),
+            "non-endpoint embed error must propagate as an error, not degrade"
         );
     }
 

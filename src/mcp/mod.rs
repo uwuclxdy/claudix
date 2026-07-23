@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -68,6 +69,10 @@ pub struct ClaudixServer {
     /// Warm provider shared with the embed side channel: the first search or
     /// hook embed pays the build, the rest of the session reuses it.
     provider_cache: Arc<ProviderCache>,
+    /// Latched once the endpoint-down lexical-degradation notice has been
+    /// surfaced, so the notice bills at most once per session. Shared across
+    /// the per-call clones of this server.
+    warned_degraded: Arc<AtomicBool>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -77,6 +82,7 @@ impl ClaudixServer {
         Self {
             project_root,
             provider_cache,
+            warned_degraded: Arc::new(AtomicBool::new(false)),
             tool_router: Self::tool_router(),
         }
     }
@@ -111,6 +117,10 @@ impl ClaudixServer {
             request.repos,
         )
         .await
+        .map(|mut output| {
+            throttle_degraded_notice(&mut output, &self.warned_degraded);
+            output
+        })
         .and_then(to_value);
         Ok(into_result(outcome))
     }
@@ -288,6 +298,18 @@ fn to_value<T: serde::Serialize>(value: T) -> crate::error::Result<Value> {
     serde_json::to_value(value).map_err(ClaudixError::from)
 }
 
+/// Keep the endpoint-down degradation notice only the first time a degraded
+/// search occurs this session; drop it on later ones. The lexical results still
+/// return every time — only the notice is throttled. A healthy search
+/// (`degraded_hint` is `None`) leaves the latch untouched thanks to the
+/// short-circuit, so it can never consume the one-shot ahead of a real
+/// degradation.
+fn throttle_degraded_notice(output: &mut cli::SearchOutput, warned: &AtomicBool) {
+    if output.degraded_hint.is_some() && warned.swap(true, Ordering::Relaxed) {
+        output.degraded_hint = None;
+    }
+}
+
 /// Successful payload → structured content; error → a tool-level error result the
 /// caller can read. A serialize failure for the payload degrades to an error
 /// result rather than tearing down the server loop.
@@ -387,6 +409,56 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("Use a path inside $CLAUDE_PROJECT_DIR"));
         assert!(text.contains("Recovery:"));
+    }
+
+    fn degraded_output() -> cli::SearchOutput {
+        cli::SearchOutput {
+            groups: Vec::new(),
+            repo_errors: Vec::new(),
+            stale_hint: None,
+            degraded_hint: Some(crate::prompts::mcp::ENDPOINT_DOWN_NOTE),
+        }
+    }
+
+    #[test]
+    fn degraded_notice_surfaces_once_then_stops() {
+        let warned = AtomicBool::new(false);
+
+        let mut first = degraded_output();
+        throttle_degraded_notice(&mut first, &warned);
+        assert!(
+            first.degraded_hint.is_some(),
+            "first degraded search must carry the notice"
+        );
+
+        let mut second = degraded_output();
+        throttle_degraded_notice(&mut second, &warned);
+        assert!(
+            second.degraded_hint.is_none(),
+            "a repeat degraded search must not re-bill the notice"
+        );
+    }
+
+    /// A healthy search must not latch the one-shot: the first degraded search
+    /// after any number of healthy ones still gets the notice.
+    #[test]
+    fn healthy_search_does_not_consume_the_degraded_one_shot() {
+        let warned = AtomicBool::new(false);
+
+        let mut healthy = cli::SearchOutput {
+            groups: Vec::new(),
+            repo_errors: Vec::new(),
+            stale_hint: None,
+            degraded_hint: None,
+        };
+        throttle_degraded_notice(&mut healthy, &warned);
+
+        let mut degraded = degraded_output();
+        throttle_degraded_notice(&mut degraded, &warned);
+        assert!(
+            degraded.degraded_hint.is_some(),
+            "a healthy search must not latch the degraded one-shot"
+        );
     }
 
     #[tokio::test]

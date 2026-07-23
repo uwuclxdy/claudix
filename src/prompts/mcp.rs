@@ -12,6 +12,11 @@ use serde_json::{Value, json};
 /// the always-billed tool description.
 pub const STALE_HITS_NOTE: &str = "A stale hit's file changed on disk after indexing: treat its line numbers as approximate and Read the file to confirm.";
 
+/// Carried on a `search_code` response only when the embedding endpoint was
+/// unreachable and the ranking fell back to lexical-only. Surfaced at most once
+/// per MCP session so the notice does not bill every degraded search.
+pub const ENDPOINT_DOWN_NOTE: &str = "The embedding endpoint is unreachable, so these results are lexical-only (keyword and identifier matching, no semantic ranking). Restart the endpoint for full semantic search.";
+
 /// The served catalog. `cross_repo` advertises the `repos` parameter on the
 /// tools that accept it; the handlers honor `repos` either way, so a session
 /// that gains cross-repos mid-flight degrades to a working-but-unadvertised
