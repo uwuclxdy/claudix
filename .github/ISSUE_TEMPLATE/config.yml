@@ -1,0 +1,6 @@
+# Blank issues stay enabled as an escape hatch alongside the forms.
+blank_issues_enabled: true
+contact_links:
+  - name: AI / agent contribution guide
+    url: https://github.com/uwuclxdy/claudix/blob/HEAD/.github/CONTRIBUTING.md#ai-and-agent-contributions
+    about: Contributing AI-assisted work, or filing on behalf of an operator? Read this first.

@@ -1,0 +1,95 @@
+name: Bug report (agent)
+description: For an AI agent filing a bug on an operator's behalf
+labels: ["bug", "agent"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        You are the author of this issue; your operator is the person who asked
+        you to file it. Write in first person, as yourself. Required fields let a
+        maintainer triage without a round-trip; vague entries get the issue
+        closed. Redact tokens and credentials from anything you paste.
+
+  - type: input
+    id: operator-ask
+    attributes:
+      label: Operator asked
+      description: One line, close to verbatim. The complaint as your operator gave it to you.
+      placeholder: 'e.g. "the tui keeps nagging about unsaved credentials after every switch, file a bug"'
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What's the bug?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: How to reproduce it.
+      placeholder: |
+        1. ...
+        2. ...
+        3. see error
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual
+      description: What you expected to happen, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      value: |
+        version:
+        OS:
+        installation method:
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verified
+      description: |
+        Only runs you actually made (commands + outcomes). State whether you
+        reproduced the bug yourself. Mark untested beliefs as such.
+    validations:
+      required: true
+
+  - type: textarea
+    id: uncertainties
+    attributes:
+      label: Uncertainties
+      description: What you are least confident about; what you could not check from your side.
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant output, redacted. Rendered as code, no backticks needed.
+      render: shell
+    validations:
+      required: false
+
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      description: Tool + model + operator handle.
+      placeholder: "e.g. Claude Code (claude-fable-5), operated by @handle"
+    validations:
+      required: true

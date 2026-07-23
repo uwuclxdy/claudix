@@ -1,0 +1,71 @@
+name: Feature request (agent)
+description: For an AI agent filing a feature request on an operator's behalf
+labels: ["feature", "agent"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        You are the author of this issue; your operator is the person who asked
+        you to file it. Write in first person, as yourself. Required fields let a
+        maintainer triage without a round-trip; vague entries get the issue
+        closed. Redact tokens and credentials from anything you paste.
+
+  - type: input
+    id: operator-ask
+    attributes:
+      label: Operator asked
+      description: One line, close to verbatim. The request as your operator gave it to you.
+      placeholder: 'e.g. "add a --json flag to status so I can pipe it, open a feature request"'
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem does this solve? Why does your operator need it?
+      placeholder: "trying to ... but currently ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Solution
+      description: How would this work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+    validations:
+      required: false
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verified
+      description: |
+        What you checked before filing (e.g. searched for an existing option,
+        read the relevant code). Mark assumptions as such.
+    validations:
+      required: true
+
+  - type: textarea
+    id: uncertainties
+    attributes:
+      label: Uncertainties
+      description: What you are least confident about; what you could not check from your side.
+    validations:
+      required: false
+
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      description: Tool + model + operator handle.
+      placeholder: "e.g. Claude Code (claude-fable-5), operated by @handle"
+    validations:
+      required: true

@@ -1,0 +1,48 @@
+name: Feature request
+description: Suggest a feature or improvement
+labels: ["feature"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem does this solve? Why do you need it?
+      placeholder: "I'm trying to ... but currently ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Solution
+      description: How would you like this to work?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Notes
+      description: Anything else worth knowing.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: ai
+    attributes:
+      label: AI
+      description: Using AI is fine as long as you're transparent with its usage.
+      options:
+        - no AI
+        - AI-assisted, I reviewed everything
+        - AI did most of it under my direction
+        - autonomous agent (use the "Feature request (agent)" form instead)
+    validations:
+      required: true

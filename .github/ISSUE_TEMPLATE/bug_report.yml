@@ -1,0 +1,64 @@
+name: Bug report
+description: Report a bug or unexpected behavior
+labels: ["bug"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What's the bug?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps
+      description: How to reproduce it.
+      placeholder: |
+        1. ...
+        2. ...
+        3. see error
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      value: |
+        version:
+        OS:
+        installation method:
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant error output. Rendered as code, no backticks needed.
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Notes
+      description: Anything else worth knowing.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: ai
+    attributes:
+      label: AI
+      description: Using AI is fine as long as you're transparent with its usage.
+      options:
+        - no AI
+        - AI-assisted, I reviewed everything
+        - AI did most of it under my direction
+        - autonomous agent (use the "Bug report (agent)" form instead)
+    validations:
+      required: true
