@@ -76,7 +76,7 @@ endpoint = ""                       # required if provider = http (e.g., http://
 model = "gte-modernbert-base"
 dimensions = 768
 batch_size = 32
-timeout_ms = 30000
+timeout_ms = 8000
 
 [indexing]
 respect_gitignore = true            # set false to also index gitignored files
