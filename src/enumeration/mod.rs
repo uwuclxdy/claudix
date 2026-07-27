@@ -227,20 +227,41 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> FileHash {
     FileHash(digest.to_be_bytes())
 }
 
-/// Walk up from `path` looking for a `.git` directory; return `true` if any
-/// ancestor contains one. Cheaper than constructing a `gix::Repository`, so
-/// hot paths (hooks, status checks) call this instead of `discover_repository`.
+/// Walk up from `path` looking for a `.git`; return `true` if any ancestor
+/// holds a usable one. Cheaper than constructing a `gix::Repository`, so hot
+/// paths (hooks, status checks) call this instead of `discover_repository`.
+/// Validates the discovered `.git` is a real repo, not just present: an orphan
+/// empty `.git` directory left in a shared parent (e.g. an interrupted
+/// `git init`) is rejected so it cannot fool this walk into reporting every
+/// sibling as a git repo.
 pub fn is_git_repo(path: &Path) -> bool {
     let mut current = path;
     loop {
-        if current.join(".git").exists() {
-            return true;
+        if let Some(valid) = valid_git_marker(current) {
+            return valid;
         }
         match current.parent() {
             Some(parent) => current = parent,
             None => return false,
         }
     }
+}
+
+/// Classify the `.git` at `dir`: `Some(true)` for a usable repo, `Some(false)`
+/// for a partial/orphan state, `None` when no `.git` is present here. A `.git`
+/// *file* is a `gitdir:` pointer for submodules and
+/// worktrees — trust presence, resolving it cross-platform is more than this
+/// hot-path guard owes (and the orphan case is always an empty directory, never
+/// a pointer file). For a directory (or a symlink to one), `git init` always
+/// writes `HEAD` and `objects/`, so require both; `Path::join` follows the
+/// symlink for those inner checks so no special case is needed.
+fn valid_git_marker(dir: &Path) -> Option<bool> {
+    let dot_git = dir.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).ok()?;
+    if metadata.is_file() {
+        return Some(true);
+    }
+    Some(dot_git.join("HEAD").exists() && dot_git.join("objects").exists())
 }
 
 fn ensure_within_root(root: &Path, path: &Path) -> Result<()> {
@@ -642,5 +663,107 @@ mod tests {
             .map(|file| file.relative_path.as_str().to_owned())
             .collect();
         assert!(!paths.contains("src/oversized.rs"));
+    }
+
+    /// Mirror `tests/common/fixture.rs`'s empty-config trick inlined, so the
+    /// orphan/real-repo tests below stay inside this module without importing
+    /// the cross-module helper.
+    fn init_real_git_repo(root: &Path) {
+        // Neutralise the developer's global/system git config for the throwaway
+        // repo (same rationale as `tests/common/fixture.rs`).
+        let empty_config = root.join(".claudix-test-empty-gitconfig");
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", &empty_config)
+            .env("GIT_CONFIG_SYSTEM", &empty_config)
+            .args(["init"])
+            .output()
+            .ok()
+            .unwrap_or_else(|| unreachable!());
+        assert!(
+            output.status.success(),
+            "git init failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // `git init` always writes both; pin them so a future git layout change
+        // doesn't silently flip these tests green for the wrong reason.
+        assert!(
+            root.join(".git/HEAD").exists(),
+            "git init must write .git/HEAD"
+        );
+        assert!(
+            root.join(".git/objects").exists(),
+            "git init must write .git/objects"
+        );
+    }
+
+    /// Regression: an orphan empty `.git` directory left in a shared parent
+    /// (e.g. from an interrupted `git init /tmp/scratch`) used to fool the
+    /// walk-up into reporting every sibling as a git repo. Constructed inside a
+    /// tempdir we own so `$TMPDIR` stays clean.
+    #[test]
+    fn is_git_repo_false_for_orphan_empty_dot_git_in_parent() {
+        let outer = tempfile::tempdir();
+        assert!(outer.is_ok());
+        let outer = outer.ok().unwrap_or_else(|| unreachable!());
+        assert!(fs::create_dir_all(outer.path().join(".git")).is_ok());
+
+        let inner = outer.path().join("workspace");
+        assert!(fs::create_dir_all(&inner).is_ok());
+
+        assert!(
+            !is_git_repo(&inner),
+            "orphan empty `.git` in a parent must not register as a repo"
+        );
+    }
+
+    #[test]
+    fn is_git_repo_true_for_real_repo_subdir() {
+        let root = tempfile::tempdir();
+        assert!(root.is_ok());
+        let root = root.ok().unwrap_or_else(|| unreachable!());
+        init_real_git_repo(root.path());
+
+        let subdir = root.path().join("subdir");
+        assert!(fs::create_dir_all(&subdir).is_ok());
+
+        assert!(
+            is_git_repo(&subdir),
+            "a real git repo must be detected from a subdir"
+        );
+    }
+
+    #[test]
+    fn is_git_repo_false_when_no_dot_git_in_walk_up() {
+        let root = tempfile::tempdir();
+        assert!(root.is_ok());
+        let root = root.ok().unwrap_or_else(|| unreachable!());
+        // Skip if any ancestor holds a `.git`: a repo above the tempdir (e.g.
+        // `TMPDIR=~/code/tmp`) makes the assertion red for environment reasons
+        // unrelated to the fix. The orphan and real-repo tests carry the
+        // mutation red on every system; this one only pins the no-`.git`
+        // baseline.
+        let mut current = root.path();
+        let blocked_by_ancestor = loop {
+            if current.join(".git").exists() {
+                break true;
+            }
+            match current.parent() {
+                Some(parent) => current = parent,
+                None => break false,
+            }
+        };
+        if blocked_by_ancestor {
+            eprintln!(
+                "skipped: a `.git` ancestor exists above {}",
+                root.path().display()
+            );
+            return;
+        }
+
+        assert!(
+            !is_git_repo(root.path()),
+            "a directory with no `.git` ancestor must not register as a repo"
+        );
     }
 }
