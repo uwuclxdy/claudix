@@ -49,6 +49,17 @@ pub enum ClaudixError {
         recovery: RecoveryHint,
     },
 
+    // 200 with a body the provider cannot decode, or a decode that violates the
+    // OpenAI embeddings shape (count mismatch, invalid index, non-finite
+    // values). Treated as endpoint-unavailable so FallbackProvider switches to
+    // bundled instead of aborting the call: LM Studio returns 200 + HTML during
+    // warm-up, and a model-loading server can silently emit truncated batches.
+    #[error("embedding endpoint returned a bad payload: {endpoint}")]
+    EmbeddingEndpointBadPayload {
+        endpoint: String,
+        recovery: RecoveryHint,
+    },
+
     #[error("schema version mismatch: store={store}, binary={binary}")]
     SchemaMismatch {
         store: u32,
@@ -137,6 +148,7 @@ impl ClaudixError {
             Self::EmbeddingTimedOut { recovery, .. } => Some(recovery.0),
             Self::EmbeddingAuthRejected { recovery, .. } => Some(recovery.0),
             Self::EmbeddingHttpStatus { recovery, .. } => Some(recovery.0),
+            Self::EmbeddingEndpointBadPayload { recovery, .. } => Some(recovery.0),
             Self::SchemaMismatch { recovery, .. } => Some(recovery.0),
             Self::DimensionMismatch { recovery, .. } => Some(recovery.0),
             Self::EmbeddingModelMismatch { recovery, .. } => Some(recovery.0),
@@ -171,6 +183,7 @@ impl ClaudixError {
                 | Self::EmbeddingTimedOut { .. }
                 | Self::EmbeddingAuthRejected { .. }
                 | Self::EmbeddingHttpStatus { .. }
+                | Self::EmbeddingEndpointBadPayload { .. }
         )
     }
 }

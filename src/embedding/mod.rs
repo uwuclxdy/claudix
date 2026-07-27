@@ -116,7 +116,8 @@ impl Provider for FallbackProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ClaudixError;
+    use crate::error::{ClaudixError, RecoveryHint};
+    use crate::prompts::hints;
     use std::time::Duration;
 
     use tokio::net::TcpListener;
@@ -218,5 +219,51 @@ mod tests {
         assert!(
             matches!(result, Err(ClaudixError::Embedding(message)) if message == "bad payload")
         );
+    }
+
+    #[tokio::test]
+    async fn fallback_provider_falls_back_for_endpoint_bad_payload() {
+        // A primary that returns EmbeddingEndpointBadPayload (200 + non-JSON,
+        // count mismatch, invalid index, non-finite values) MUST trigger
+        // fallback rather than propagating — the endpoint is unusable for this
+        // session's embedding shape, not permanently broken.
+        struct BadPayloadProvider;
+
+        #[async_trait]
+        impl Provider for BadPayloadProvider {
+            fn name(&self) -> &str {
+                "bad-payload"
+            }
+
+            fn dimensions(&self) -> Dimension {
+                Dimension(2)
+            }
+
+            fn model_id(&self) -> &str {
+                "bad-payload-model"
+            }
+
+            async fn embed(&self, _batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+                Err(ClaudixError::EmbeddingEndpointBadPayload {
+                    endpoint: "http://test.example".to_owned(),
+                    recovery: RecoveryHint(hints::RUN_DOCTOR),
+                })
+            }
+
+            async fn health_check(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let provider = FallbackProvider::new(
+            Arc::new(BadPayloadProvider),
+            Arc::new(FixedProvider {
+                vectors: vec![vec![0.1, 0.2]],
+            }),
+        );
+
+        let result = provider.embed(&["alpha"]).await;
+        assert!(result.is_ok());
+        assert_eq!(result.ok().unwrap_or_default(), vec![vec![0.1, 0.2]]);
     }
 }

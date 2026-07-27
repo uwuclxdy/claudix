@@ -122,23 +122,29 @@ impl Provider for HttpProvider {
             .error_for_status()
             .map_err(|source| self.status_error(source))?;
 
-        let payload: EmbeddingResponse = response.json().await?;
+        let payload: EmbeddingResponse =
+            response
+                .json()
+                .await
+                .map_err(|_| ClaudixError::EmbeddingEndpointBadPayload {
+                    endpoint: self.endpoint.clone(),
+                    recovery: RecoveryHint(hints::RUN_DOCTOR),
+                })?;
         if payload.data.len() != batch.len() {
-            return Err(ClaudixError::Embedding(format!(
-                "provider returned {} embeddings for {} inputs",
-                payload.data.len(),
-                batch.len()
-            )));
+            return Err(ClaudixError::EmbeddingEndpointBadPayload {
+                endpoint: self.endpoint.clone(),
+                recovery: RecoveryHint(hints::RUN_DOCTOR),
+            });
         }
         let mut seen = vec![false; batch.len()];
         let mut items = Vec::with_capacity(payload.data.len());
         for (position, item) in payload.data.into_iter().enumerate() {
             let index = item.index.unwrap_or(position);
             if index >= batch.len() || seen[index] {
-                return Err(ClaudixError::Embedding(format!(
-                    "provider returned invalid embedding index {index} for {} inputs",
-                    batch.len()
-                )));
+                return Err(ClaudixError::EmbeddingEndpointBadPayload {
+                    endpoint: self.endpoint.clone(),
+                    recovery: RecoveryHint(hints::RUN_DOCTOR),
+                });
             }
             seen[index] = true;
             items.push((index, item.embedding));
@@ -146,7 +152,7 @@ impl Provider for HttpProvider {
         items.sort_unstable_by_key(|(idx, _)| *idx);
         let vectors: Vec<Vec<f32>> = items.into_iter().map(|(_, embedding)| embedding).collect();
 
-        validate_dimensions(&vectors, self.dimensions)?;
+        validate_dimensions(&vectors, self.dimensions, &self.endpoint)?;
         Ok(vectors)
     }
 
@@ -214,7 +220,7 @@ fn normalize_endpoint(endpoint: String) -> Result<String> {
     Ok(endpoint)
 }
 
-fn validate_dimensions(vectors: &[Vec<f32>], dimensions: Dimension) -> Result<()> {
+fn validate_dimensions(vectors: &[Vec<f32>], dimensions: Dimension, endpoint: &str) -> Result<()> {
     let expected = usize::from(dimensions.0);
 
     for vector in vectors {
@@ -226,9 +232,10 @@ fn validate_dimensions(vectors: &[Vec<f32>], dimensions: Dimension) -> Result<()
             });
         }
         if vector.iter().any(|value| !value.is_finite()) {
-            return Err(ClaudixError::Embedding(
-                "provider returned non-finite embedding values".to_owned(),
-            ));
+            return Err(ClaudixError::EmbeddingEndpointBadPayload {
+                endpoint: endpoint.to_owned(),
+                recovery: RecoveryHint(hints::RUN_DOCTOR),
+            });
         }
     }
 
@@ -329,9 +336,11 @@ mod tests {
         let provider = provider.ok().unwrap_or_else(|| unreachable!());
 
         let error = provider.embed(&["alpha", "beta"]).await;
-        assert!(
-            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("invalid embedding index 0"))
-        );
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, .. })
+                if endpoint == server.endpoint()
+        ));
         let _ = server.finish().await;
     }
 
@@ -353,9 +362,11 @@ mod tests {
         let provider = provider.ok().unwrap_or_else(|| unreachable!());
 
         let error = provider.embed(&["alpha", "beta"]).await;
-        assert!(
-            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("invalid embedding index 2"))
-        );
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, .. })
+                if endpoint == server.endpoint()
+        ));
         let _ = server.finish().await;
     }
 
@@ -375,19 +386,56 @@ mod tests {
         let provider = provider.ok().unwrap_or_else(|| unreachable!());
 
         let error = provider.embed(&["alpha", "beta"]).await;
-        assert!(
-            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("1 embeddings for 2 inputs"))
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, .. })
+                if endpoint == server.endpoint()
+        ));
+        let _ = server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn http_provider_classifies_non_json_body_as_bad_payload() {
+        // LM Studio during warm-up can return 200 + HTML. The decode failure
+        // must classify as endpoint-unavailable so FallbackProvider switches to
+        // bundled instead of hard-failing the call.
+        let server = TestServer::spawn(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: 5\r\n\r\noops!"
+                .to_owned(),
+        )
+        .await;
+
+        let provider = HttpProvider::new(
+            server.endpoint(),
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
         );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
+
+        let error = provider.embed(&["alpha"]).await;
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, .. })
+                if endpoint == server.endpoint()
+        ));
         let _ = server.finish().await;
     }
 
     #[test]
     fn validate_dimensions_rejects_non_finite_embedding_values() {
-        let error = validate_dimensions(&[vec![0.1, f32::INFINITY]], Dimension(2));
-
-        assert!(
-            matches!(error, Err(ClaudixError::Embedding(message)) if message.contains("non-finite embedding"))
+        let error = validate_dimensions(
+            &[vec![0.1, f32::INFINITY]],
+            Dimension(2),
+            "http://test.example",
         );
+
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingEndpointBadPayload { .. })
+        ));
     }
 
     #[tokio::test]
