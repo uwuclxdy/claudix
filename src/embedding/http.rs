@@ -107,20 +107,30 @@ impl Provider for HttpProvider {
                 .send()
                 .await;
 
-            match send_result {
-                Ok(response) => break response,
+            let response = match send_result {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => response,
+                    Err(source)
+                        if attempt < MAX_RETRY_ATTEMPTS
+                            && source.status().is_some_and(|status| {
+                                status.is_server_error() || status.as_u16() == 429
+                            }) =>
+                    {
+                        tokio::time::sleep(delay).await;
+                        delay = (delay * 2).min(RETRY_MAX_DELAY);
+                        continue;
+                    }
+                    Err(source) => return Err(self.status_error(source)),
+                },
                 Err(source) if attempt < MAX_RETRY_ATTEMPTS && is_retryable_transport(&source) => {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(RETRY_MAX_DELAY);
                     continue;
                 }
                 Err(source) => return Err(self.transport_error(source)),
-            }
+            };
+            break response;
         };
-
-        let response = response
-            .error_for_status()
-            .map_err(|source| self.status_error(source))?;
 
         let payload: EmbeddingResponse =
             response
@@ -245,6 +255,8 @@ fn validate_dimensions(vectors: &[Vec<f32>], dimensions: Dimension, endpoint: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -565,6 +577,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_provider_retries_5xx_then_succeeds() {
+        // A model-loading LM Studio returns 503 until weights are resident;
+        // embed() must retry inside the loop and succeed once the server is
+        // ready, rather than hard-failing on the first 503.
+        let server = MultiResponseServer::spawn(vec![
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_owned(),
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\n\r\n".to_owned(),
+            response_with_json(r#"{"data":[{"embedding":[0.1,0.2]}]}"#),
+        ])
+        .await;
+
+        let provider = HttpProvider::new(
+            server.endpoint(),
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
+
+        let result = provider.embed(&["alpha"]).await;
+        assert!(result.is_ok());
+        assert_eq!(
+            result.ok().unwrap_or_default(),
+            vec![vec![0.1_f32, 0.2_f32]]
+        );
+        // Three requests observed: two 503s + the 200.
+        assert_eq!(server.request_count(), 3);
+    }
+
+    #[tokio::test]
     async fn http_provider_reports_timeout_when_response_stalls() {
         let listener = TcpListener::bind("127.0.0.1:0").await;
         assert!(listener.is_ok());
@@ -654,6 +698,56 @@ mod tests {
             let request = self.request_rx.await.ok().unwrap_or_else(|| unreachable!());
             let _ = self.shutdown_tx.send(());
             request
+        }
+    }
+
+    /// Loopback server that serves a sequence of canned responses on successive
+    /// accepts, with a shared request counter. Used by retry tests that need
+    /// the client to observe multiple responses on the same listener.
+    struct MultiResponseServer {
+        endpoint: String,
+        request_count: Arc<AtomicU32>,
+        _handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl MultiResponseServer {
+        async fn spawn(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await;
+            assert!(listener.is_ok());
+            let listener = listener.ok().unwrap_or_else(|| unreachable!());
+            let endpoint = format!(
+                "http://{}",
+                listener.local_addr().ok().unwrap_or_else(|| unreachable!())
+            );
+            let request_count = Arc::new(AtomicU32::new(0));
+            let count_clone = Arc::clone(&request_count);
+            let _handle = tokio::spawn(async move {
+                for response in responses {
+                    let (mut socket, _) = match listener.accept().await {
+                        Ok(pair) => pair,
+                        Err(_) => return,
+                    };
+                    let mut buffer = vec![0_u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    count_clone.fetch_add(1, Ordering::SeqCst);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                }
+            });
+
+            Self {
+                endpoint,
+                request_count,
+                _handle,
+            }
+        }
+
+        fn endpoint(&self) -> &str {
+            &self.endpoint
+        }
+
+        fn request_count(&self) -> u32 {
+            self.request_count.load(Ordering::SeqCst)
         }
     }
 }
