@@ -136,13 +136,19 @@ impl Provider for HttpProvider {
             response
                 .json()
                 .await
-                .map_err(|_| ClaudixError::EmbeddingEndpointBadPayload {
+                .map_err(|source| ClaudixError::EmbeddingEndpointBadPayload {
                     endpoint: self.endpoint.clone(),
+                    reason: source.to_string(),
                     recovery: RecoveryHint(hints::RUN_DOCTOR),
                 })?;
         if payload.data.len() != batch.len() {
             return Err(ClaudixError::EmbeddingEndpointBadPayload {
                 endpoint: self.endpoint.clone(),
+                reason: format!(
+                    "provider returned {} embeddings for {} inputs",
+                    payload.data.len(),
+                    batch.len()
+                ),
                 recovery: RecoveryHint(hints::RUN_DOCTOR),
             });
         }
@@ -153,6 +159,7 @@ impl Provider for HttpProvider {
             if index >= batch.len() || seen[index] {
                 return Err(ClaudixError::EmbeddingEndpointBadPayload {
                     endpoint: self.endpoint.clone(),
+                    reason: format!("invalid embedding index {index} for {} inputs", batch.len()),
                     recovery: RecoveryHint(hints::RUN_DOCTOR),
                 });
             }
@@ -244,6 +251,7 @@ fn validate_dimensions(vectors: &[Vec<f32>], dimensions: Dimension, endpoint: &s
         if vector.iter().any(|value| !value.is_finite()) {
             return Err(ClaudixError::EmbeddingEndpointBadPayload {
                 endpoint: endpoint.to_owned(),
+                reason: "non-finite embedding values".to_owned(),
                 recovery: RecoveryHint(hints::RUN_DOCTOR),
             });
         }
@@ -350,8 +358,8 @@ mod tests {
         let error = provider.embed(&["alpha", "beta"]).await;
         assert!(matches!(
             error,
-            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, .. })
-                if endpoint == server.endpoint()
+            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, reason, .. })
+                if endpoint == server.endpoint() && reason.contains("invalid embedding index")
         ));
         let _ = server.finish().await;
     }
@@ -376,8 +384,8 @@ mod tests {
         let error = provider.embed(&["alpha", "beta"]).await;
         assert!(matches!(
             error,
-            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, .. })
-                if endpoint == server.endpoint()
+            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, reason, .. })
+                if endpoint == server.endpoint() && reason.contains("invalid embedding index")
         ));
         let _ = server.finish().await;
     }
@@ -400,8 +408,9 @@ mod tests {
         let error = provider.embed(&["alpha", "beta"]).await;
         assert!(matches!(
             error,
-            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, .. })
+            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, reason, .. })
                 if endpoint == server.endpoint()
+                    && reason == "provider returned 1 embeddings for 2 inputs"
         ));
         let _ = server.finish().await;
     }
@@ -430,8 +439,8 @@ mod tests {
         let error = provider.embed(&["alpha"]).await;
         assert!(matches!(
             error,
-            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, .. })
-                if endpoint == server.endpoint()
+            Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, reason, .. })
+                if endpoint == server.endpoint() && reason.contains("decoding")
         ));
         let _ = server.finish().await;
     }
@@ -446,7 +455,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            Err(ClaudixError::EmbeddingEndpointBadPayload { .. })
+            Err(ClaudixError::EmbeddingEndpointBadPayload { reason, .. })
+                if reason.contains("non-finite")
         ));
     }
 

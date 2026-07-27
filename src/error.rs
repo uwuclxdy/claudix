@@ -54,9 +54,10 @@ pub enum ClaudixError {
     // values). Treated as endpoint-unavailable so FallbackProvider switches to
     // bundled instead of aborting the call: LM Studio returns 200 + HTML during
     // warm-up, and a model-loading server can silently emit truncated batches.
-    #[error("embedding endpoint returned a bad payload: {endpoint}")]
+    #[error("embedding endpoint returned a bad payload ({reason}): {endpoint}")]
     EmbeddingEndpointBadPayload {
         endpoint: String,
+        reason: String,
         recovery: RecoveryHint,
     },
 

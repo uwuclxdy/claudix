@@ -246,6 +246,7 @@ mod tests {
             async fn embed(&self, _batch: &[&str]) -> Result<Vec<Vec<f32>>> {
                 Err(ClaudixError::EmbeddingEndpointBadPayload {
                     endpoint: "http://test.example".to_owned(),
+                    reason: "test payload rejection".to_owned(),
                     recovery: RecoveryHint(hints::RUN_DOCTOR),
                 })
             }
