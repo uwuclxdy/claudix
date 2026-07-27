@@ -619,6 +619,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_provider_does_not_retry_4xx() {
+        // A 401 must surface immediately as EmbeddingAuthRejected without
+        // consuming the retry budget — widening the predicate to retry 4xx
+        // would burn the second slot on the canned 200 and silently mask the
+        // auth failure.
+        let server = MultiResponseServer::spawn(vec![
+            "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".to_owned(),
+            response_with_json(r#"{"data":[{"embedding":[0.1,0.2]}]}"#),
+        ])
+        .await;
+
+        let provider = HttpProvider::new(
+            server.endpoint(),
+            "test-model",
+            Dimension(2),
+            Duration::from_secs(5),
+            None,
+        );
+        assert!(provider.is_ok());
+        let provider = provider.ok().unwrap_or_else(|| unreachable!());
+
+        let error = provider.embed(&["alpha"]).await;
+        assert!(matches!(
+            error,
+            Err(ClaudixError::EmbeddingAuthRejected { status: 401, .. })
+        ));
+        assert_eq!(server.request_count(), 1);
+    }
+
+    #[tokio::test]
     async fn http_provider_reports_timeout_when_response_stalls() {
         let listener = TcpListener::bind("127.0.0.1:0").await;
         assert!(listener.is_ok());
