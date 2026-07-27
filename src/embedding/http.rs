@@ -154,8 +154,13 @@ impl Provider for HttpProvider {
             return Err(ClaudixError::EmbeddingEndpointBadPayload {
                 endpoint: self.endpoint.clone(),
                 reason: format!(
-                    "provider returned {} embeddings for {} inputs",
+                    "provider returned {} {} for {} inputs",
                     payload.data.len(),
+                    if payload.data.len() == 1 {
+                        "embedding"
+                    } else {
+                        "embeddings"
+                    },
                     batch.len()
                 ),
                 recovery: RecoveryHint(hints::RUN_DOCTOR),
@@ -419,7 +424,7 @@ mod tests {
             error,
             Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, reason, .. })
                 if endpoint == server.endpoint()
-                    && reason == "provider returned 1 embeddings for 2 inputs"
+                    && reason.contains("provider returned 1 embedding for 2 inputs")
         ));
         let _ = server.finish().await;
     }
