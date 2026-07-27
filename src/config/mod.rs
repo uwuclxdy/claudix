@@ -146,7 +146,7 @@ impl Default for Config {
                     .dimensions
                     .0,
                 batch_size: 32,
-                timeout_ms: 30_000,
+                timeout_ms: 8_000,
             },
             indexing: IndexingConfig {
                 respect_gitignore: true,
@@ -792,6 +792,14 @@ index_dir = ".claudix/custom-index"
 
         let error = validate(&config);
         assert!(matches!(error, Err(ClaudixError::ConfigInvalid { .. })));
+    }
+
+    #[test]
+    fn default_embedding_timeout_is_8s() {
+        // A localhost embedding API has no business taking the prior 30s
+        // default. With MAX_RETRY_ATTEMPTS=3 and the 200ms base backoff, 8s
+        // bounds a worst-case embed() call near 25s instead of ~91s.
+        assert_eq!(Config::default().embedding.timeout_ms, 8_000);
     }
 
     #[test]
