@@ -132,13 +132,22 @@ impl Provider for HttpProvider {
             break response;
         };
 
+        // reqwest's Display hides the serde parse detail in `source()`; walk
+        // the chain so /claudix:doctor can show "expected value", not
+        // "decoding". Drop this if reqwest inlines the parse text into Display.
         let payload: EmbeddingResponse =
             response
                 .json()
                 .await
                 .map_err(|source| ClaudixError::EmbeddingEndpointBadPayload {
                     endpoint: self.endpoint.clone(),
-                    reason: source.to_string(),
+                    reason: std::iter::successors(
+                        Some(&source as &dyn std::error::Error),
+                        |error| error.source(),
+                    )
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join(": "),
                     recovery: RecoveryHint(hints::RUN_DOCTOR),
                 })?;
         if payload.data.len() != batch.len() {
@@ -440,7 +449,7 @@ mod tests {
         assert!(matches!(
             error,
             Err(ClaudixError::EmbeddingEndpointBadPayload { endpoint, reason, .. })
-                if endpoint == server.endpoint() && reason.contains("decoding")
+                if endpoint == server.endpoint() && reason.contains("line")
         ));
         let _ = server.finish().await;
     }
