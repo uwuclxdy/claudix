@@ -11,7 +11,7 @@ mod post_tool_use;
 mod pre_tool_use;
 mod ready_check;
 mod session_start;
-mod spawn;
+pub(crate) mod spawn;
 
 use payload::HookPayload;
 use post_tool_use::{combine_hook_responses, take_change_neighbors_context};
@@ -37,6 +37,7 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
         HookPayload {
             tool_name: None,
             tool_input: None,
+            session_id: None,
         }
     } else {
         serde_json::from_str(payload)?
@@ -55,8 +56,13 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
                 (Some(st), Some(cfg)) => check_index_ready(st, cfg, "UserPromptSubmit"),
                 _ => None,
             };
-            let neighbors =
-                take_change_neighbors_context(store.as_ref(), config.as_ref(), "UserPromptSubmit");
+            let neighbors = take_change_neighbors_context(
+                store.as_ref(),
+                config.as_ref(),
+                "UserPromptSubmit",
+                payload.session_id.as_deref(),
+                &[],
+            );
             Ok(combine_hook_responses(
                 "UserPromptSubmit",
                 [index_ready, neighbors],

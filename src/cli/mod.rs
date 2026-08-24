@@ -852,7 +852,9 @@ pub async fn run_reindex_file(
     // again, since the reindex-file child returns 0 with no retry path.
     let _reindex_lock = store.acquire_reindex_lock()?;
     let claudix = Claudix::new(project_root, Arc::new(config)).await?;
-    let stats = claudix.reindex_file(path.as_ref()).await?;
+    // No session identity: a manual reindex cannot be attributed, so it never
+    // writes a change-neighbors marker (the ack would drop it unread anyway).
+    let stats = claudix.reindex_file(path.as_ref(), None).await?;
 
     Ok(IndexOutput {
         file_count: stats.file_count,

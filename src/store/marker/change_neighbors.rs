@@ -4,12 +4,18 @@
 //! Layout — single-line JSON file:
 //!
 //! ```json
-//! {"edited_path":"src/foo.rs","neighbors":[{"file_path":"src/bar.rs","line_start":1,"line_end":10,"name":"fn_name","score":0.82}]}
+//! {"edited_path":"src/foo.rs","session_id":"abc123","neighbors":[{"file_path":"src/bar.rs","line_start":1,"line_end":10,"name":"fn_name","score":0.82}]}
 //! ```
 //!
 //! The hook reads, surfaces, and atomically deletes this file on the next
 //! `PostToolUse` or `UserPromptSubmit` event. If it does not exist the hook
 //! produces no neighbors output.
+//!
+//! `session_id` names the session whose edit produced the marker; the acking
+//! hook drops (without surfacing) any marker whose session is not the acking
+//! event's own. Absent on legacy markers — `#[serde(default)]`, and those read
+//! as `None`, which no event matches, so a pre-attribution marker never
+//! surfaces either.
 
 use std::collections::HashSet;
 use std::fs;
@@ -31,6 +37,11 @@ pub(crate) struct NeighborEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ChangeNeighborsMarker {
     pub edited_path: String,
+    /// Session whose edit produced this marker; the ack only ever surfaces it
+    /// to an event of that same session. `None` = unattributed (legacy format,
+    /// or a writer that refused to guess) and never surfaces.
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub neighbors: Vec<NeighborEntry>,
 }
 

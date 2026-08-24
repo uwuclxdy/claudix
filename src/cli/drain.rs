@@ -108,7 +108,13 @@ async fn drain_loop(project_root: &Path, config: &Config, store: &Store) -> Resu
                         continue;
                     }
                 };
-                if let Err(error) = claudix.reindex_file(Path::new(path)).await {
+                // The marker the reindex writes is attributed to the session of
+                // this path's newest queue line (the last edit the reindex will
+                // see). Unattributed edits never write a marker: the reader
+                // only surfaces a marker whose session matches the event's, so
+                // an unowned marker would be dropped unread.
+                let session = reindex_queue::latest_session(&entries, path);
+                if let Err(error) = claudix.reindex_file(Path::new(path), session).await {
                     tracing::warn!("claudix drain failed to reindex {path}: {error}");
                 }
                 drop(reindex_lock);

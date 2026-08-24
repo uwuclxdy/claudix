@@ -2,13 +2,15 @@
 //!
 //! One-shot `PostToolUse` hooks share no memory, so rapid edits to the same
 //! file would each spawn a fresh detached reindex. Instead every edit appends a
-//! `millis<TAB>relative-path` line here, and a single drain worker (claimed via
-//! a pid marker) owns the debounce timing loop and reindexes each file once.
+//! `millis<TAB>relative-path<TAB>session-id` line here (the session id is
+//! omitted when the enqueueing event carried none, so legacy two-field lines
+//! parse as `session: None`), and a single drain worker (claimed via a pid
+//! marker) owns the debounce timing loop and reindexes each file once.
 //!
 //! Layout — one line per edit, append-only:
 //!
 //! ```text
-//! 1717430400123\tsrc/foo.rs
+//! 1717430400123\tsrc/foo.rs\tsess-abc
 //! 1717430400512\tsrc/foo.rs
 //! ```
 //!
@@ -57,6 +59,9 @@ pub(crate) fn now_epoch_millis() -> u64 {
 pub(crate) struct QueueEntry {
     pub ts: u64,
     pub path: String,
+    /// Session of the hook event that enqueued this edit; `None` on legacy
+    /// two-field lines or events that carried no session id.
+    pub session: Option<String>,
 }
 
 /// Per-distinct-path first/last edit timestamps (epoch millis).
@@ -74,18 +79,32 @@ pub(crate) struct DuePaths {
 }
 
 /// Parse raw queue content into entries, skipping malformed lines (fail-open).
+/// A line is `millis<TAB>path` or `millis<TAB>path<TAB>session`; the session
+/// field is everything after the path's first tab, so a session id containing a
+/// tab cannot forge an extra field — it just never matches a real event session
+/// and the marker it would attribute gets dropped unread (loss, never a wrong
+/// hint). A newline in a session id splits the line: the edit's own line still
+/// parses, with a truncated session that never matches a real event (the hint
+/// is lost, never misattributed), and the stray remainder fails the parse.
 pub(crate) fn parse_entries(content: &str) -> Vec<QueueEntry> {
     content
         .lines()
         .filter_map(|line| {
-            let (ts, path) = line.split_once('\t')?;
+            let (ts, rest) = line.split_once('\t')?;
             let ts = ts.trim().parse::<u64>().ok()?;
+            let (path, session) = match rest.split_once('\t') {
+                Some((path, session)) => (path, Some(session)),
+                None => (rest, None),
+            };
             if path.is_empty() {
                 return None;
             }
             Some(QueueEntry {
                 ts,
                 path: path.to_owned(),
+                session: session
+                    .filter(|session| !session.is_empty())
+                    .map(str::to_owned),
             })
         })
         .collect()
@@ -142,12 +161,12 @@ pub(crate) fn read_content(queue_path: &Path) -> String {
     fs::read_to_string(queue_path).unwrap_or_default()
 }
 
-/// Append one edited path to the queue. Fail-open: a lock miss or write error
-/// returns `false` (the edit is simply not coalesced; it is caught by the next
-/// edit to that file or a manifest-age full reindex). Serialized against
-/// [`remove_drained`] via the queue lock so an append is never lost to a
-/// concurrent worker rewrite.
-pub(crate) fn append(queue_path: &Path, relative_path: &str) -> bool {
+/// Append one edited path (and its editing session, when known) to the queue.
+/// Fail-open: a lock miss or write error returns `false` (the edit is simply
+/// not coalesced; it is caught by the next edit to that file or a manifest-age
+/// full reindex). Serialized against [`remove_drained`] via the queue lock so
+/// an append is never lost to a concurrent worker rewrite.
+pub(crate) fn append(queue_path: &Path, relative_path: &str, session_id: Option<&str>) -> bool {
     if let Some(parent) = queue_path.parent() {
         let _ = fs::create_dir_all(parent);
     }
@@ -161,7 +180,28 @@ pub(crate) fn append(queue_path: &Path, relative_path: &str) -> bool {
     else {
         return false;
     };
-    writeln!(file, "{}\t{relative_path}", now_epoch_millis()).is_ok()
+    let written = match session_id {
+        Some(session) => writeln!(file, "{}\t{relative_path}\t{session}", now_epoch_millis()),
+        None => writeln!(file, "{}\t{relative_path}", now_epoch_millis()),
+    };
+    written.is_ok()
+}
+
+/// Session of the newest queue line for `path` (ties resolve to the
+/// later-appended line), or `None` when the path has no entries or its newest
+/// edit carried no session. The drain worker attributes the reindexed edit's
+/// change-neighbors marker to this session.
+pub(crate) fn latest_session<'a>(entries: &'a [QueueEntry], path: &str) -> Option<&'a str> {
+    let mut newest: Option<&QueueEntry> = None;
+    for entry in entries {
+        if entry.path != path {
+            continue;
+        }
+        if newest.is_none_or(|newest| entry.ts >= newest.ts) {
+            newest = Some(entry);
+        }
+    }
+    newest.and_then(|entry| entry.session.as_deref())
 }
 
 /// Remove the entries drained by a completed reindex, keeping every other line.
@@ -182,7 +222,12 @@ pub(crate) fn remove_drained(queue_path: &Path, drained: &BTreeMap<String, u64>)
             .get(&entry.path)
             .is_some_and(|&cutoff| entry.ts <= cutoff);
         if !is_drained {
-            kept.push_str(&format!("{}\t{}\n", entry.ts, entry.path));
+            match entry.session.as_deref() {
+                Some(session) => {
+                    kept.push_str(&format!("{}\t{}\t{session}\n", entry.ts, entry.path));
+                }
+                None => kept.push_str(&format!("{}\t{}\n", entry.ts, entry.path)),
+            }
         }
     }
     // Temp+rename so the lock-free loop-top read never sees a truncated file.
@@ -246,6 +291,7 @@ mod tests {
         QueueEntry {
             ts,
             path: path.to_owned(),
+            session: None,
         }
     }
 
@@ -329,7 +375,7 @@ mod tests {
     fn append_writes_a_parseable_line() {
         let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
         let queue = dir.path().join("reindex-queue");
-        assert!(append(&queue, "src/a.rs"));
+        assert!(append(&queue, "src/a.rs", None));
 
         let entries = parse_entries(&read_content(&queue));
         assert_eq!(entries.len(), 1);
@@ -340,9 +386,9 @@ mod tests {
     fn append_then_parse_collapses_repeated_path_to_one() {
         let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
         let queue = dir.path().join("reindex-queue");
-        assert!(append(&queue, "src/a.rs"));
-        assert!(append(&queue, "src/a.rs"));
-        assert!(append(&queue, "src/a.rs"));
+        assert!(append(&queue, "src/a.rs", None));
+        assert!(append(&queue, "src/a.rs", None));
+        assert!(append(&queue, "src/a.rs", None));
 
         let windows = collapse(&parse_entries(&read_content(&queue)));
         assert_eq!(windows.len(), 1, "three edits of one file → one path");
@@ -350,6 +396,53 @@ mod tests {
         assert!(
             window.last_seen >= window.first_seen,
             "last_seen must not precede first_seen"
+        );
+    }
+
+    #[test]
+    fn append_with_session_round_trips_and_latest_session_wins_ties() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let queue = dir.path().join("reindex-queue");
+        assert!(append(&queue, "src/a.rs", Some("sess-1")));
+        // Same path later, no session (legacy-shaped line).
+        assert!(append(&queue, "src/a.rs", None));
+        assert!(append(&queue, "src/b.rs", Some("sess-2")));
+
+        let entries = parse_entries(&read_content(&queue));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries[0].session.as_deref(),
+            Some("sess-1"),
+            "the session field must survive the append/parse round trip"
+        );
+        assert_eq!(entries[1].session, None, "a two-field line parses as None");
+
+        // The newest line for src/a.rs is the later-appended one, whose session
+        // is None — latest_session must report None, not the stale sess-1.
+        assert_eq!(latest_session(&entries, "src/a.rs"), None);
+        assert_eq!(latest_session(&entries, "src/b.rs"), Some("sess-2"));
+        assert_eq!(latest_session(&entries, "src/nope.rs"), None);
+    }
+
+    #[test]
+    fn remove_drained_preserves_the_session_field() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let queue = dir.path().join("reindex-queue");
+        let seeded = "100\tsrc/a.rs\tsess-1\n200\tsrc/a.rs\n150\tsrc/b.rs\tsess-2\n";
+        assert!(fs::write(&queue, seeded).is_ok());
+
+        let mut drained = BTreeMap::new();
+        drained.insert("src/a.rs".to_owned(), 200);
+        drained.insert("src/b.rs".to_owned(), 100);
+        assert!(remove_drained(&queue, &drained));
+
+        let entries = parse_entries(&read_content(&queue));
+        assert_eq!(entries.len(), 1, "only the undrained b@150 line survives");
+        assert_eq!(entries[0].path, "src/b.rs");
+        assert_eq!(
+            entries[0].session.as_deref(),
+            Some("sess-2"),
+            "the rewrite must keep the surviving line's session field"
         );
     }
 

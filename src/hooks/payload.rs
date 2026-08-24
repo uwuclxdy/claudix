@@ -5,6 +5,12 @@ use serde_json::Value;
 pub(super) struct HookPayload {
     pub tool_name: Option<String>,
     pub tool_input: Option<ToolInput>,
+    /// Claude Code's hook input schema carries a `session_id` on every event
+    /// (basis: the documented CC hook payload shape, not measured here).
+    /// `None` — an older client, a partial payload, or the empty-payload test
+    /// path — means the event cannot be attributed and never acks a marker.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -387,7 +387,12 @@ impl Claudix {
         })
     }
 
-    pub async fn reindex_file(&self, path: &Path) -> Result<IndexStats> {
+    /// `session_id` names the session whose edit triggered this reindex; the
+    /// change-neighbors marker records it so the acking hook only surfaces the
+    /// hint inside that same session. `None` means the edit cannot be
+    /// attributed (a manual `claudix reindex-file`, a watcher launched without
+    /// a session identity), and no marker is written at all.
+    pub async fn reindex_file(&self, path: &Path, session_id: Option<&str>) -> Result<IndexStats> {
         let relative_path = self.relative_path_from_input(path)?;
 
         // Honour the same ignore set the watcher uses so a direct CLI/MCP call
@@ -509,6 +514,7 @@ impl Claudix {
                 &relative_path,
                 &embedded_chunks,
                 &previous_contents,
+                session_id,
             )
             .await;
         }
@@ -537,7 +543,15 @@ impl Claudix {
         relative_path: &RelativePath,
         embedded_chunks: &[EmbeddedChunk],
         previous_contents: &HashSet<FileHash>,
+        session_id: Option<&str>,
     ) {
+        // An unattributed edit never writes a hint: the acking hook drops any
+        // marker whose session does not match its event, so an unowned marker
+        // could only ever be dropped later. Refusing here is cheaper and makes
+        // the direction explicit — no hint without a session identity.
+        let Some(session_id) = session_id else {
+            return;
+        };
         // Query with the chunks this edit actually introduced. Every chunk of
         // the file makes the neighbor set a property of the file rather than of
         // the edit, so every save re-injects the same "related code" list.
@@ -633,6 +647,7 @@ impl Claudix {
             &marker_path,
             &ChangeNeighborsMarker {
                 edited_path: relative_path.as_str().to_owned(),
+                session_id: Some(session_id.to_owned()),
                 neighbors: entries,
             },
         );
@@ -1545,7 +1560,7 @@ mod tests {
             .is_ok()
         );
 
-        let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
+        let stats = claudix.reindex_file(Path::new("src/math.rs"), None).await;
         assert!(stats.is_ok());
         assert_eq!(
             stats.ok().unwrap_or_else(|| unreachable!()),
@@ -1582,7 +1597,7 @@ mod tests {
         assert!(claudix.index_full(&mut ()).await.is_ok());
 
         // Reindex the same file without modifying it — hash matches stored hash, must skip.
-        let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
+        let stats = claudix.reindex_file(Path::new("src/math.rs"), None).await;
         assert!(stats.is_ok());
         let stats = stats.ok().unwrap_or_else(|| unreachable!());
         // Chunk count unchanged — no re-embedding happened.
@@ -1611,7 +1626,7 @@ mod tests {
             claudix.config().clone(),
             embedder,
         )?;
-        c2.reindex_file(Path::new("src/math.rs")).await?;
+        c2.reindex_file(Path::new("src/math.rs"), None).await?;
 
         assert_eq!(
             calls.load(Ordering::Relaxed),
@@ -1657,7 +1672,8 @@ mod tests {
                 claudix.config().clone(),
                 embedder,
             )?;
-            c2.reindex_file(std::path::Path::new("binary.bin")).await?;
+            c2.reindex_file(std::path::Path::new("binary.bin"), None)
+                .await?;
             calls.load(Ordering::Relaxed)
         };
         assert_eq!(
@@ -2001,7 +2017,7 @@ mod tests {
                 .is_ok()
         );
 
-        let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
+        let stats = claudix.reindex_file(Path::new("src/math.rs"), None).await;
         assert!(stats.is_ok());
         assert_eq!(
             stats.ok().unwrap_or_else(|| unreachable!()),
@@ -2047,7 +2063,7 @@ mod tests {
             .is_ok()
         );
 
-        let stats = claudix.reindex_file(Path::new("src/lib.rs")).await;
+        let stats = claudix.reindex_file(Path::new("src/lib.rs"), None).await;
         assert!(stats.is_ok());
 
         let rows = claudix.store.read_chunks().await;
@@ -2076,7 +2092,7 @@ mod tests {
         // replace path. The skip path must still prune the deleted file.
         fs::remove_file(fixture.root().join("src/math.rs")).await?;
 
-        claudix.reindex_file(Path::new("src/lib.rs")).await?;
+        claudix.reindex_file(Path::new("src/lib.rs"), None).await?;
 
         let rows = claudix.store.read_chunks().await?;
         assert!(
@@ -2108,7 +2124,7 @@ mod tests {
                 .is_ok()
         );
 
-        let stats = claudix.reindex_file(Path::new("src/math.rs")).await;
+        let stats = claudix.reindex_file(Path::new("src/math.rs"), None).await;
         assert!(stats.is_ok());
 
         let rows = claudix.store.read_chunks().await;
@@ -2136,7 +2152,9 @@ mod tests {
         }
         fs::write(&internal, b"pub fn stray() -> u32 { 1 }\n").await?;
 
-        let stats = claudix.reindex_file(Path::new(".claudix/stray.rs")).await?;
+        let stats = claudix
+            .reindex_file(Path::new(".claudix/stray.rs"), None)
+            .await?;
         assert_eq!(stats.chunk_count, baseline.len());
 
         let after = claudix.store.read_chunks().await?;
@@ -2257,7 +2275,9 @@ mod tests {
         )
         .await?;
 
-        claudix.reindex_file(Path::new("src/lib.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/lib.rs"), Some("sess-test"))
+            .await?;
 
         let marker_path = claudix.store.change_neighbors_marker_path();
         assert!(
@@ -2270,6 +2290,11 @@ mod tests {
         let marker = marker.unwrap_or_else(|| unreachable!());
 
         assert_eq!(marker.edited_path, "src/lib.rs");
+        assert_eq!(
+            marker.session_id.as_deref(),
+            Some("sess-test"),
+            "the marker must record the reindexing session"
+        );
         assert!(
             marker
                 .neighbors
@@ -2280,6 +2305,56 @@ mod tests {
         assert!(
             marker.neighbors.iter().all(|n| n.file_path != "src/lib.rs"),
             "edited file must not appear in its own neighbor list"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reindex_file_without_session_writes_no_change_neighbors_marker() -> Result<()> {
+        // The refuse-hints fallback: an edit nobody can attribute (a manual
+        // `claudix reindex-file`, a watcher launched without a session
+        // identity) must not leave a marker a later session's ack would either
+        // surface wrongly or drop unread — the reindex just skips hint writing.
+        let fixture = TestFixture::new("small_rust")?;
+        let mut config = stub_config();
+        config.hooks.surface_related_on_edit = true;
+        config.hooks.related_top_k = 5;
+        config.hooks.related_min_similarity = 0.0;
+
+        let shared_vector = vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let claudix = claudix_with_rotating(
+            fixture.root().to_path_buf(),
+            config.clone(),
+            vec![shared_vector.clone()],
+        )?;
+        claudix.store.ensure_layout()?;
+
+        seed_chunk(
+            &claudix.store,
+            claudix.config.as_ref(),
+            "src/other.rs",
+            "other_fn",
+            shared_vector,
+        )
+        .await?;
+        tokio::fs::write(
+            fixture.root().join("src/other.rs"),
+            b"pub fn other_fn() {}\n",
+        )
+        .await?;
+        tokio::fs::write(
+            fixture.root().join("src/lib.rs"),
+            b"pub fn greet(name: &str) -> String { format!(\"Hello, {name}!\") }\n",
+        )
+        .await?;
+
+        // Same near-duplicate setup that writes a marker above, but with no
+        // session identity on the reindex call.
+        claudix.reindex_file(Path::new("src/lib.rs"), None).await?;
+
+        assert!(
+            !claudix.store.change_neighbors_marker_path().exists(),
+            "an unattributed reindex must not write a change-neighbors marker"
         );
         Ok(())
     }
@@ -2312,7 +2387,9 @@ mod tests {
 
         tokio::fs::write(fixture.root().join("src/lib.rs"), b"pub fn greet() {}\n").await?;
 
-        claudix.reindex_file(Path::new("src/lib.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/lib.rs"), Some("sess-test"))
+            .await?;
 
         assert!(
             !claudix.store.change_neighbors_marker_path().exists(),
@@ -2347,7 +2424,9 @@ mod tests {
 
         tokio::fs::write(fixture.root().join("src/lib.rs"), b"pub fn greet() {}\n").await?;
 
-        claudix.reindex_file(Path::new("src/lib.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/lib.rs"), Some("sess-test"))
+            .await?;
 
         assert!(
             !claudix.store.change_neighbors_marker_path().exists(),
@@ -2427,7 +2506,9 @@ mod tests {
         let edited = fixture.root().join("src/edited.rs");
 
         fs::write(&edited, format!("{ALPHA_FN}\n{BETA_FN}")).await?;
-        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/edited.rs"), Some("sess-test"))
+            .await?;
 
         // Count, not identity: on an exact score tie `neighbor_rank` still orders
         // deterministically by path, but which entry survives a budget of 1 is not
@@ -2486,7 +2567,9 @@ mod tests {
 
         let edited = fixture.root().join("src/edited.rs");
         fs::write(&edited, ALPHA_FN).await?;
-        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/edited.rs"), Some("sess-test"))
+            .await?;
 
         let pooled = marker_neighbor_paths(&claudix.store.change_neighbors_marker_path()).len();
         assert!(
@@ -2509,7 +2592,9 @@ mod tests {
         let marker_path = claudix.store.change_neighbors_marker_path();
 
         fs::write(&edited, format!("{ALPHA_FN}\n{BETA_FN}")).await?;
-        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/edited.rs"), Some("sess-test"))
+            .await?;
 
         // Control: with nothing stored for the file, both chunks are new and
         // both neighbors are reachable. Without it the assertion below could
@@ -2528,7 +2613,9 @@ mod tests {
             format!("{ALPHA_FN}\npub fn beta() {{\n    22\n}}\n"),
         )
         .await?;
-        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/edited.rs"), Some("sess-test"))
+            .await?;
 
         assert_eq!(
             marker_neighbor_paths(&marker_path),
@@ -2547,12 +2634,16 @@ mod tests {
         let marker_path = claudix.store.change_neighbors_marker_path();
 
         fs::write(&edited, format!("{ALPHA_FN}\n{BETA_FN}")).await?;
-        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/edited.rs"), Some("sess-test"))
+            .await?;
         assert!(marker_path.exists(), "control: the first index surfaces");
         fs::remove_file(&marker_path).await?;
 
         fs::write(&edited, format!("{BETA_FN}\n{ALPHA_FN}")).await?;
-        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/edited.rs"), Some("sess-test"))
+            .await?;
 
         // Liveness control: the file hash changed, so the reindex re-chunked
         // rather than short-circuiting on an unchanged hash. Rows sort by byte
@@ -2593,7 +2684,9 @@ mod tests {
         };
 
         fs::write(&edited, with_body("2")).await?;
-        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/edited.rs"), Some("sess-test"))
+            .await?;
 
         // Control: the impl block really is stored as its own chunk covering
         // both methods, so the test is exercising the container shape and not
@@ -2615,7 +2708,9 @@ mod tests {
         // Change only beta's body. The method chunk and the enclosing impl
         // chunk both change; alpha's own chunk does not.
         fs::write(&edited, with_body("22")).await?;
-        claudix.reindex_file(Path::new("src/edited.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/edited.rs"), Some("sess-test"))
+            .await?;
 
         assert_eq!(
             marker_neighbor_paths(&marker_path),
@@ -2662,7 +2757,9 @@ mod tests {
         let fresh = fixture.root().join("src/fresh.rs");
 
         fs::write(&fresh, format!("{ALPHA_FN}\n{BETA_FN}")).await?;
-        claudix.reindex_file(Path::new("src/fresh.rs")).await?;
+        claudix
+            .reindex_file(Path::new("src/fresh.rs"), Some("sess-test"))
+            .await?;
 
         assert_eq!(
             marker_neighbor_paths(&claudix.store.change_neighbors_marker_path()),

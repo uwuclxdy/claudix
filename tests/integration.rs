@@ -117,7 +117,7 @@ async fn reindex_file_updates_target_preserves_others() {
     assert!(write.is_ok(), "write math.rs failed");
 
     let reindex = claudix
-        .reindex_file(&fixture.root().join("src/math.rs"))
+        .reindex_file(&fixture.root().join("src/math.rs"), None)
         .await;
     assert!(reindex.is_ok(), "reindex_file failed: {reindex:?}");
 

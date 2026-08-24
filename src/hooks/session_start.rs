@@ -13,7 +13,7 @@ use super::spawn::{spawn_background_index, spawn_background_watch};
 
 pub(super) async fn handle_session_start(
     project_root: &Path,
-    _payload: HookPayload,
+    payload: HookPayload,
 ) -> Result<Option<Value>> {
     let config = config::load(project_root).ok();
 
@@ -25,7 +25,7 @@ pub(super) async fn handle_session_start(
         false
     };
     if let Some(ref config) = config {
-        let _ = spawn_background_watch(project_root, config);
+        let _ = spawn_background_watch(project_root, config, payload.session_id.as_deref());
     }
 
     let store = config

@@ -64,7 +64,7 @@ pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bo
         return false;
     }
 
-    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("index")]) else {
+    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("index")], None) else {
         let _ = fs::remove_file(&marker_path);
         return false;
     };
@@ -84,9 +84,16 @@ pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bo
 /// from an unbounded fork bomb into a no-op.
 const BACKGROUND_SENTINEL: &str = "CLAUDIX_BACKGROUND";
 
+/// Environment variable carrying the session id of the hook event that spawned
+/// the watcher. The watcher reads it once at launch and attributes every
+/// change-neighbors marker it writes to that starter session — its own launch
+/// context, never a state file another hook event can rewrite.
+pub(crate) const CLAUDIX_SESSION_ID_ENV: &str = "CLAUDIX_SESSION_ID";
+
 pub(super) fn spawn_detached_claudix<const N: usize, S>(
     project_root: &Path,
     args: [S; N],
+    extra_env: Option<(&str, &str)>,
 ) -> Option<u32>
 where
     S: AsRef<OsStr>,
@@ -112,10 +119,14 @@ where
         ]
     };
 
-    spawn_detached_command(project_root, binary.as_os_str(), args)
+    spawn_detached_command(project_root, binary.as_os_str(), args, extra_env)
 }
 
-pub(super) fn spawn_background_watch(project_root: &Path, config: &Config) -> bool {
+pub(super) fn spawn_background_watch(
+    project_root: &Path,
+    config: &Config,
+    session_id: Option<&str>,
+) -> bool {
     if !config.watch || !config.hooks.auto_reembed_on_edit {
         return false;
     }
@@ -131,7 +142,9 @@ pub(super) fn spawn_background_watch(project_root: &Path, config: &Config) -> bo
         return false;
     }
 
-    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("watch")]) else {
+    let extra_env = session_id.map(|session| (CLAUDIX_SESSION_ID_ENV, session));
+    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("watch")], extra_env)
+    else {
         let _ = fs::remove_file(&marker_path);
         return false;
     };
@@ -163,7 +176,8 @@ pub(super) fn spawn_background_drain_worker(project_root: &Path, config: &Config
         return false;
     }
 
-    let Some(child_pid) = spawn_detached_claudix(project_root, [OsStr::new("drain-reindex-queue")])
+    let Some(child_pid) =
+        spawn_detached_claudix(project_root, [OsStr::new("drain-reindex-queue")], None)
     else {
         let _ = fs::remove_file(&marker_path);
         return false;
@@ -179,6 +193,7 @@ fn spawn_detached_command<const N: usize, S>(
     project_root: &Path,
     binary: &OsStr,
     args: [S; N],
+    extra_env: Option<(&str, &str)>,
 ) -> Option<u32>
 where
     S: AsRef<OsStr>,
@@ -188,12 +203,17 @@ where
     // `nohup` re-execs the binary, so its PID is the nohup process itself;
     // for our liveness checks that's fine because the wrapper stays alive
     // for the whole runtime of the child it execs into.
-    std::process::Command::new("nohup")
+    let mut command = std::process::Command::new("nohup");
+    command
         .arg(binary)
         .args(args.iter().map(AsRef::as_ref))
         .current_dir(project_root)
         .env("CLAUDE_PROJECT_DIR", project_root)
-        .env(BACKGROUND_SENTINEL, "1")
+        .env(BACKGROUND_SENTINEL, "1");
+    if let Some((key, value)) = extra_env {
+        command.env(key, value);
+    }
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -208,6 +228,7 @@ fn spawn_detached_command<const N: usize, S>(
     project_root: &Path,
     binary: &OsStr,
     args: [S; N],
+    extra_env: Option<(&str, &str)>,
 ) -> Option<u32>
 where
     S: AsRef<OsStr>,
@@ -217,11 +238,16 @@ where
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const DETACHED_PROCESS: u32 = 0x0000_0008;
 
-    std::process::Command::new(binary)
+    let mut command = std::process::Command::new(binary);
+    command
         .args(args.iter().map(AsRef::as_ref))
         .current_dir(project_root)
         .env("CLAUDE_PROJECT_DIR", project_root)
-        .env(BACKGROUND_SENTINEL, "1")
+        .env(BACKGROUND_SENTINEL, "1");
+    if let Some((key, value)) = extra_env {
+        command.env(key, value);
+    }
+    command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

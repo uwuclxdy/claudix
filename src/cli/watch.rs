@@ -10,6 +10,7 @@ use crate::Claudix;
 use crate::config;
 use crate::enumeration::WatchFilter;
 use crate::error::{ClaudixError, Result};
+use crate::hooks::spawn::CLAUDIX_SESSION_ID_ENV;
 use crate::store::Store;
 use crate::store::marker::{InstallError, PidMarker};
 
@@ -27,6 +28,23 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
 
     let store = Store::new(&project_root, &config)?;
     store.ensure_layout()?;
+
+    // Session attribution: the watcher outlives the session that spawned it and
+    // filesystem events carry no session, so change-neighbors markers are
+    // attributed to the starter session — the identity this process holds from
+    // its launch context, never a file a hook event can rewrite. Without one
+    // (a manual `claudix watch`) it cannot attribute, and `reindex_file`
+    // refuses to write hints rather than write them unowned.
+    let session_id = std::env::var(CLAUDIX_SESSION_ID_ENV)
+        .ok()
+        .filter(|session| !session.is_empty());
+    if session_id.is_none() {
+        tracing::warn!(
+            "claudix watch launched without a session identity; \
+             change-neighbor hints are disabled"
+        );
+    }
+
     let marker = Arc::new(PidMarker::install(store.watch_marker_path()).map_err(
         |error| match error {
             InstallError::AlreadyHeld => {
@@ -111,7 +129,7 @@ pub async fn run_watch(project_root: impl AsRef<Path>) -> Result<()> {
                             continue;
                         }
                     };
-                    if let Err(error) = claudix.reindex_file(&path).await {
+                    if let Err(error) = claudix.reindex_file(&path, session_id.as_deref()).await {
                         tracing::warn!("claudix watch failed to reindex {}: {error}", path.display());
                     }
                 }

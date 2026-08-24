@@ -211,3 +211,14 @@ pub fn edit_related_context(edited_path: &str, locations: &[String]) -> String {
         locations.join("; "),
     )
 }
+
+/// Variant for an ack whose event did not edit the recorded file (a later
+/// event, or one without a file like UserPromptSubmit). Never claims "your
+/// edit" — that wording is reserved for [`edit_related_context`], which the
+/// caller uses only when the acking event's own file is the edited file.
+pub fn recent_edit_related_context(edited_path: &str, locations: &[String]) -> String {
+    format!(
+        "claudix: code related to a recent edit of `{edited_path}` (may need matching changes): {}",
+        locations.join("; "),
+    )
+}

@@ -52,6 +52,26 @@ pub(super) async fn handle_post_tool_use(
         .as_ref()
         .and_then(|cfg| Store::new(project_root, cfg).ok());
 
+    let session_id = payload.session_id.as_deref();
+
+    // Files this event itself edited (any spelling: file_path, notebook_path,
+    // or the files_modified list). The change-neighbors ack compares these
+    // against the marker's edited_path, so "your edit" is only ever claimed by
+    // the event that actually edited that file.
+    let event_files: Vec<String> = payload
+        .tool_input
+        .as_ref()
+        .map(|input| {
+            input
+                .file_path
+                .iter()
+                .chain(input.notebook_path.iter())
+                .chain(input.files_modified.iter().flatten())
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Coalesce the no-watcher reindex path. The ready-check and
     // neighbor-surfacing run on every PostToolUse event regardless.
     //
@@ -71,7 +91,7 @@ pub(super) async fn handle_post_tool_use(
         && !watcher_alive(st)
         && let Some(input) = payload.tool_input.as_ref()
     {
-        let enqueued = enqueue_watchable_edits(st, input);
+        let enqueued = enqueue_watchable_edits(st, input, session_id);
         // Append-before-ensure-worker: the worker must see the entry when it
         // reads the queue. Claim-or-skip, so calling it every time is safe.
         if enqueued > 0 {
@@ -92,8 +112,13 @@ pub(super) async fn handle_post_tool_use(
         _ => None,
     };
 
-    let change_neighbors =
-        take_change_neighbors_context(store.as_ref(), config.as_ref(), "PostToolUse");
+    let change_neighbors = take_change_neighbors_context(
+        store.as_ref(),
+        config.as_ref(),
+        "PostToolUse",
+        session_id,
+        &event_files,
+    );
 
     let read_neighbors = read_surfacing_context(
         store.as_ref(),
@@ -280,10 +305,22 @@ fn chunk_overlaps_window(
 /// Read and ack the change-neighbors marker, returning formatted additionalContext.
 /// Returns `None` when the marker is absent, feature is disabled, or the store
 /// cannot be constructed (fail-open).
+///
+/// Session attribution: the marker names the session whose edit produced it,
+/// and it is acked only from an event carrying that same session id — both
+/// sides must be present and equal. Anything else — a marker left by another
+/// session, an unattributed one (legacy format, manual reindex), or an event
+/// without a session id — is stale and dropped without surfacing, so a
+/// related-code hint can never claim another session's edit, not even in a
+/// session-less event. The hint claims "your edit" only when `event_files`
+/// names the marker's edited file; otherwise the wording credits a recent
+/// edit, since the acking event is not the edit that produced the marker.
 pub(super) fn take_change_neighbors_context(
     store: Option<&Store>,
     config: Option<&Config>,
     event_name: &str,
+    session_id: Option<&str>,
+    event_files: &[String],
 ) -> Option<Value> {
     let cfg = config?;
     if !cfg.hooks.surface_related_on_edit {
@@ -293,6 +330,16 @@ pub(super) fn take_change_neighbors_context(
     let project_root = store.project_root();
     let marker_path = store.change_neighbors_marker_path();
     let marker = change_neighbors::read_and_remove(&marker_path)?;
+
+    // Both sides must be PRESENT and equal: two absences are not a match, and
+    // an unattributed marker must never surface — not even to a session-less
+    // event, which cannot prove it owns the edit either.
+    if !matches!(
+        (marker.session_id.as_deref(), session_id),
+        (Some(marker_session), Some(event_session)) if marker_session == event_session
+    ) {
+        return None;
+    }
 
     // Per-session dedup: a neighbor already surfaced this session is suppressed
     // whatever file the edit touched, so a hub file can't be re-injected once per
@@ -340,7 +387,14 @@ pub(super) fn take_change_neighbors_context(
     // Record only the neighbors actually surfaced.
     change_neighbors::append_seen(&seen_path, &fresh_keys);
 
-    let context = prompts::hooks::edit_related_context(&marker.edited_path, &hits);
+    let acked_own_edit = event_files
+        .iter()
+        .any(|file| canonical_dedup_key(project_root, file) == marker.edited_path);
+    let context = if acked_own_edit {
+        prompts::hooks::edit_related_context(&marker.edited_path, &hits)
+    } else {
+        prompts::hooks::recent_edit_related_context(&marker.edited_path, &hits)
+    };
 
     Some(json!({
         "hookSpecificOutput": {
@@ -423,7 +477,7 @@ fn reindex_target_is_watchable(
 /// [`canonical_dedup_key`]) so the same file arriving as an absolute path in one
 /// edit and a project-relative path in another coalesces to a single queue path,
 /// and the drain worker's `reindex_file` consumes the relative spelling directly.
-fn enqueue_watchable_edits(store: &Store, input: &ToolInput) -> usize {
+fn enqueue_watchable_edits(store: &Store, input: &ToolInput, session_id: Option<&str>) -> usize {
     if store.ensure_layout().is_err() {
         return 0;
     }
@@ -435,7 +489,7 @@ fn enqueue_watchable_edits(store: &Store, input: &ToolInput) -> usize {
     reindex_paths_from_input(root, input)
         .into_iter()
         .filter(|p| reindex_target_is_watchable(root, filter.as_ref(), p))
-        .filter(|p| reindex_queue::append(&queue_path, &canonical_dedup_key(root, p)))
+        .filter(|p| reindex_queue::append(&queue_path, &canonical_dedup_key(root, p), session_id))
         .count()
 }
 
@@ -876,6 +930,10 @@ mod tests {
 
     // ── change-neighbors surfacing ──────────────────────────────────────────
 
+    /// Session every typed-marker helper writes and every direct ack call
+    /// fires with; the run()-level attribution tests use their own literals.
+    const TEST_SESSION: &str = "sess-A";
+
     fn write_neighbors_marker(
         store: &Store,
         edited_path: &str,
@@ -884,6 +942,7 @@ mod tests {
         use crate::store::marker::change_neighbors::{ChangeNeighborsMarker, write};
         let marker = ChangeNeighborsMarker {
             edited_path: edited_path.to_owned(),
+            session_id: Some(TEST_SESSION.to_owned()),
             neighbors,
         };
         write(&store.change_neighbors_marker_path(), &marker);
@@ -917,7 +976,13 @@ mod tests {
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
 
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
         let response = response.unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -953,7 +1018,13 @@ mod tests {
             "marker must exist before read"
         );
 
-        let _ = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let _ = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
 
         assert!(
             !store.change_neighbors_marker_path().exists(),
@@ -971,7 +1042,13 @@ mod tests {
         store.ensure_layout()?;
 
         // No marker written — must produce None.
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
         assert!(
             response.is_none(),
             "absent marker must produce no additionalContext"
@@ -994,7 +1071,13 @@ mod tests {
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
 
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
         assert!(
             response.is_none(),
             "surface_related_on_edit = false must suppress output even when marker is present"
@@ -1021,7 +1104,13 @@ mod tests {
             ],
         );
 
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
         let response = response.unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -1054,7 +1143,13 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
         let response = response.unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -1071,7 +1166,13 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
         assert!(
             response.is_none(),
             "a neighbor already surfaced this session must be suppressed on re-edit"
@@ -1093,8 +1194,14 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let first = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
-            .unwrap_or(serde_json::Value::Null);
+        let first = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        )
+        .unwrap_or(serde_json::Value::Null);
         assert!(
             first["hookSpecificOutput"]["additionalContext"]
                 .as_str()
@@ -1110,10 +1217,179 @@ mod tests {
             "src/other.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
         assert!(
             response.is_none(),
             "a neighbor surfaced once must not resurface via a different edited file, got: {response:?}"
+        );
+        Ok(())
+    }
+
+    // ── change-neighbors session attribution ────────────────────────────────
+
+    /// Plant a session-attributed marker as raw JSON so these tests exercise the
+    /// public `run` layer against whatever the marker schema accepts today.
+    fn write_raw_neighbors_marker(store: &Store, edited_path: &str, session_id: &str) {
+        let json = json!({
+            "edited_path": edited_path,
+            "session_id": session_id,
+            "neighbors": [{
+                "file_path": "src/math.rs",
+                "line_start": 10,
+                "line_end": 25,
+                "name": "add",
+                "score": 0.82,
+            }],
+        });
+        fs::write(store.change_neighbors_marker_path(), json.to_string())
+            .expect("marker write must succeed");
+    }
+
+    #[tokio::test]
+    async fn foreign_session_marker_is_dropped_without_surfacing() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // A marker left by another session's edit (the triage shape: an edit
+        // acking a marker a different session's write left behind).
+        write_raw_neighbors_marker(&store, "src/lib.rs", "session-foreign");
+
+        let payload = json!({
+            "session_id": "session-mine",
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/math.rs") },
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+
+        assert!(
+            response.is_none(),
+            "a foreign-session marker must never surface, got: {response:?}"
+        );
+        assert!(
+            !store.change_neighbors_marker_path().exists(),
+            "a foreign-session marker must be dropped from disk"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn matching_session_marker_surfaces_your_edit_hint() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        write_raw_neighbors_marker(&store, "src/lib.rs", "sess-S");
+
+        // The acking event edits the very file the marker records.
+        let payload = json!({
+            "session_id": "sess-S",
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") },
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(
+            context.contains("src/math.rs"),
+            "a same-session marker must surface its neighbors, got: {context}"
+        );
+        assert!(
+            context.contains("your edit of `src/lib.rs`"),
+            "an event that edited the recorded file may claim 'your edit', got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn your_edit_wording_requires_the_acking_event_to_be_that_edit() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Same session, but the acking event edits a different file than the
+        // marker records (the triage shape: a todo.md Write attributed to
+        // docs/handoff-state.md).
+        write_raw_neighbors_marker(&store, "src/lib.rs", "sess-S");
+
+        let payload = json!({
+            "session_id": "sess-S",
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/math.rs") },
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+
+        assert!(
+            context.contains("src/math.rs"),
+            "a same-session marker must still surface its neighbors, got: {context}"
+        );
+        assert!(
+            !context.contains("your edit"),
+            "an event that did not edit the recorded file must not claim 'your edit', got: {context}"
+        );
+        assert!(
+            context.contains("recent edit of `src/lib.rs`"),
+            "the hint must attribute to a recent edit instead, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unattributed_marker_never_surfaces_not_even_to_a_sessionless_event() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // A legacy marker (no session_id key) must not surface even when the
+        // acking event also carries no session: two absences are not a match,
+        // and an unowned hint must never surface.
+        let json = json!({
+            "edited_path": "src/lib.rs",
+            "neighbors": [{
+                "file_path": "src/math.rs",
+                "line_start": 10,
+                "line_end": 25,
+                "name": "add",
+                "score": 0.82,
+            }],
+        });
+        fs::write(store.change_neighbors_marker_path(), json.to_string())
+            .expect("marker write must succeed");
+
+        let payload = json!({
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/math.rs") },
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+
+        assert!(
+            response.is_none(),
+            "an unattributed marker must never surface, got: {response:?}"
+        );
+        assert!(
+            !store.change_neighbors_marker_path().exists(),
+            "an unattributed marker must be dropped from disk"
         );
         Ok(())
     }
@@ -1131,7 +1407,13 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
         );
-        let _ = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse");
+        let _ = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
 
         // Same neighbor file, different symbol → still unknown to the agent.
         write_neighbors_marker(
@@ -1139,8 +1421,14 @@ mod tests {
             "src/lib.rs",
             vec![make_neighbor_entry("src/math.rs", "multiply", 0.82)],
         );
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
-            .unwrap_or(serde_json::Value::Null);
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        )
+        .unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
@@ -1181,8 +1469,14 @@ mod tests {
         let entries = seed_neighbor_files(fixture.root(), top_k * 3);
         write_neighbors_marker(&store, "src/lib.rs", entries);
 
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
-            .unwrap_or(serde_json::Value::Null);
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        )
+        .unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
@@ -1232,8 +1526,14 @@ mod tests {
         );
 
         write_neighbors_marker(&store, "src/lib.rs", entries);
-        let response = take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
-            .unwrap_or(serde_json::Value::Null);
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        )
+        .unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
@@ -1270,9 +1570,14 @@ mod tests {
                 "src/lib.rs",
                 vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
             );
-            let response =
-                take_change_neighbors_context(Some(&store), Some(&config), "PostToolUse")
-                    .unwrap_or(serde_json::Value::Null);
+            let response = take_change_neighbors_context(
+                Some(&store),
+                Some(&config),
+                "PostToolUse",
+                Some(TEST_SESSION),
+                &[],
+            )
+            .unwrap_or(serde_json::Value::Null);
             let context = response["hookSpecificOutput"]["additionalContext"]
                 .as_str()
                 .unwrap_or_default();
@@ -1331,7 +1636,12 @@ mod tests {
             vec![make_neighbor_entry("src/math.rs", "add", 0.80)],
         );
 
-        let response = run(fixture.root(), HookEvent::PostToolUse, "{}").await?;
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &json!({ "session_id": TEST_SESSION }).to_string(),
+        )
+        .await?;
         let response = response.unwrap_or(serde_json::Value::Null);
         let context = response["hookSpecificOutput"]["additionalContext"]
             .as_str()
