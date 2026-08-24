@@ -69,9 +69,9 @@ pub struct ClaudixServer {
     /// Warm provider shared with the embed side channel: the first search or
     /// hook embed pays the build, the rest of the session reuses it.
     provider_cache: Arc<ProviderCache>,
-    /// Latched once the endpoint-down lexical-degradation notice has been
-    /// surfaced, so the notice bills at most once per session. Shared across
-    /// the per-call clones of this server.
+    /// Latched once a degraded-search notice (endpoint-down or reindex hint)
+    /// has been surfaced, so the notice bills at most once per session. Shared
+    /// across the per-call clones of this server.
     warned_degraded: Arc<AtomicBool>,
     tool_router: ToolRouter<Self>,
 }
@@ -298,12 +298,12 @@ fn to_value<T: serde::Serialize>(value: T) -> crate::error::Result<Value> {
     serde_json::to_value(value).map_err(ClaudixError::from)
 }
 
-/// Keep the endpoint-down degradation notice only the first time a degraded
-/// search occurs this session; drop it on later ones. The lexical results still
-/// return every time — only the notice is throttled. A healthy search
-/// (`degraded_hint` is `None`) leaves the latch untouched thanks to the
-/// short-circuit, so it can never consume the one-shot ahead of a real
-/// degradation.
+/// Keep a degraded-search notice (endpoint-down or reindex hint) only the
+/// first time a degraded search occurs this session; drop it on later ones.
+/// The lexical results still return every time — only the notice is throttled.
+/// A healthy search (`degraded_hint` is `None`) leaves the latch untouched
+/// thanks to the short-circuit, so it can never consume the one-shot ahead of
+/// a real degradation.
 fn throttle_degraded_notice(output: &mut cli::SearchOutput, warned: &AtomicBool) {
     if output.degraded_hint.is_some() && warned.swap(true, Ordering::Relaxed) {
         output.degraded_hint = None;

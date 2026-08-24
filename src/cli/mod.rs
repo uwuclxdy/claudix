@@ -80,8 +80,10 @@ pub struct SearchOutput {
     /// so a session that never sees a stale hit never pays for the explanation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stale_hint: Option<&'static str>,
-    /// Set when the embedding endpoint was unreachable and results fell back to
-    /// lexical-only ranking. The MCP layer throttles this to once per session;
+    /// Set when results were ranked lexical-only: the endpoint-down notice
+    /// when the embedding endpoint was unreachable, or the reindex hint when
+    /// the stored index's embedding model/dimensions differ from the
+    /// configured provider. The MCP layer throttles this to once per session;
     /// the non-cached CLI path (a fresh process) carries it every time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub degraded_hint: Option<&'static str>,
@@ -704,18 +706,32 @@ async fn run_search_impl(
 ) -> Result<SearchOutput> {
     validate_search_query(&query)?;
     let project_root = canonical_project_root(project_root.as_ref())?;
-    let config = config::load(&project_root)?;
+    let config = Arc::new(config::load(&project_root)?);
     let top_k = top_k.unwrap_or(config.search.top_k);
     validate_search_top_k(top_k)?;
     // Active project is always in scope; union the config cross_repos with the
     // per-call repos, deduped at search time by canonical path.
     let repos = effective_cross_repos(&config.search.cross_repos, repos);
-    let claudix = match provider_cache {
-        Some(cache) => {
-            let provider = cache.get_or_build(&config).await?;
-            Claudix::with_embedder(project_root, Arc::new(config), provider)?
+    let provider = match provider_cache {
+        Some(cache) => cache.get_or_build(&config).await?,
+        None => crate::build_provider(&config).await?,
+    };
+    // A stored index whose embedding model/dimensions differ from the
+    // configured provider degrades to lexical ranking with the reindex hint
+    // instead of erroring: `Searcher::search_all` re-derives the mismatch
+    // against the manifest. Any other construction error still fails the call,
+    // and every write path keeps the strict [`Claudix::with_embedder`] check.
+    let claudix = match Claudix::with_embedder(
+        project_root.clone(),
+        Arc::clone(&config),
+        Arc::clone(&provider),
+    ) {
+        Ok(claudix) => claudix,
+        Err(ClaudixError::EmbeddingModelMismatch { .. })
+        | Err(ClaudixError::DimensionMismatch { .. }) => {
+            Claudix::with_embedder_unvalidated(project_root, config, provider)?
         }
-        None => Claudix::new(project_root, Arc::new(config)).await?,
+        Err(error) => return Err(error),
     };
 
     run_search_with_claudix(&claudix, query, top_k, language_filter, path_prefix, repos).await
@@ -1004,9 +1020,7 @@ async fn run_search_with_claudix(
         groups,
         repo_errors: found.repo_errors,
         stale_hint: any_stale.then_some(crate::prompts::mcp::STALE_HITS_NOTE),
-        degraded_hint: found
-            .degraded
-            .then_some(crate::prompts::mcp::ENDPOINT_DOWN_NOTE),
+        degraded_hint: found.degraded_hint,
     })
 }
 

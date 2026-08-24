@@ -164,8 +164,28 @@ impl Claudix {
         config: Arc<Config>,
         embedder: Arc<dyn Provider>,
     ) -> Result<Self> {
+        let this = Self::with_embedder_unvalidated(project_root, config, embedder)?;
+        this.store.validate_manifest_compatibility(
+            this.embedder.model_id(),
+            this.embedder.dimensions().0,
+        )?;
+        Ok(this)
+    }
+
+    /// Search-only construction that skips the manifest embedding-identity
+    /// check. `cli::run_search_impl` falls back to this when
+    /// [`Self::with_embedder`] reported a model or dimension mismatch:
+    /// `Searcher::search_all` re-derives the mismatch against the manifest and
+    /// degrades to lexical ranking with the reindex hint instead of erroring.
+    /// Write paths (index, reindex, drain, watch) must keep using
+    /// [`Self::with_embedder`] — its check is what stops a mismatched reindex
+    /// from appending wrong-width vectors into the chunks table.
+    pub(crate) fn with_embedder_unvalidated(
+        project_root: PathBuf,
+        config: Arc<Config>,
+        embedder: Arc<dyn Provider>,
+    ) -> Result<Self> {
         let store = Store::new(&project_root, config.as_ref())?;
-        store.validate_manifest_compatibility(embedder.model_id(), embedder.dimensions().0)?;
 
         Ok(Self {
             config,

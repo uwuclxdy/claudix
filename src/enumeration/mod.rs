@@ -665,15 +665,26 @@ mod tests {
         assert!(!paths.contains("src/oversized.rs"));
     }
 
-    /// Mirror `tests/common/fixture.rs`'s empty-config trick inlined, so the
-    /// orphan/real-repo tests below stay inside this module without importing
-    /// the cross-module helper.
+    /// Mirror `tests/common/fixture.rs`'s empty-config trick and git env
+    /// scrub inlined, so the orphan/real-repo tests below stay inside this
+    /// module without importing the cross-module helper.
     fn init_real_git_repo(root: &Path) {
-        // Neutralise the developer's global/system git config for the throwaway
-        // repo (same rationale as `tests/common/fixture.rs`).
+        // Neutralise the developer's global/system git config and every
+        // redirecting git env var for the throwaway repo (same rationale as
+        // `tests/common/fixture.rs`: a gated commit runs the suite inside
+        // git's hook environment, which hands GIT_INDEX_FILE to every test
+        // subprocess).
         let empty_config = root.join(".claudix-test-empty-gitconfig");
         let output = std::process::Command::new("git")
             .current_dir(root)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_CEILING_DIRECTORIES")
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_COUNT")
             .env("GIT_CONFIG_GLOBAL", &empty_config)
             .env("GIT_CONFIG_SYSTEM", &empty_config)
             .args(["init"])

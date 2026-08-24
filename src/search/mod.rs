@@ -52,9 +52,11 @@ pub struct SearchResult {
 pub struct SearchResults {
     pub results: Vec<SearchResult>,
     pub repo_errors: Vec<RepoError>,
-    /// True when the embedding endpoint was unreachable and the ranking fell
-    /// back to lexical-only (BM25 + identifier) over the indexed corpus.
-    pub degraded: bool,
+    /// Set when the ranking fell back to lexical-only (BM25 + identifier):
+    /// `ENDPOINT_DOWN_NOTE` when the embedding endpoint was unreachable, or
+    /// the reindex hint when the stored index's embedding model/dimensions
+    /// differ from the active provider.
+    pub degraded_hint: Option<&'static str>,
 }
 
 /// Warn when a full search (embed + rank + staleness) exceeds this. Fires at the
@@ -127,7 +129,7 @@ impl Searcher {
             return Ok(SearchResults {
                 results: Vec::new(),
                 repo_errors: Vec::new(),
-                degraded: false,
+                degraded_hint: None,
             });
         }
 
@@ -156,20 +158,49 @@ impl Searcher {
             return Ok(SearchResults {
                 results: Vec::new(),
                 repo_errors: Vec::new(),
-                degraded: false,
+                degraded_hint: None,
             });
         }
 
         let (labeled_rows, repo_errors) = self.collect_labeled_rows(&query).await?;
+
+        // The dense scores are only comparable when the stored vectors share
+        // the active embedder's identity, so the identity gate runs before the
+        // empty-corpus early return: a mismatched store must surface its
+        // reindex hint even when it holds nothing to rank. This is the same
+        // check `Claudix::with_embedder` runs — the search path reaches here
+        // through the unvalidated constructor — and every write path keeps the
+        // strict check. The provider-less hook path (a precomputed vector) has
+        // no embedder to compare and is validated at its own boundary.
+        // `identity_mismatch` is a dedicated embed-skip latch: the hint is a
+        // UI-facing value and must stay free for other degradation causes to
+        // set without silently skipping embedding on healthy searches.
+        let mut degraded_hint: Option<&'static str> = None;
+        let mut identity_mismatch = false;
+        if precomputed_vector.is_none()
+            && let Some(embedder) = self.embedder.as_ref()
+            && let Err(error) = self
+                .store
+                .validate_manifest_compatibility(embedder.model_id(), embedder.dimensions().0)
+        {
+            match error {
+                ClaudixError::EmbeddingModelMismatch { recovery, .. }
+                | ClaudixError::DimensionMismatch { recovery, .. } => {
+                    identity_mismatch = true;
+                    degraded_hint = Some(recovery.0);
+                }
+                error => return Err(error),
+            }
+        }
+
         if labeled_rows.is_empty() {
             return Ok(SearchResults {
                 results: Vec::new(),
                 repo_errors,
-                degraded: false,
+                degraded_hint,
             });
         }
 
-        let mut degraded = false;
         let query_vector = match precomputed_vector {
             Some(vector) => vector,
             None => {
@@ -178,33 +209,42 @@ impl Searcher {
                         "provider-less searcher requires a precomputed query vector".to_owned(),
                     )
                 })?;
-                // Embed the query once with the active embedder. Its
-                // model/dimensions are the reference identity every
-                // cross-repo's vectors must match. When the active provider
-                // has bundled fallback enabled, this call falls back before
-                // ranking the non-empty corpus.
-                match embedder.embed(&[query.query.as_str()]).await {
-                    Ok(vectors) => {
-                        if vectors.len() != 1 {
-                            return Err(ClaudixError::Embedding(format!(
-                                "provider returned {} vectors for 1 query",
-                                vectors.len()
-                            )));
+                if identity_mismatch {
+                    // Identity mismatch: never call the embedder — fresh
+                    // embeddings and stored vectors are not comparable. The
+                    // empty vector drives `rank_rows` lexically, the same
+                    // shape the endpoint-down arm below produces.
+                    Vec::new()
+                } else {
+                    // Embed the query once with the active embedder. Its
+                    // model/dimensions are the reference identity every
+                    // cross-repo's vectors must match. When the active
+                    // provider has bundled fallback enabled, this call
+                    // falls back before ranking the non-empty corpus.
+                    match embedder.embed(&[query.query.as_str()]).await {
+                        Ok(vectors) => {
+                            if vectors.len() != 1 {
+                                return Err(ClaudixError::Embedding(format!(
+                                    "provider returned {} vectors for 1 query",
+                                    vectors.len()
+                                )));
+                            }
+                            let query_vector = vectors.into_iter().next().unwrap_or_default();
+                            validate_query_vector(&query_vector, embedder.dimensions())?;
+                            query_vector
                         }
-                        let query_vector = vectors.into_iter().next().unwrap_or_default();
-                        validate_query_vector(&query_vector, embedder.dimensions())?;
-                        query_vector
+                        // Endpoint down (offline / timeout / auth / HTTP
+                        // error): degrade to lexical ranking over the corpus
+                        // already loaded above. An empty query vector zeroes
+                        // every dense score, so `rank_rows` is driven purely
+                        // by BM25 + identifier hits. Non-endpoint embed
+                        // failures still propagate as errors.
+                        Err(error) if error.is_endpoint_unavailable() => {
+                            degraded_hint = Some(crate::prompts::mcp::ENDPOINT_DOWN_NOTE);
+                            Vec::new()
+                        }
+                        Err(error) => return Err(error),
                     }
-                    // Endpoint down (offline / timeout / auth / HTTP error):
-                    // degrade to lexical ranking over the corpus already loaded
-                    // above. An empty query vector zeroes every dense score, so
-                    // `rank_rows` is driven purely by BM25 + identifier hits.
-                    // Non-endpoint embed failures still propagate as errors.
-                    Err(error) if error.is_endpoint_unavailable() => {
-                        degraded = true;
-                        Vec::new()
-                    }
-                    Err(error) => return Err(error),
                 }
             }
         };
@@ -218,7 +258,7 @@ impl Searcher {
         Ok(SearchResults {
             results,
             repo_errors,
-            degraded,
+            degraded_hint,
         })
     }
 
@@ -809,8 +849,10 @@ mod tests {
             self.dimension
         }
 
+        /// Matches the `stub-v1` store the harness indexes, so the manifest
+        /// gate in `search_all` lets calls reach the embed attempt.
         fn model_id(&self) -> &str {
-            "fixed-model"
+            "stub-v1"
         }
 
         async fn embed(&self, batch: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -824,7 +866,9 @@ mod tests {
 
     /// Embeds by failing: `endpoint_down` picks a fresh endpoint-unavailable
     /// error (drives lexical degradation) vs a plain embedding error (must
-    /// propagate). `ClaudixError` is not `Clone`, so the error is built per call.
+    /// propagate). Claims the store's `stub-v1` identity so the manifest gate
+    /// in `search_all` lets the call reach the embed attempt. `ClaudixError`
+    /// is not `Clone`, so the error is built per call.
     struct FailingProvider {
         endpoint_down: bool,
     }
@@ -840,7 +884,7 @@ mod tests {
         }
 
         fn model_id(&self) -> &str {
-            "failing-model"
+            "stub-v1"
         }
 
         async fn embed(&self, _batch: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -1261,9 +1305,11 @@ mod tests {
         let harness = search_harness().await;
         assert!(harness.is_ok());
         let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        // Claims the store's `stub-v1` identity (8 dims) so the manifest gate
+        // lets the call reach the embed attempt and the non-finite check.
         let embedder: Arc<dyn Provider> = Arc::new(FixedProvider {
-            dimension: Dimension(384),
-            vectors: vec![vec![f32::NAN; 384]],
+            dimension: Dimension(8),
+            vectors: vec![vec![f32::NAN; 8]],
         });
         let searcher = Searcher::new(
             harness.searcher.project_root,
@@ -1323,9 +1369,10 @@ mod tests {
             "endpoint-down search must degrade, not error: {results:?}"
         );
         let results = results.ok().unwrap_or_else(|| unreachable!());
-        assert!(
-            results.degraded,
-            "an endpoint-down search must be marked degraded"
+        assert_eq!(
+            results.degraded_hint,
+            Some(crate::prompts::mcp::ENDPOINT_DOWN_NOTE),
+            "an endpoint-down search must carry the endpoint-down notice"
         );
         assert!(
             results.results.iter().any(|result| {
@@ -1334,6 +1381,124 @@ mod tests {
             }),
             "lexical fallback must still surface the 'add' identifier/BM25 hit"
         );
+    }
+
+    /// Claims a model id that matches no stored index, driving the
+    /// identity-mismatch degradation. `embed` fails loudly so any test where it
+    /// runs proves the mismatch path did not skip it.
+    struct OtherModelProvider;
+
+    #[async_trait]
+    impl Provider for OtherModelProvider {
+        fn name(&self) -> &str {
+            "other"
+        }
+
+        fn dimensions(&self) -> Dimension {
+            Dimension(8)
+        }
+
+        fn model_id(&self) -> &str {
+            "other-model"
+        }
+
+        async fn embed(&self, _batch: &[&str]) -> Result<Vec<Vec<f32>>> {
+            Err(ClaudixError::Embedding(
+                "other-model must never be embedded against a mismatched index".to_owned(),
+            ))
+        }
+
+        async fn health_check(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A stored index whose embedding identity differs from the active
+    /// provider degrades to lexical ranking with the reindex hint — the
+    /// searcher-level counterpart of the endpoint-down degradation. The
+    /// public-path pin lives in `tests/model_mismatch_degrade.rs`.
+    #[tokio::test]
+    async fn search_degrades_to_lexical_with_reindex_hint_on_identity_mismatch() {
+        let harness = search_harness().await;
+        assert!(harness.is_ok());
+        let harness = harness.ok().unwrap_or_else(|| unreachable!());
+        let embedder: Arc<dyn Provider> = Arc::new(OtherModelProvider);
+        let searcher = Searcher::new(
+            harness.searcher.project_root,
+            harness.searcher.store,
+            embedder,
+            harness.searcher.config,
+        );
+
+        // The harness indexes under stub-v1; a provider claiming another model
+        // must not embed — the reindex hint must ride the degraded result.
+        let results = searcher
+            .search(SearchQuery {
+                query: "add".to_owned(),
+                top_k: 10,
+                language_filter: None,
+                path_prefix: None,
+                repos: Vec::new(),
+            })
+            .await;
+        assert!(
+            results.is_ok(),
+            "identity-mismatch search must degrade, not error: {results:?}"
+        );
+        let results = results.ok().unwrap_or_else(|| unreachable!());
+        assert_eq!(
+            results.degraded_hint,
+            Some(hints::REINDEX_AFTER_MODEL_CHANGE),
+            "a model mismatch must carry the reindex hint, not the endpoint notice"
+        );
+        assert!(
+            results.results.iter().any(|result| {
+                result.chunk.name.as_deref() == Some("add")
+                    && result.chunk.file_path.as_str() == "src/math.rs"
+            }),
+            "lexical fallback must still surface the 'add' identifier/BM25 hit"
+        );
+    }
+
+    /// A mismatched store that holds nothing to rank must still surface the
+    /// reindex hint: the identity gate runs before the empty-corpus early
+    /// return, so the hint does not vanish with the rows. The fixture is the
+    /// crash-window shape (a manifest naming the old model over an empty
+    /// chunks table), which pre-degradation hard-errored at construction.
+    #[tokio::test]
+    async fn mismatch_degrade_surfaces_reindex_hint_on_empty_corpus() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+        store.reset_chunks_table(Dimension(8)).await?;
+        store.write_manifest(&crate::store::Manifest::new("old-model", 8))?;
+        let embedder: Arc<dyn Provider> = Arc::new(OtherModelProvider);
+        let searcher = Searcher::new(
+            fixture.root().to_path_buf(),
+            store,
+            embedder,
+            config.search.clone(),
+        );
+
+        let results = searcher
+            .search(SearchQuery {
+                query: "add".to_owned(),
+                top_k: 10,
+                language_filter: None,
+                path_prefix: None,
+                repos: Vec::new(),
+            })
+            .await;
+        assert!(results.is_ok(), "search failed: {results:?}");
+        let results = results.ok().unwrap_or_else(|| unreachable!());
+        assert!(results.results.is_empty(), "an empty corpus has no hits");
+        assert_eq!(
+            results.degraded_hint,
+            Some(hints::REINDEX_AFTER_MODEL_CHANGE),
+            "an identity mismatch must carry the reindex hint even with zero chunks"
+        );
+        Ok(())
     }
 
     /// A non-endpoint embedding failure is a real bug, not a reason to degrade:
