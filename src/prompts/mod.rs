@@ -85,7 +85,7 @@ mod tests {
 
     #[test]
     fn no_agent_visible_string_names_a_retired_tool() {
-        let served: Vec<String> = mcp::tool_definitions(true)
+        let served: Vec<String> = mcp::tool_definitions()
             .iter()
             .filter_map(|tool| tool.get("name")?.as_str().map(str::to_owned))
             .collect();

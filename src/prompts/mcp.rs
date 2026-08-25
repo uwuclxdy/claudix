@@ -17,19 +17,16 @@ pub const STALE_HITS_NOTE: &str = "A stale hit's file changed on disk after inde
 /// per MCP session so the notice does not bill every degraded search.
 pub const ENDPOINT_DOWN_NOTE: &str = "The embedding endpoint is unreachable, so these results are lexical-only (keyword and identifier matching, no semantic ranking). Restart the endpoint for full semantic search.";
 
-/// The served catalog. `cross_repo` advertises the `repos` parameter on the
-/// tools that accept it; the handlers honor `repos` either way, so a session
-/// that gains cross-repos mid-flight degrades to a working-but-unadvertised
-/// parameter rather than a broken call.
-pub fn tool_definitions(cross_repo: bool) -> Vec<Value> {
-    vec![
-        search_code(cross_repo),
-        reindex(),
-        find_duplicates(cross_repo),
-    ]
+/// The served catalog. `repos` is always advertised on the tools that accept
+/// it, whether or not cross-repos are configured: hiding it gated the argument
+/// on config and left a subagent without cross-repos unable to select a target
+/// repo from the schema (settled 2026-08-24: advertise always, no exclude
+/// option).
+pub fn tool_definitions() -> Vec<Value> {
+    vec![search_code(), reindex(), find_duplicates()]
 }
 
-fn search_code(cross_repo: bool) -> Value {
+fn search_code() -> Value {
     let mut properties = json!({
         "query": { "type": "string", "description": "Natural-language description or identifier name. Multiple words work best." },
         "top_k": { "type": "integer", "minimum": 1, "description": "Maximum results to return (default 10)" },
@@ -40,12 +37,10 @@ fn search_code(cross_repo: bool) -> Value {
         },
         "path_prefix": { "type": "string", "description": "Restrict to files under this project-relative path prefix, e.g. \"src/hooks\"" }
     });
-    if cross_repo {
-        insert_repos_property(
-            &mut properties,
-            "Absolute paths to other indexed repos to search read-only, added to the active project.",
-        );
-    }
+    insert_repos_property(
+        &mut properties,
+        "Absolute paths to other indexed repos to search read-only. The active project is always searched.",
+    );
     json!({
         "name": "search_code",
         "description": "Semantic code search over the indexed project. Use when: finding code by meaning ('where is auth handled'), looking up an identifier, exploring an unfamiliar area, or checking whether logic already exists before writing it. Prefer over Grep unless you need an exact literal or regex. Returns hits grouped by directory, best score first.",
@@ -71,7 +66,7 @@ fn reindex() -> Value {
     })
 }
 
-fn find_duplicates(cross_repo: bool) -> Value {
+fn find_duplicates() -> Value {
     let mut properties = json!({
         "min_similarity": {
             "type": "number",
@@ -85,12 +80,10 @@ fn find_duplicates(cross_repo: bool) -> Value {
             "description": "Maximum number of pairs to return (default 50)"
         }
     });
-    if cross_repo {
-        insert_repos_property(
-            &mut properties,
-            "Absolute paths to other indexed repos to scan read-only, added to the active project.",
-        );
-    }
+    insert_repos_property(
+        &mut properties,
+        "Absolute paths to other indexed repos to scan read-only. The active project is always scanned.",
+    );
     json!({
         "name": "find_duplicates",
         "description": "Near-identical code chunks, found by comparing stored embeddings. Use when: checking whether equivalent code already exists before adding logic, or auditing copy-paste. Returns pairs by similarity, highest first.",
@@ -120,8 +113,8 @@ fn insert_repos_property(properties: &mut Value, description: &str) {
 mod tests {
     use super::*;
 
-    fn names(cross_repo: bool) -> Vec<String> {
-        tool_definitions(cross_repo)
+    fn names() -> Vec<String> {
+        tool_definitions()
             .iter()
             .filter_map(|tool| tool.get("name")?.as_str().map(str::to_owned))
             .collect()
@@ -131,24 +124,23 @@ mod tests {
         tool.pointer("/inputSchema/properties/repos").is_some()
     }
 
-    #[test]
-    fn catalog_is_the_same_three_tools_regardless_of_cross_repo() {
-        let expected = vec!["search_code", "reindex", "find_duplicates"];
-        assert_eq!(names(false), expected);
-        assert_eq!(names(true), expected);
+    fn repos_description(tool: &Value) -> Option<&str> {
+        tool.pointer("/inputSchema/properties/repos/description")?
+            .as_str()
     }
 
     #[test]
-    fn repos_param_is_advertised_only_when_cross_repo_is_configured() {
-        for tool in tool_definitions(false) {
-            assert!(
-                !has_repos_param(&tool),
-                "{} advertised repos without cross-repos configured",
-                tool["name"]
-            );
-        }
+    fn catalog_serves_the_three_tools() {
+        let expected = vec!["search_code", "reindex", "find_duplicates"];
+        assert_eq!(names(), expected);
+    }
 
-        let with_repos: Vec<String> = tool_definitions(true)
+    /// A subagent with no cross-repos configured still gets `repos`: it is the
+    /// only way the served schema lets it select a target repo, so the argument
+    /// must appear whether or not any config names repos.
+    #[test]
+    fn repos_param_is_always_advertised_on_cross_repo_tools() {
+        let with_repos: Vec<String> = tool_definitions()
             .iter()
             .filter(|tool| has_repos_param(tool))
             .filter_map(|tool| tool.get("name")?.as_str().map(str::to_owned))
@@ -156,11 +148,38 @@ mod tests {
         assert_eq!(with_repos, vec!["search_code", "find_duplicates"]);
     }
 
+    #[test]
+    fn repos_description_states_the_active_project_is_always_searched_or_scanned() {
+        let with_repos: Vec<Value> = tool_definitions()
+            .into_iter()
+            .filter(has_repos_param)
+            .collect();
+        assert_eq!(
+            with_repos.len(),
+            2,
+            "both cross-repo tools must advertise repos"
+        );
+
+        for tool in with_repos {
+            let description = repos_description(&tool).unwrap_or_default();
+            let verb = if tool["name"] == "search_code" {
+                "searched"
+            } else {
+                "scanned"
+            };
+            assert!(
+                description.contains(&format!("The active project is always {verb}")),
+                "{} repos description must state the active project is always {verb}: {description:?}",
+                tool["name"]
+            );
+        }
+    }
+
     /// The description restating the schema is exactly the duplication this
     /// module exists to avoid, and it silently rots when an argument changes.
     #[test]
     fn descriptions_never_restate_args_or_returns() {
-        for tool in tool_definitions(true) {
+        for tool in tool_definitions() {
             let description = tool["description"].as_str();
             assert!(
                 description.is_some_and(|text| text.len() > 40),
@@ -188,7 +207,7 @@ mod tests {
     #[test]
     fn every_required_field_exists_in_properties() {
         let mut checked = 0;
-        for tool in tool_definitions(true) {
+        for tool in tool_definitions() {
             let schema = &tool["inputSchema"];
             assert!(
                 schema["properties"].is_object(),

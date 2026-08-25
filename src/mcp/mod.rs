@@ -87,17 +87,6 @@ impl ClaudixServer {
         }
     }
 
-    /// Whether `[search].cross_repos` names anything, deciding if the catalog
-    /// advertises `repos`. Read per `tools/list` rather than cached at
-    /// construction so a `/mcp` reconnect picks up a config edit. A config that
-    /// fails to load answers "no": the handlers still accept `repos`, so the
-    /// cost of guessing wrong is an unadvertised parameter, not a broken tool.
-    fn cross_repo_configured(&self) -> bool {
-        config::load(&self.project_root)
-            .map(|config| !config.search.cross_repos.is_empty())
-            .unwrap_or(false)
-    }
-
     /// Semantic code search over the active project plus optional cross-repos.
     #[tool(name = "search_code")]
     async fn search_code(&self, Parameters(request): Parameters<SearchCodeRequest>) -> ToolOutcome {
@@ -186,17 +175,15 @@ impl ServerHandler for ClaudixServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tool_catalog(
-            self.cross_repo_configured(),
-        )?))
+        Ok(ListToolsResult::with_all_items(tool_catalog()?))
     }
 }
 
 /// The served tool catalog, built from `prompts::mcp` in declared order. Single
 /// source of truth for `tools/list`; the macro-derived per-tool schemas are not
 /// served.
-fn tool_catalog(cross_repo: bool) -> std::result::Result<Vec<Tool>, ErrorData> {
-    crate::prompts::mcp::tool_definitions(cross_repo)
+fn tool_catalog() -> std::result::Result<Vec<Tool>, ErrorData> {
+    crate::prompts::mcp::tool_definitions()
         .into_iter()
         .map(tool_from_definition)
         .collect()
@@ -369,7 +356,7 @@ mod tests {
 
     #[test]
     fn list_tools_returns_documented_tool_names_in_order() {
-        let tools = tool_catalog(false).unwrap_or_default();
+        let tools = tool_catalog().unwrap_or_default();
         let names = tools
             .iter()
             .map(|tool| tool.name.as_ref())
@@ -382,7 +369,7 @@ mod tests {
     /// catalog advertises a call that fails at runtime.
     #[test]
     fn every_served_tool_has_a_handler() {
-        let served = tool_catalog(true).unwrap_or_default();
+        let served = tool_catalog().unwrap_or_default();
         let routed = ClaudixServer::tool_router();
 
         for tool in &served {
@@ -542,33 +529,6 @@ mod tests {
         assert_eq!(
             after.chunk_count, before.chunk_count,
             "force wiped the index during a single-file reindex"
-        );
-    }
-
-    /// `cross_repo_configured` reads the real config layers, so a bare "." would
-    /// resolve the developer's own `~/.claude/claudix.toml` and pass or fail with
-    /// their machine. Pin both answers against a fixture that owns its config.
-    #[tokio::test]
-    async fn cross_repo_advertises_repos_only_when_config_lists_them() {
-        let fixture = TestFixture::new("small_rust");
-        assert!(fixture.is_ok());
-        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
-        let server =
-            ClaudixServer::new(fixture.root().to_path_buf(), Arc::new(ProviderCache::new()));
-
-        let mut config = stub_config();
-        config.search.cross_repos = vec![];
-        assert!(write_fixture_config(fixture.root(), &config).is_ok());
-        assert!(
-            !server.cross_repo_configured(),
-            "no cross_repos configured, yet repos was advertised"
-        );
-
-        config.search.cross_repos = vec!["/somewhere/else".to_owned()];
-        assert!(write_fixture_config(fixture.root(), &config).is_ok());
-        assert!(
-            server.cross_repo_configured(),
-            "cross_repos configured, yet repos stayed hidden"
         );
     }
 }
