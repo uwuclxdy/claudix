@@ -116,7 +116,7 @@ Configuration is validated at every entry point (MCP, hook, CLI). Invalid config
 Two optional rule files control what gets indexed, using gitignore syntax (globs, `!` negation, comments). Place them at the repo root or in any subdirectory; patterns are relative to the rule file's own directory, like nested `.gitignore` files. Precedence per path: `.indexinclude` beats `.gitignore`, which beats `.indexignore`.
 
 - `.indexignore` excludes tracked files from the index: test fixtures, vendored code, minified bundles.
-- `.indexinclude` pulls gitignored paths into the index: internal `docs/`, generated code. A one-line `*` in `docs/.indexinclude` indexes that whole tree. Files without a code chunker index as plain text.
+- `.indexinclude` pulls gitignored paths into the index: internal `docs/`, generated code. A one-line `*` file inside the `docs/` directory indexes that whole tree. Files without a code chunker index as plain text.
 
 A rule file buried two or more levels inside a gitignored subtree is not discovered; put it at the top of the gitignored directory or at the repo root. Edited rule files apply on the next index run. To index everything gitignored instead, set `[indexing] respect_gitignore = false`.
 
@@ -198,7 +198,7 @@ Heuristics for passthrough: regex anchors/character classes, explicit file globs
 
 ### Related-Code Surfacing
 
-After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` caps hits per edit; the cosine floor is corpus-relative (each full index stores the p30 of its own score distribution), with `related_min_similarity` as the fallback and a hard minimum. A neighbor already surfaced this session is not repeated, whichever file you were editing at the time.
+After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` caps hits per edit; the cosine floor is corpus-relative (each full index stores the p30 of its own score distribution), with `related_min_similarity` as the fallback and a hard minimum. A neighbor already surfaced this session is not repeated when it names the same lines, whichever file you were editing at the time; hints pointing at lines the session already Read are skipped too.
 
 ### MCP Tool: `search_code`
 

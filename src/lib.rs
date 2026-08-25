@@ -601,7 +601,7 @@ impl Claudix {
         // in every regime the harness replays. Raising the depth is not
         // monotone: a deeper marker feeds the ack-time seen-filter faster, so
         // intermediate depths starve edits that both a shallower and a deeper one
-        // clear. Numbers and method: `docs/subsystems/hooks.md`.
+        // clear.
         let top_k = self
             .config
             .hooks
