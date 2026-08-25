@@ -10,8 +10,9 @@
 //! <child_pid>         // spawned child pid, or "0" placeholder
 //! ```
 //!
-//! Stale recovery is age-based on `created_at` rather than mtime, because
-//! `check_index_ready` rewrites the marker between session-start spawns.
+//! Stale recovery is age-based on `created_at` rather than mtime: a surfaced
+//! failure leaves the marker in place (each turn resurfaces it), so the file's
+//! mtime cannot say when the failed run was claimed.
 
 use std::fs;
 use std::path::Path;
@@ -28,6 +29,10 @@ pub(crate) const FAILURE_GRACE_SECS: u64 = 60;
 pub(crate) struct PendingIndexMarker {
     pub prior_ts: String,
     pub created_at: SystemTime,
+    /// Raw RFC3339 string as written in the marker file. Distinct from
+    /// `created_at` (the parsed value) and refreshed on every claim, so it
+    /// identifies one failed run for the session-less ack ledger.
+    pub created_at_raw: String,
     /// PID of the spawned `claudix index` child, or `None` if the marker is
     /// still the placeholder written before the child was forked (or a legacy
     /// marker missing this line entirely).
@@ -38,7 +43,8 @@ pub(crate) fn read(marker_path: &Path) -> Option<PendingIndexMarker> {
     let content = fs::read_to_string(marker_path).ok()?;
     let mut lines = content.lines();
     let prior_ts = lines.next()?.to_owned();
-    let created_at = parse_rfc3339(lines.next()?).ok()?;
+    let created_at_raw = lines.next()?.to_owned();
+    let created_at = parse_rfc3339(&created_at_raw).ok()?;
     let child_pid = lines
         .next()
         .and_then(|line| line.trim().parse::<u32>().ok())
@@ -46,6 +52,7 @@ pub(crate) fn read(marker_path: &Path) -> Option<PendingIndexMarker> {
     Some(PendingIndexMarker {
         prior_ts,
         created_at,
+        created_at_raw,
         child_pid,
     })
 }
@@ -85,6 +92,21 @@ fn is_fresh(marker_path: &Path) -> bool {
         .duration_since(marker.created_at)
         .map(|age| age < Duration::from_secs(FAILURE_GRACE_SECS))
         .unwrap_or(false)
+}
+
+/// A pending marker reads as "index in flight" while it is still fresh (inside
+/// the failure-grace window) or its recorded child is alive. A stale marker
+/// with a dead child is a failed run: `check_index_ready` leaves those in place
+/// so each turn can resurface the failure, and SessionStart must not report
+/// them as still building.
+pub(crate) fn is_in_flight(marker_path: &Path) -> bool {
+    let Some(marker) = read(marker_path) else {
+        return false;
+    };
+    is_fresh(marker_path)
+        || marker
+            .child_pid
+            .is_some_and(crate::store::marker::process_running)
 }
 
 #[cfg(test)]
@@ -157,5 +179,33 @@ mod tests {
         assert!(try_claim(&marker_path, &payload));
         let marker = read(&marker_path);
         assert!(marker.is_some());
+    }
+
+    #[test]
+    fn is_in_flight_reads_stale_dead_child_as_not_building() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("indexing-pending");
+        // Backdated past the failure grace with a "0" (dead) child: a failed run
+        // whose marker now persists so each turn can resurface it.
+        fs::write(&marker_path, "none\n2025-01-01T00:00:00Z\n0\n")
+            .unwrap_or_else(|_| unreachable!());
+
+        assert!(
+            !is_in_flight(&marker_path),
+            "a stale marker with a dead child must not read as building"
+        );
+    }
+
+    #[test]
+    fn is_in_flight_reads_fresh_marker_as_building() {
+        let dir = tempdir().ok().unwrap_or_else(|| unreachable!());
+        let marker_path = dir.path().join("indexing-pending");
+        fs::write(&marker_path, format!("none\n{}\n0\n", now_rfc3339()))
+            .unwrap_or_else(|_| unreachable!());
+
+        assert!(
+            is_in_flight(&marker_path),
+            "a fresh claim must read as building"
+        );
     }
 }

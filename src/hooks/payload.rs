@@ -11,6 +11,12 @@ pub(super) struct HookPayload {
     /// path — means the event cannot be attributed and never acks a marker.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// UUID of the user prompt currently being processed (CC common hook input,
+    /// v2.1.196+). The turn identity for index-failure dedupe: re-fired submits
+    /// within one turn carry the same id, a new prompt carries a new one. `None`
+    /// on older clients or before the first user input.
+    #[serde(default)]
+    pub prompt_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

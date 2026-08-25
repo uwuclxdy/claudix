@@ -57,9 +57,10 @@ pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bo
     // aged out yet); either way, leave it alone so its `created_at` keeps
     // anchoring the failure-grace clock.
     let placeholder = format!("{prior_ts}\n{}\n0\n", now_rfc3339());
-    // Leave the ack file alone — `check_index_ready` rewrites it on success and
-    // on each surfaced failure. Wiping it here would defeat dedup, so an index
-    // that keeps failing with the same `prior_ts` would re-notify every session.
+    // Leave the ack file alone — `check_index_ready` removes it on success and
+    // the session-less fallback writes it, keyed on the failed run's raw
+    // `created_at`. Wiping it here would defeat that once-per-failed-run
+    // fallback for legacy clients.
     if !pending_index::try_claim(&marker_path, &placeholder) {
         return false;
     }

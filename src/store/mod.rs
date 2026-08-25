@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use lancedb::{Connection, Table};
+use sha2::Digest;
 use tokio::sync::OnceCell;
 
 use crate::config::Config;
@@ -155,6 +156,28 @@ impl Store {
 
     pub fn state_dir_path(&self) -> &Path {
         &self.paths.state_dir
+    }
+
+    /// Per-session record of the last surfaced index-failure context (prompt id
+    /// + failed run).
+    ///
+    /// The filename hashes the session id so one session's dedupe state can
+    /// never be rewritten by another session's events, and an arbitrary session
+    /// id cannot spell a path.
+    ///
+    /// One file per session that ever hit a failed index; never removed. Accepted: tens of bytes per affected session, and any sweep would need an age gate so a live session's record is not deleted.
+    pub fn index_failure_seen_path(&self, session_id: &str) -> PathBuf {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(session_id.as_bytes());
+        let digest = hasher.finalize();
+        let suffix: String = digest
+            .iter()
+            .take(8)
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        self.paths
+            .state_dir
+            .join(format!("index-failure-seen-{suffix}.json"))
     }
 
     pub fn ensure_layout(&self) -> Result<()> {

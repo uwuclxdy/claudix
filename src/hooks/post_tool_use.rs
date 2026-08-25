@@ -108,7 +108,13 @@ pub(super) async fn handle_post_tool_use(
     // read-neighbors are all surfaced together. Index-ready goes first (most
     // urgent); the rest append in order.
     let index_ready = match (store.as_ref(), config.as_ref()) {
-        (Some(st), Some(cfg)) => check_index_ready(st, cfg, "PostToolUse"),
+        (Some(st), Some(cfg)) => check_index_ready(
+            st,
+            cfg,
+            "PostToolUse",
+            session_id,
+            payload.prompt_id.as_deref(),
+        ),
         _ => None,
     };
 

@@ -42,9 +42,15 @@ pub(super) async fn handle_session_start(
     // A spawn that lost the claim (another session already started one) still
     // counts as "in flight" for the user-facing message — otherwise we'd tell
     // them the index is empty while it's actively being built.
+    // A failed run's marker now survives its surfaced failure (each turn
+    // resurfaces it), so marker existence alone reads as "building" forever on
+    // a broken repo. Gate on liveness instead: fresh claim or a live child.
     let indexing_in_flight = indexing_spawned
         || store.as_ref().is_some_and(|store| {
-            store.full_index_running() || store.pending_index_marker_path().exists()
+            store.full_index_running()
+                || crate::store::marker::pending_index::is_in_flight(
+                    &store.pending_index_marker_path(),
+                )
         });
 
     let indexed_file_count = manifest.as_ref().map(|m| m.file_count).unwrap_or(0);
