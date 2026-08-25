@@ -16,10 +16,8 @@ Configuration lives in `~/.claude/claudix.toml` (global) overridden by `<repo>/.
 
 ## Build or rebuild the index
 
-Agent path: the `reindex` MCP tool. CLI path: `claudix index` (`--progress` streams per-file progress). Pass `force: true` / `--force` to wipe the store before rebuilding. Needed for:
+Agent path: the `reindex` MCP tool. CLI path: `claudix index` (`--progress` streams per-file progress). A plain reindex clears a store whose embedding model, dimensions, or schema version no longer match the config. Pass `force: true` / `--force` to wipe the store before rebuilding. Needed for:
 
-- embedding model or dimension changes
-- schema mismatch after a plugin upgrade
 - resetting a corrupted index
 
 Indexing may take a minute on large repositories; if it errors, run `/claudix:doctor` to diagnose the embedding provider.
@@ -37,7 +35,7 @@ Edited rule files apply on the next index run, so reindex after changing them.
 
 ## Embedding providers
 
-`[embedding] provider = "bundled"` (default, `gte-modernbert-base` at 768 dims; `bge-small-en-v1.5` at 384 dims also selectable, zero setup either way) or `"http"` (any keyless OpenAI-`/v1/embeddings` server: LM Studio `http://localhost:1234`, Ollama `http://localhost:11434`, vLLM, a LiteLLM proxy). Set `model` to the id the server reports; set `dimensions` to the model's output size. Any model or dimension change requires a force rebuild (previous section). Keyed APIs (Voyage, OpenAI) need a local proxy that injects the key.
+`[embedding] provider = "bundled"` (default, `gte-modernbert-base` at 768 dims; `bge-small-en-v1.5` at 384 dims also selectable, zero setup either way) or `"http"` (any keyless OpenAI-`/v1/embeddings` server: LM Studio `http://localhost:1234`, Ollama `http://localhost:11434`, vLLM, a LiteLLM proxy). Set `model` to the id the server reports; set `dimensions` to the model's output size. Any model or dimension change is cleared automatically by the next plain reindex (previous section). Keyed APIs (Voyage, OpenAI) need a local proxy that injects the key.
 
 ## Cross-repo search
 

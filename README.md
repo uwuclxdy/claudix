@@ -242,13 +242,13 @@ endpoint = "http://localhost:11434"
 model = "nomic-embed-text"
 ```
 
-Vector width follows the model: 768 for the bundled `gte-modernbert-base`, 384 for `bge-small-en-v1.5`, whatever an `http` model publishes. After any model or dimension change, rebuild with `claudix index --force` (SessionStart flags the mismatch but never wipes your index on its own).
+Vector width follows the model: 768 for the bundled `gte-modernbert-base`, 384 for `bge-small-en-v1.5`, whatever an `http` model publishes. After any model or dimension change, rebuild with `claudix index` (SessionStart flags the mismatch but never wipes your index on its own).
 
 ### Choosing a Model
 
 The bundled `gte-modernbert-base` is a general-purpose English text model with a long context window. It is a solid zero-setup default, but a code-specialized or larger embedder measurably improves retrieval on real codebases. For how the bundled models were measured against each other, why an absolute similarity floor is not portable across models (and how claudix calibrates a corpus-relative one per index), and why public code-retrieval benchmarks do not measure this use case, see [wiki/embedding-findings.md](wiki/embedding-findings.md).
 
-The `http` provider speaks the OpenAI `/v1/embeddings` format and sends no authorization header, so it connects to keyless servers: LM Studio, Ollama, a local vLLM instance, or a local proxy such as LiteLLM. Hosted APIs that require a key (Voyage, OpenAI, Gemini) are reachable only by fronting them with a local proxy that injects the key. Set `dimensions` to the model's output size, or to a smaller Matryoshka size it supports; changing the dimension requires a `claudix index --force` rebuild.
+The `http` provider speaks the OpenAI `/v1/embeddings` format and sends no authorization header, so it connects to keyless servers: LM Studio, Ollama, a local vLLM instance, or a local proxy such as LiteLLM. Hosted APIs that require a key (Voyage, OpenAI, Gemini) are reachable only by fronting them with a local proxy that injects the key. Set `dimensions` to the model's output size, or to a smaller Matryoshka size it supports; changing the dimension requires a `claudix index` rebuild.
 
 | Pick | Model | Dimensions | Context | Access | Why |
 |------|-------|-----------|---------|--------|-----|
@@ -325,7 +325,7 @@ If using LM Studio or Ollama:
 
 1. Verify server is running: `curl http://localhost:1234/health` (LM Studio) or `curl http://localhost:11434/api/embeddings` (Ollama)
 2. Check configuration: `/claudix:doctor` shows `endpoint` in use
-3. Switch to bundled: set `provider = "bundled"` in `~/.claude/claudix.toml`, then rebuild with `claudix index --force` (the model changed)
+3. Switch to bundled: set `provider = "bundled"` in `~/.claude/claudix.toml`, then rebuild with `claudix index` (the model changed)
 
 ### Hooks Don't Trigger or Fail Silently
 
@@ -343,7 +343,7 @@ RUST_LOG=debug claudix status  # or any other subcommand
 
 ### Schema Mismatch After Upgrade
 
-If the binary is newer than indexed chunks, SessionStart triggers background reindex and emits `additionalContext`. You can manually rebuild with `claudix index --force`.
+If the binary is newer than indexed chunks, SessionStart triggers background reindex and emits `additionalContext`. You can manually rebuild with `claudix index`.
 
 ## Fail-Open Guarantee
 
