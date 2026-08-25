@@ -33,7 +33,7 @@ pub fn session_start_response(
         .map(|p| format!(" Tail `{p}` to check progress."))
         .unwrap_or_default();
     let additional_context = if model_mismatch {
-        "claudix semantic search unavailable: the index was built with a different embedding model. Call the reindex tool with force: true (or run `claudix index --force`) to rebuild.".to_owned()
+        "claudix semantic search unavailable: the index was built with a different embedding model. Call the reindex tool (or run `claudix index`) to rebuild.".to_owned()
     } else if chunk_count == 0 && indexing_in_flight {
         format!(
             "claudix is building its first index in the background; you'll be notified here when it's ready, so just carry on with Grep or Read until then.{progress_suffix}"

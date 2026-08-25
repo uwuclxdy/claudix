@@ -66,13 +66,13 @@ pub const BUNDLED_ASSET_CORRUPT: &str = "The downloaded model asset did not matc
 
 // --- store --------------------------------------------------------------
 pub const REINDEX_SCHEMA_VERSION: &str =
-    "Run reindex with force: true to rebuild the store with the current schema version";
+    "Run reindex to rebuild the store with the current schema version";
 pub const REINDEX_AFTER_MODEL_CHANGE: &str =
-    "Run reindex with force: true after changing the configured embedding model";
+    "Run reindex after changing the configured embedding model";
 pub const REINDEX_AFTER_DIMENSION_CHANGE: &str =
-    "Run reindex with force: true after changing the configured embedding dimensions";
+    "Run reindex after changing the configured embedding dimensions";
 pub const REINDEX_ALIGN_DIMENSIONS: &str =
-    "Run reindex with force: true after aligning embedding dimensions with the active model";
+    "Run reindex after aligning embedding dimensions with the active model";
 
 // --- cli ----------------------------------------------------------------
 pub const FINITE_MIN_SIMILARITY: &str = "Use a finite min_similarity between 0 and 1";
