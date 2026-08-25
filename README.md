@@ -198,7 +198,7 @@ Heuristics for passthrough: regex anchors/character classes, explicit file globs
 
 ### Related-Code Surfacing
 
-After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` caps hits per edit; the cosine floor is corpus-relative (each full index stores the p30 of its own score distribution), with `related_min_similarity` as the fallback and a hard minimum. A neighbor already surfaced this session is not repeated when it names the same lines, whichever file you were editing at the time; hints pointing at lines the session already Read are skipped too.
+After an edit, claudix looks up code semantically related to the changed chunks and injects the locations into the conversation on the next hook event ("may need matching changes"). Source hits render under `related code:` and documentation files (markdown, rst, adoc, txt, org extensions, case-insensitive, and conventional extensionless basenames such as README or LICENSE) under `related docs:`; a label appears only when its group has hits. Ranged `Read`s get the same treatment when `surface_related_on_read = true` (opt-in). `related_top_k` caps hits per edit across both groups; the cosine floor is corpus-relative (each full index stores the p30 of its own score distribution), with `related_min_similarity` as the fallback and a hard minimum. A neighbor already surfaced this session is not repeated when it names the same lines, whichever file you were editing at the time; hints pointing at lines the session already Read are skipped too.
 
 ### MCP Tool: `search_code`
 
