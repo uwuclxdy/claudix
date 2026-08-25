@@ -1,5 +1,5 @@
-//! Measurement harness for related-code hint noise. Numbers it produced are
-//! recorded in `docs/subsystems/hooks.md`; open questions in `docs/todo.md`.
+//! Measurement harness for related-code hint noise. The numbers it prints back
+//! the shipped depth and floor constants.
 //!
 //! Reads the repo's own live index and replays the hook's neighbor pipeline
 //! against it, so the numbers come from the shipped code path rather than from
@@ -32,8 +32,8 @@ use crate::store::{Store, StoredChunk};
 use crate::types::{Language, RelativePath};
 
 /// Edits per simulated session, `CLAUDIX_MEASURE_SESSION` to override. The
-/// default matches the shape of the pre-fix baseline in `docs/todo.md` (10
-/// edits to 10 different files) so the two are comparable. Longer sessions are
+/// default (10 edits to 10 different files) matches the baseline the shipped
+/// depth was measured against, so the two stay comparable. Longer sessions are
 /// what put the seen-filter under real pressure: the ledger only grows, so the
 /// pool cap can only start costing hints once a session has consumed enough of
 /// one edit's candidates.
@@ -344,7 +344,7 @@ fn percentile(sorted: &[f32], p: usize) -> f32 {
 /// is an absolute cosine and each embedding model spreads its similarities
 /// differently, so a floor tuned against one is worth re-checking against
 /// another. Run it on the same repo under two providers and compare. The
-/// bge-small-vs-qwen3 comparison it answered is in `docs/subsystems/hooks.md`.
+/// sweep answered the bge-small-vs-qwen3 comparison.
 ///
 /// It scans at floor `0.0` itself rather than taking a pool, because a floored
 /// pool would silently mix a no-neighbor sentinel into the percentiles and drag
@@ -1114,8 +1114,8 @@ async fn hint_distribution_over_the_live_index() {
 
     // Multi-seed: one edit per file seeded with up to k changed chunks at once,
     // the model of a k-hunk edit. Its pool is the union of the per-seed pools,
-    // so it is the ceiling the single-seed sections above only lower-bound
-    // (`docs/todo.md` item 3). Read the over-cap and starvation counts here.
+    // so it is the ceiling the single-seed sections above only lower-bound.
+    // Read the over-cap and starvation counts here.
     let k = multi_seed_k();
     let multi_pools = scan(&rows, build_multi_seed_edits(&by_file, k), floor);
     println!("\n=== multi-seed query, up to k={k} changed chunks per edit ===");
