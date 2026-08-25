@@ -52,6 +52,28 @@ pub struct Claudix {
 pub struct IndexStats {
     pub file_count: usize,
     pub chunk_count: usize,
+    /// Set only by [`Claudix::index_full`], and only when the pass enumerated
+    /// files but stored no chunks. That pass and an empty repository print the
+    /// same `indexed 0 files into 0 chunks` summary, so the CLI renders this on
+    /// stderr after the summary; other consumers ignore it. Never set by
+    /// [`Claudix::reindex_file`] or its fast paths.
+    pub empty_index_warning: Option<String>,
+}
+
+/// The warning for a full pass that enumerated files but stored no chunks:
+/// the cause (no file produced indexable chunks) plus the fix (a root
+/// `.indexinclude`). Silent on partial skips — some files chunked — and on an
+/// enumeration that yielded nothing, where the zero summary is accurate.
+fn build_empty_index_warning(enumerated: usize, chunk_count: usize) -> Option<String> {
+    if enumerated == 0 || chunk_count > 0 {
+        return None;
+    }
+    Some(format!(
+        "{enumerated} files enumerated but 0 chunks indexed — no file produced \
+         indexable chunks (e.g. unknown-language files chunk empty unless a \
+         .indexinclude rule force-includes them)\n\
+         hint: add a root .indexinclude with a `*` rule to text-index these files"
+    ))
 }
 
 pub enum IndexFileStatus {
@@ -280,6 +302,7 @@ impl Claudix {
             return Ok(IndexStats {
                 file_count: stats.file_count,
                 chunk_count: stats.chunk_count,
+                empty_index_warning: build_empty_index_warning(files.len(), stats.chunk_count),
             });
         }
 
@@ -297,6 +320,7 @@ impl Claudix {
             return Ok(IndexStats {
                 file_count: stats.file_count,
                 chunk_count: stats.chunk_count,
+                empty_index_warning: build_empty_index_warning(files.len(), stats.chunk_count),
             });
         }
 
@@ -384,6 +408,7 @@ impl Claudix {
         Ok(IndexStats {
             file_count: stats.file_count,
             chunk_count: stats.chunk_count,
+            empty_index_warning: build_empty_index_warning(files.len(), stats.chunk_count),
         })
     }
 
@@ -410,6 +435,7 @@ impl Claudix {
                     .as_ref()
                     .map(|m| m.chunk_count as usize)
                     .unwrap_or(0),
+                empty_index_warning: None,
             });
         }
 
@@ -421,6 +447,7 @@ impl Claudix {
                 Ok(Some(pruned)) => IndexStats {
                     file_count: pruned.file_count,
                     chunk_count: pruned.chunk_count,
+                    empty_index_warning: None,
                 },
                 _ => stats,
             };
@@ -455,6 +482,7 @@ impl Claudix {
             return Ok(IndexStats {
                 file_count: stats.file_count,
                 chunk_count: stats.chunk_count,
+                empty_index_warning: None,
             });
         };
 
@@ -522,6 +550,7 @@ impl Claudix {
         Ok(IndexStats {
             file_count: stats.file_count,
             chunk_count: stats.chunk_count,
+            empty_index_warning: None,
         })
     }
 
@@ -709,6 +738,7 @@ impl Claudix {
             Some(IndexStats {
                 file_count: usize::try_from(manifest.file_count).unwrap_or(usize::MAX),
                 chunk_count: usize::try_from(manifest.chunk_count).unwrap_or(usize::MAX),
+                empty_index_warning: None,
             }),
             None,
         ))
@@ -1247,6 +1277,30 @@ mod tests {
         })
     }
 
+    #[test]
+    fn empty_index_warning_fires_only_for_enumerated_files_with_zero_chunks() {
+        // Files enumerated, nothing chunked — the silent-empty shape the CLI
+        // must make loud.
+        let warning = build_empty_index_warning(3, 0);
+        assert!(warning.is_some());
+        let warning = warning.unwrap_or_else(|| unreachable!());
+        assert!(
+            warning.contains("3 files enumerated but 0 chunks indexed"),
+            "the warning must name the cause, got: {warning}"
+        );
+        assert!(
+            warning.contains(
+                "hint: add a root .indexinclude with a `*` rule to text-index these files"
+            ),
+            "the warning must name the fix, got: {warning}"
+        );
+
+        // Partial skip: some files chunked, others skipped — silent.
+        assert_eq!(build_empty_index_warning(3, 2), None);
+        // Empty enumeration: the zero summary is accurate — silent.
+        assert_eq!(build_empty_index_warning(0, 0), None);
+    }
+
     #[tokio::test]
     async fn index_full_persists_fixture_chunks() {
         let fixture = TestFixture::new("small_rust");
@@ -1265,6 +1319,7 @@ mod tests {
             IndexStats {
                 file_count: 2,
                 chunk_count: 3,
+                empty_index_warning: None,
             }
         );
 
@@ -1484,6 +1539,7 @@ mod tests {
             IndexStats {
                 file_count: 2,
                 chunk_count: 3,
+                empty_index_warning: None,
             }
         );
 
@@ -1567,6 +1623,7 @@ mod tests {
             IndexStats {
                 file_count: 2,
                 chunk_count: 3,
+                empty_index_warning: None,
             }
         );
 
@@ -1995,6 +2052,7 @@ mod tests {
             IndexStats {
                 file_count: 2,
                 chunk_count: 3,
+                empty_index_warning: None,
             }
         );
     }
@@ -2024,6 +2082,7 @@ mod tests {
             IndexStats {
                 file_count: 1,
                 chunk_count: 2,
+                empty_index_warning: None,
             }
         );
 

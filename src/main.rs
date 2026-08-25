@@ -143,6 +143,9 @@ async fn run() -> Result<()> {
                 "indexed {} files into {} chunks",
                 output.file_count, output.chunk_count
             );
+            if let Some(warning) = &output.empty_index_warning {
+                eprintln!("warning: {warning}");
+            }
         }
         Command::Search {
             query,

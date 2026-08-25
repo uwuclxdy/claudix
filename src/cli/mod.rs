@@ -93,6 +93,11 @@ pub struct SearchOutput {
 pub struct IndexOutput {
     pub file_count: usize,
     pub chunk_count: usize,
+    /// Set when the full pass enumerated files but stored no chunks; `main.rs`
+    /// prints it on stderr after the summary. Skipped from serialized output
+    /// unless present (the MCP reindex sweep then surfaces it to the agent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub empty_index_warning: Option<String>,
 }
 
 pub struct StderrIndexProgress;
@@ -781,6 +786,7 @@ pub async fn run_index(project_root: impl AsRef<Path>, progress: bool) -> Result
     Ok(IndexOutput {
         file_count: stats.file_count,
         chunk_count: stats.chunk_count,
+        empty_index_warning: stats.empty_index_warning,
     })
 }
 
@@ -859,6 +865,7 @@ pub async fn run_reindex_file(
     Ok(IndexOutput {
         file_count: stats.file_count,
         chunk_count: stats.chunk_count,
+        empty_index_warning: stats.empty_index_warning,
     })
 }
 
@@ -1459,6 +1466,87 @@ mod tests {
         assert_eq!(
             manifest.dimensions, config.embedding.dimensions,
             "dimensions must match config after the clean reindex"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_index_warns_when_files_enumerate_but_nothing_chunks() {
+        // Every file in this fixture is unknown-language, so the pass stores
+        // zero chunks while the enumeration is non-empty — the silent-empty
+        // shape that must print a warning. Run three passes: pass 1 chunks for
+        // real while the store's state files are still enumerable; pass 2
+        // re-chunks for real after the store's `.claudix/.gitignore` shrinks
+        // the enumerated set and invalidates the recorded hashes; pass 3 takes
+        // the manifest fast path. All three must warn.
+        let fixture = TestFixture::new("unknown_only");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+        let claude_dir = fixture.root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        let config_text = toml::to_string(&config);
+        assert!(config_text.is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                config_text.ok().unwrap_or_default(),
+            )
+            .is_ok()
+        );
+
+        for pass in 1..=3 {
+            let output = run_index(fixture.root(), false).await;
+            assert!(output.is_ok(), "run_index (pass {pass}) failed");
+            let output = output.ok().unwrap_or_else(|| unreachable!());
+            assert_eq!(
+                (output.file_count, output.chunk_count),
+                (0, 0),
+                "pass {pass}: the unknown-only corpus must store no chunks"
+            );
+            let warning = output
+                .empty_index_warning
+                .unwrap_or_else(|| unreachable!("pass {pass} must warn"));
+            assert!(
+                warning.contains("files enumerated but 0 chunks indexed"),
+                "pass {pass}: the warning must name the cause, got: {warning}"
+            );
+            assert!(
+                warning.contains(
+                    "hint: add a root .indexinclude with a `*` rule to text-index these files"
+                ),
+                "pass {pass}: the warning must name the fix, got: {warning}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_index_stays_silent_when_files_chunk() {
+        // small_rust chunks 3 chunks from 2 files: a corpus that stores chunks
+        // must never warn, whatever individual files were skipped.
+        let fixture = TestFixture::new("small_rust");
+        assert!(fixture.is_ok());
+        let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+        let config = stub_config();
+        let claude_dir = fixture.root().join(".claude");
+        assert!(std::fs::create_dir_all(&claude_dir).is_ok());
+        let config_text = toml::to_string(&config);
+        assert!(config_text.is_ok());
+        assert!(
+            std::fs::write(
+                claude_dir.join("claudix.toml"),
+                config_text.ok().unwrap_or_default(),
+            )
+            .is_ok()
+        );
+
+        let output = run_index(fixture.root(), false).await;
+        assert!(output.is_ok());
+        let output = output.ok().unwrap_or_else(|| unreachable!());
+        assert!(output.chunk_count > 0);
+        assert!(
+            output.empty_index_warning.is_none(),
+            "a pass that stored chunks must not warn, got: {:?}",
+            output.empty_index_warning
         );
     }
 

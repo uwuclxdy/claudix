@@ -45,6 +45,7 @@ async fn full_index_enumerates_and_persists_chunks() {
         IndexStats {
             file_count: 2,
             chunk_count: 3,
+            empty_index_warning: None,
         },
         "unexpected index stats: {stats:?}"
     );
