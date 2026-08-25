@@ -83,12 +83,27 @@ struct EditPool {
     pool: Vec<Neighbor>,
 }
 
-/// One neighbor's dedup identity. Mirrors the scope of
-/// `change_neighbors::seen_key`: neighbor file plus symbol, never the edited
-/// path. Modelled as a tuple rather than the tab-joined string because the
-/// harness measures suppression, not the on-disk encoding.
-fn dedup_id(n: &Neighbor) -> (String, Option<String>) {
-    (n.file_path.clone(), n.name.clone())
+/// One neighbor's dedup identity. Mirrors the shipped seen ledger: neighbor
+/// file plus symbol plus the line range the hint names — the same pair at
+/// different lines is new context, and a recorded range suppresses only a hint
+/// it fully contains. Modelled as ranges per (file, symbol) rather than the
+/// tab-joined ledger line because the harness measures suppression, not the
+/// on-disk encoding.
+type SeenLedger = BTreeMap<(String, String), Vec<(u32, u32)>>;
+
+fn seen_covers(seen: &SeenLedger, n: &Neighbor) -> bool {
+    seen.get(&(n.file_path.clone(), n.name.clone().unwrap_or_default()))
+        .is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|&(start, end)| start <= n.line_start && end >= n.line_end)
+        })
+}
+
+fn record_seen(seen: &mut SeenLedger, n: &Neighbor) {
+    seen.entry((n.file_path.clone(), n.name.clone().unwrap_or_default()))
+        .or_default()
+        .push((n.line_start, n.line_end));
 }
 
 /// Render a hit the way the hint line identifies it, for equal-list detection.
@@ -116,7 +131,7 @@ fn consume(
     pool: &[Neighbor],
     top_k: usize,
     depth: usize,
-    seen: Option<&mut HashSet<(String, Option<String>)>>,
+    seen: Option<&mut SeenLedger>,
 ) -> Vec<Neighbor> {
     let marker_cap = top_k.saturating_mul(depth);
     let candidates = pool.iter().take(marker_cap);
@@ -129,11 +144,10 @@ fn consume(
                 if out.len() == top_k {
                     break;
                 }
-                let id = dedup_id(n);
-                if seen.contains(&id) {
+                if seen_covers(seen, n) {
                     continue;
                 }
-                seen.insert(id);
+                record_seen(seen, n);
                 out.push(n.clone());
             }
             out
@@ -212,7 +226,7 @@ fn replay(
     let mut stats = RunStats::default();
 
     for session in order.chunks(session_edits()) {
-        let mut seen: HashSet<(String, Option<String>)> = HashSet::new();
+        let mut seen: SeenLedger = SeenLedger::new();
         let mut lists_this_session: HashSet<Vec<String>> = HashSet::new();
 
         for edit in session.iter().filter_map(|&i| pools.get(i)) {
@@ -234,10 +248,7 @@ fn replay(
                 // the hint. Non-zero only under a multi-seed edit on a dense
                 // corpus; see `hooks.md` and [`report_depth_sweep`].
                 let cap = top_k.saturating_mul(depth);
-                if edit.pool.len() > cap
-                    && edit.pool[cap..]
-                        .iter()
-                        .any(|n| !seen.contains(&dedup_id(n)))
+                if edit.pool.len() > cap && edit.pool[cap..].iter().any(|n| !seen_covers(&seen, n))
                 {
                     stats.starved_by_cap += 1;
                 }

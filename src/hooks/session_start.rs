@@ -31,10 +31,20 @@ pub(super) async fn handle_session_start(
     let store = config
         .as_ref()
         .and_then(|config| Store::new(project_root, config).ok());
-    // New session → forget which related-code pairs were already surfaced so the
-    // post-edit dedup ledger starts clean. Fail-open.
+    // New session → forget which related-code pairs were already surfaced and
+    // which lines it has Read, so both dedupe ledgers start clean. Only the
+    // starting session's own files are reset outright; other sessions' files
+    // are reaped only once the age-gated sweep below proves them stale. Fail-open.
     if let Some(store) = store.as_ref() {
-        let _ = std::fs::remove_file(store.change_neighbors_seen_path());
+        if let Some(session_id) = payload.session_id.as_deref() {
+            let _ = std::fs::remove_file(store.change_neighbors_seen_path(session_id));
+            let _ = std::fs::remove_file(store.change_neighbors_read_path(session_id));
+        }
+        // Reap ledgers no live session has touched within the retention window:
+        // dead sessions' per-session files, plus the pre-hq-4 shared file —
+        // which a concurrently running old binary may still append, so the age
+        // gate keeps it while it is live rather than deleting on sight.
+        crate::store::marker::change_neighbors::sweep_stale_ledgers(store.state_dir_path());
     }
     let manifest = store
         .as_ref()

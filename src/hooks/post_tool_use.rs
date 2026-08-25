@@ -27,20 +27,31 @@ const READ_SURFACING_TIMEOUT_MS: u64 = 2_000;
 /// expensive to run on the hot `Read` path, so surfacing is skipped entirely.
 const READ_SURFACING_MAX_CHUNKS: usize = 50_000;
 
+/// Claude Code's Read tool advertises a per-call cap of 2000 lines (its tool
+/// description; the hook payload carries no truncation notice). The read ledger
+/// never records beyond it: an over-long claim would suppress hints for lines
+/// the session never saw. Under-claiming only costs a repeated hint (fail-open).
+const READ_TOOL_MAX_LINES: u32 = 2000;
+
 pub(super) async fn handle_post_tool_use(
     project_root: &Path,
     payload: HookPayload,
 ) -> Result<Option<Value>> {
     let config = config::load(project_root).ok();
 
-    // `Read` rides this hook too (see hooks.json matcher) purely for read-time
-    // surfacing — it must NEVER spawn a reindex. The edit tools below do.
+    // `Read` rides this hook too (see hooks.json matcher) for read-time
+    // surfacing and read-tracking — it must NEVER spawn a reindex. The edit
+    // tools below do.
     let tool_name = payload.tool_name.as_deref();
 
+    // With both surfacing flags off a Read event has nothing to record and
+    // nothing to surface: keep the early return so those users pay only the
+    // process spawn + config load. With either flag on, the event records what
+    // the session read (the read ledger feeds both surfacing paths' dedupe).
     if tool_name == Some("Read")
-        && !config
-            .as_ref()
-            .is_some_and(|cfg| cfg.hooks.surface_related_on_read)
+        && !config.as_ref().is_some_and(|cfg| {
+            cfg.hooks.surface_related_on_read || cfg.hooks.surface_related_on_edit
+        })
     {
         return Ok(None);
     }
@@ -104,6 +115,16 @@ pub(super) async fn handle_post_tool_use(
         payload.tool_input
     };
 
+    // Track what this Read event showed the agent, so both surfacing paths can
+    // skip hints naming lines the session already has. Attributed events only:
+    // an unattributed record could suppress another session's hints.
+    if let (Some(st), Some(input), Some(session)) =
+        (store.as_ref(), read_input.as_ref(), session_id)
+        && tool_name == Some("Read")
+    {
+        record_read_range(st, session, input);
+    }
+
     // Prefer not to drop any message: index-ready, change-neighbors, and
     // read-neighbors are all surfaced together. Index-ready goes first (most
     // urgent); the rest append in order.
@@ -132,6 +153,7 @@ pub(super) async fn handle_post_tool_use(
         tool_name,
         read_input.as_ref(),
         "PostToolUse",
+        session_id,
     )
     .await;
 
@@ -162,6 +184,7 @@ async fn read_surfacing_context(
     tool_name: Option<&str>,
     tool_input: Option<&ToolInput>,
     event_name: &str,
+    session_id: Option<&str>,
 ) -> Option<Value> {
     if tool_name != Some("Read") {
         return None;
@@ -248,12 +271,55 @@ async fn read_surfacing_context(
     // Defense in depth on top of index-time pruning: a file deleted out-of-band
     // may still have chunks in the store until the next reindex, so never offer
     // a now-missing file as related code. Cheap: one stat per hit (≤ top_k).
+    //
+    // Then the two line-aware dedupe layers: a hint the session was already
+    // shown (seen ledger), and a hint pointing at lines the session already
+    // Read (read ledger). Without a session id neither ledger is scoped, so
+    // nothing is suppressed — fail-open toward a repeated hint.
+    let seen_path = session_id.map(|id| store.change_neighbors_seen_path(id));
+    let seen = seen_path
+        .as_deref()
+        .map_or_else(Vec::new, change_neighbors::read_seen);
+    let read_ledger_path = session_id.map(|id| store.change_neighbors_read_path(id));
+    let read = read_ledger_path
+        .as_deref()
+        .map_or_else(Vec::new, change_neighbors::read_ranges);
+
     let hits: Vec<_> = hits
         .into_iter()
         .filter(|n| neighbor_file_exists(project_root, &n.file_path))
+        .filter(|n| {
+            !change_neighbors::is_seen(
+                &seen,
+                &n.file_path,
+                n.name.as_deref(),
+                n.line_start,
+                n.line_end,
+            )
+        })
+        .filter(|n| !change_neighbors::is_read(&read, &n.file_path, n.line_start, n.line_end))
         .collect();
     if hits.is_empty() {
         return None;
+    }
+
+    // Record only the neighbors actually surfaced, so the edit-time ack's
+    // seen-check skips them too. Best-effort: a write failure risks a repeat.
+    if let Some(path) = seen_path.as_deref() {
+        change_neighbors::append_seen(
+            path,
+            &hits
+                .iter()
+                .map(|n| {
+                    change_neighbors::SeenEntry::new(
+                        &n.file_path,
+                        n.name.as_deref(),
+                        n.line_start,
+                        n.line_end,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
     }
 
     let locations: Vec<String> = hits
@@ -308,6 +374,49 @@ fn chunk_overlaps_window(
     starts_in_range && chunk_end >= window_start
 }
 
+/// Append the Read event's window to the session's read ledger, so later
+/// related-code hints naming lines the agent already has can be suppressed.
+///
+/// Range semantics match [`read_surfacing_context`]: `start = offset.unwrap_or(1)`,
+/// and the window is clamped to the Read tool's per-call cap — a full-file read
+/// (neither field) covers at most the first [`READ_TOOL_MAX_LINES`] lines, and
+/// an explicit `limit` beyond the cap is cut to it. The tool shows no more per
+/// call, so claiming more would suppress hints for lines the session never saw.
+/// A zero `limit` shows nothing and records nothing: even a one-line claim
+/// could suppress a hint at exactly `start`. Fail-open: a path that escapes the
+/// project root or a write failure just means a hint may surface again.
+fn record_read_range(store: &Store, session_id: &str, input: &ToolInput) {
+    let Some(file_path) = input.file_path.as_deref() else {
+        return;
+    };
+    let Some(relative) = project_relative(store.project_root(), file_path) else {
+        return;
+    };
+    let relative = RelativePath::from_path(&relative);
+    if relative
+        .reject_escape(prompts::hints::READ_INSIDE_PROJECT_DIR)
+        .is_err()
+    {
+        return;
+    }
+    if input.limit == Some(0) {
+        return;
+    }
+    let start = input.offset.unwrap_or(1);
+    let shown = input
+        .limit
+        .map_or(READ_TOOL_MAX_LINES, |count| count.min(READ_TOOL_MAX_LINES));
+    let end = start.saturating_add(shown.saturating_sub(1));
+    change_neighbors::append_read_range(
+        &store.change_neighbors_read_path(session_id),
+        &change_neighbors::ReadRange {
+            file_path: relative.as_str().to_owned(),
+            line_start: start,
+            line_end: end,
+        },
+    );
+}
+
 /// Read and ack the change-neighbors marker, returning formatted additionalContext.
 /// Returns `None` when the marker is absent, feature is disabled, or the store
 /// cannot be constructed (fail-open).
@@ -340,36 +449,57 @@ pub(super) fn take_change_neighbors_context(
     // Both sides must be PRESENT and equal: two absences are not a match, and
     // an unattributed marker must never surface — not even to a session-less
     // event, which cannot prove it owns the edit either.
-    if !matches!(
-        (marker.session_id.as_deref(), session_id),
-        (Some(marker_session), Some(event_session)) if marker_session == event_session
-    ) {
+    let (Some(marker_session), Some(event_session)) = (marker.session_id.as_deref(), session_id)
+    else {
+        return None;
+    };
+    if marker_session != event_session {
         return None;
     }
 
-    // Per-session dedup: a neighbor already surfaced this session is suppressed
-    // whatever file the edit touched, so a hub file can't be re-injected once per
-    // edited path. The ledger is reset on SessionStart. Fail-open: an unreadable
-    // ledger reads as empty, so nothing is wrongly suppressed.
-    let seen_path = store.change_neighbors_seen_path();
+    // Two per-session dedupe layers, both line-aware:
+    // - the seen ledger: a neighbor whose lines this session was already shown
+    //   is suppressed whatever file the edit touched, so a hub file can't be
+    //   re-injected once per edited path. The same pair at different lines is
+    //   new context and still surfaces.
+    // - the read ledger: a neighbor naming lines the session already Read is
+    //   suppressed — the agent already has that content in context.
+    // Both ledgers are reset on SessionStart. Fail-open: an unreadable ledger
+    // reads as empty, so nothing is wrongly suppressed.
+    let seen_path = store.change_neighbors_seen_path(event_session);
     let seen = change_neighbors::read_seen(&seen_path);
+    let read_path = store.change_neighbors_read_path(event_session);
+    let read = change_neighbors::read_ranges(&read_path);
 
-    let mut fresh_keys: Vec<String> = Vec::new();
+    let mut fresh: Vec<change_neighbors::SeenEntry> = Vec::new();
     let hits: Vec<String> = marker
         .neighbors
         .iter()
         .filter(|n| n.file_path != marker.edited_path)
         .filter(|n| neighbor_file_exists(project_root, &n.file_path))
         .filter(|n| {
-            let key = change_neighbors::seen_key(&n.file_path, n.name.as_deref());
-            if seen.contains(&key) {
+            if change_neighbors::is_seen(
+                &seen,
+                &n.file_path,
+                n.name.as_deref(),
+                n.line_start,
+                n.line_end,
+            ) {
                 return false;
             }
-            fresh_keys.push(key);
+            if change_neighbors::is_read(&read, &n.file_path, n.line_start, n.line_end) {
+                return false;
+            }
+            fresh.push(change_neighbors::SeenEntry::new(
+                &n.file_path,
+                n.name.as_deref(),
+                n.line_start,
+                n.line_end,
+            ));
             true
         })
         // Lazily, so the filter above never runs for the tail this drops: it pushes
-        // into `fresh_keys`, and a key recorded for a neighbor that was truncated
+        // into `fresh`, and an entry recorded for a neighbor that was truncated
         // away would suppress a hint nobody ever saw. The marker is over-fetched
         // (see `write_change_neighbors_marker`), so this is where a hint budget of
         // top_k is actually applied — against unseen candidates rather than against
@@ -391,7 +521,7 @@ pub(super) fn take_change_neighbors_context(
     }
 
     // Record only the neighbors actually surfaced.
-    change_neighbors::append_seen(&seen_path, &fresh_keys);
+    change_neighbors::append_seen(&seen_path, &fresh);
 
     let acked_own_edit = event_files
         .iter()
@@ -968,6 +1098,18 @@ mod tests {
         }
     }
 
+    fn neighbor_entry_with_lines(
+        file_path: &str,
+        name: &str,
+        line_start: u32,
+        line_end: u32,
+    ) -> crate::store::marker::change_neighbors::NeighborEntry {
+        let mut entry = make_neighbor_entry(file_path, name, 0.82);
+        entry.line_start = line_start;
+        entry.line_end = line_end;
+        entry
+    }
+
     #[tokio::test]
     async fn neighbors_marker_surfaces_related_file_in_additional_context() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;
@@ -1445,6 +1587,467 @@ mod tests {
         Ok(())
     }
 
+    // ── line-aware dedupe (seen + read ledgers) ─────────────────────────────
+
+    #[tokio::test]
+    async fn same_symbol_at_different_lines_still_surfaces() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // First take surfaces (src/math.rs, add) at lines 10-25 and records it.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+        let _ = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
+
+        // Same file + symbol, different lines: new context the agent has not
+        // seen, so it must surface — the old whole-file key would swallow it.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![neighbor_entry_with_lines("src/math.rs", "add", 60, 80)],
+        );
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        )
+        .unwrap_or(serde_json::Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("src/math.rs"),
+            "the same symbol at different lines is new context, got: {context}"
+        );
+        assert!(
+            context.contains("60-80"),
+            "the hint must name the new line range, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn seen_dedupe_state_is_per_session() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Session A surfaces the (src/lib.rs → src/math.rs add) pair once.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+        let _ = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some("sess-A"),
+            &[],
+        );
+
+        // Session B's own marker for the identical pair: B has never been shown
+        // it, so B must surface it — a shared ledger would wrongly suppress it.
+        write_raw_neighbors_marker(&store, "src/lib.rs", "sess-B");
+        let payload = json!({
+            "session_id": "sess-B",
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            context.contains("src/math.rs"),
+            "session B's ledger is empty and must surface the hint, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_then_edit_suppresses_hint_inside_read_lines() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config(); // edit surfacing on (default), read surfacing off
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // The session reads lines 1-50 of src/math.rs.
+        let read_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": fixture.root().join("src/math.rs"),
+                "offset": 1,
+                "limit": 50
+            }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload.to_string(),
+        )
+        .await?;
+        assert!(
+            response.is_none(),
+            "a ranged read with read-surfacing off surfaces nothing, got: {response:?}"
+        );
+
+        // An edit of src/lib.rs leaves a marker whose hint points at lines 10-25
+        // of the file the session just read: inside the read window.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![neighbor_entry_with_lines("src/math.rs", "add", 10, 25)],
+        );
+        let edit_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &edit_payload.to_string(),
+        )
+        .await?;
+        assert!(
+            response.is_none(),
+            "a hint pointing inside lines the session read must be suppressed, got: {response:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_then_edit_hint_outside_read_lines_still_fires() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        let read_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": fixture.root().join("src/math.rs"),
+                "offset": 1,
+                "limit": 50
+            }
+        });
+        let _ = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload.to_string(),
+        )
+        .await?;
+
+        // The hint points at lines 60-80: outside the read window.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![neighbor_entry_with_lines("src/math.rs", "add", 60, 80)],
+        );
+        let edit_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &edit_payload.to_string(),
+        )
+        .await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            context.contains("src/math.rs"),
+            "a hint outside the read lines must still fire, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_then_edit_hint_partially_overlapping_read_lines_still_fires() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        let read_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": fixture.root().join("src/math.rs"),
+                "offset": 1,
+                "limit": 50
+            }
+        });
+        let _ = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload.to_string(),
+        )
+        .await?;
+
+        // Lines 40-60 overlap the read window but are not contained in it: part
+        // of the hinted region is new, so the hint must fire.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![neighbor_entry_with_lines("src/math.rs", "add", 40, 60)],
+        );
+        let edit_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &edit_payload.to_string(),
+        )
+        .await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            context.contains("src/math.rs"),
+            "a hint that only partially overlaps the read lines must still fire, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_dedupe_state_is_per_session() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // Session A reads lines 1-50 of src/math.rs.
+        let read_payload = json!({
+            "session_id": "sess-reader",
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": fixture.root().join("src/math.rs"),
+                "offset": 1,
+                "limit": 50
+            }
+        });
+        let _ = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload.to_string(),
+        )
+        .await?;
+
+        // Session B edits src/lib.rs and its own marker points inside those
+        // lines. B has read nothing, so the hint must fire — a shared read
+        // ledger would wrongly suppress it.
+        write_raw_neighbors_marker(&store, "src/lib.rs", "sess-editor");
+        let edit_payload = json!({
+            "session_id": "sess-editor",
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &edit_payload.to_string(),
+        )
+        .await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            context.contains("src/math.rs"),
+            "session B has not read those lines; the hint must fire, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_file_read_suppresses_hints_into_that_file() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // No offset/limit: the Read tool shows the file up to its per-call cap,
+        // and the hint sits far inside it.
+        let read_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": { "file_path": fixture.root().join("src/math.rs") }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload.to_string(),
+        )
+        .await?;
+        assert!(
+            response.is_none(),
+            "a full-file read with read-surfacing off surfaces nothing, got: {response:?}"
+        );
+
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+        let edit_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &edit_payload.to_string(),
+        )
+        .await?;
+        assert!(
+            response.is_none(),
+            "the hint sits inside the first READ_TOOL_MAX_LINES lines the full-file read covers, so it is redundant, got: {response:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn full_file_read_does_not_cover_lines_beyond_the_read_tool_cap() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // A 2600-line file: the Read tool shows at most 2000 lines per call,
+        // so the ledger must not claim beyond that.
+        let big: String = (0..2600).map(|i| format!("line {i}\n")).collect();
+        fs::write(fixture.root().join("src/big.rs"), big)?;
+
+        let read_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": { "file_path": fixture.root().join("src/big.rs") }
+        });
+        let _ = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload.to_string(),
+        )
+        .await?;
+
+        // A hint at lines 2500-2510: beyond what the tool could have shown, so
+        // the session never read them and the hint must fire.
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![neighbor_entry_with_lines("src/big.rs", "far", 2500, 2510)],
+        );
+        let edit_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &edit_payload.to_string(),
+        )
+        .await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            context.contains("src/big.rs"),
+            "lines beyond the Read tool's cap were never shown; the hint must fire, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn zero_limit_read_records_nothing() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // limit=0 shows no lines, so nothing may be recorded: a hint at exactly
+        // the offset line must still fire.
+        let read_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": {
+                "file_path": fixture.root().join("src/math.rs"),
+                "offset": 10,
+                "limit": 0
+            }
+        });
+        let _ = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload.to_string(),
+        )
+        .await?;
+
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![neighbor_entry_with_lines("src/math.rs", "add", 10, 10)],
+        );
+        let edit_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &edit_payload.to_string(),
+        )
+        .await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            context.contains("src/math.rs"),
+            "a zero-limit read showed nothing; the hint at the offset line must fire, got: {context}"
+        );
+        Ok(())
+    }
+
     /// Create `count` real neighbor files (so `neighbor_file_exists` passes) plus
     /// the marker entries pointing at them, descending by score so marker order is
     /// rank order.
@@ -1494,7 +2097,8 @@ mod tests {
 
         // A key recorded for a neighbor that was truncated away would suppress a
         // hint nobody ever saw — the failure mode of truncating after collecting.
-        let ledger = fs::read_to_string(store.change_neighbors_seen_path()).unwrap_or_default();
+        let ledger =
+            fs::read_to_string(store.change_neighbors_seen_path(TEST_SESSION)).unwrap_or_default();
         let recorded = ledger.lines().filter(|line| !line.is_empty()).count();
         assert_eq!(
             recorded, top_k,
@@ -1519,15 +2123,20 @@ mod tests {
         let entries = seed_neighbor_files(fixture.root(), top_k * 3);
 
         // The whole leading rank is already spent by earlier edits this session.
-        let spent: Vec<String> = entries
+        let spent: Vec<crate::store::marker::change_neighbors::SeenEntry> = entries
             .iter()
             .take(top_k)
             .map(|e| {
-                crate::store::marker::change_neighbors::seen_key(&e.file_path, e.name.as_deref())
+                crate::store::marker::change_neighbors::SeenEntry::new(
+                    &e.file_path,
+                    e.name.as_deref(),
+                    e.line_start,
+                    e.line_end,
+                )
             })
             .collect();
         crate::store::marker::change_neighbors::append_seen(
-            &store.change_neighbors_seen_path(),
+            &store.change_neighbors_seen_path(TEST_SESSION),
             &spent,
         );
 
@@ -1567,7 +2176,7 @@ mod tests {
 
         // A directory where the ledger file belongs: every read AND every append
         // fails, exercising both fail-open branches at once.
-        let seen_path = store.change_neighbors_seen_path();
+        let seen_path = store.change_neighbors_seen_path(TEST_SESSION);
         fs::create_dir_all(&seen_path)?;
 
         for take in 1..=2 {
@@ -1596,23 +2205,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_start_clears_seen_ledger() -> Result<()> {
+    async fn session_start_resets_only_the_starting_sessions_ledgers() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;
         let config = stub_config();
         write_config(fixture.root(), &config);
         let store = Store::new(fixture.root(), &config)?;
         store.ensure_layout()?;
 
-        // Seed a dummy key into the per-session dedup ledger.
-        let seen_path = store.change_neighbors_seen_path();
-        fs::write(&seen_path, "src/math.rs\tadd\n")?;
-        assert!(seen_path.exists(), "ledger must exist before SessionStart");
+        // Seed dummy state for the starting session and for another one.
+        let seen_path = store.change_neighbors_seen_path("sess-start");
+        let read_path = store.change_neighbors_read_path("sess-start");
+        let other_seen = store.change_neighbors_seen_path("sess-other");
+        let other_read = store.change_neighbors_read_path("sess-other");
+        for path in [&seen_path, &read_path, &other_seen, &other_read] {
+            fs::write(path, "src/math.rs\tadd\t10\t25\n")?;
+        }
 
-        run(fixture.root(), HookEvent::SessionStart, "{}").await?;
+        let payload = json!({ "session_id": "sess-start" });
+        run(
+            fixture.root(),
+            HookEvent::SessionStart,
+            &payload.to_string(),
+        )
+        .await?;
 
         assert!(
             !seen_path.exists(),
-            "SessionStart must reset the dedup ledger"
+            "SessionStart must reset the starting session's seen ledger"
+        );
+        assert!(
+            !read_path.exists(),
+            "SessionStart must reset the starting session's read ledger"
+        );
+        assert!(
+            other_seen.exists(),
+            "another session's seen ledger must survive"
+        );
+        assert!(
+            other_read.exists(),
+            "another session's read ledger must survive"
         );
         Ok(())
     }
@@ -2137,6 +2768,235 @@ mod tests {
         assert!(
             !store.change_neighbors_marker_path().exists(),
             "Read must never trigger a reindex"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_hint_already_surfaced_this_session_is_suppressed() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // foo and c both neighbor bar's chunk at lines 40-58.
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/c.rs",
+                    "twin-c",
+                    70,
+                    80,
+                    vec![0.98, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        let read_payload = |path: &str, offset: u32, limit: u32| {
+            json!({
+                "session_id": TEST_SESSION,
+                "tool_name": "Read",
+                "tool_input": { "file_path": path, "offset": offset, "limit": limit }
+            })
+            .to_string()
+        };
+
+        // Reading foo surfaces bar and c, and records both in the seen ledger.
+        let first = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload("src/foo.rs", 12, 6),
+        )
+        .await?;
+        let context = first.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            context.contains("src/bar.rs"),
+            "first read must surface bar, got: {context}"
+        );
+        assert!(
+            context.contains("src/c.rs"),
+            "first read must surface c, got: {context}"
+        );
+
+        // Reading c now queries its own chunk: bar neighbors it too but was
+        // already surfaced at these same lines, so it is suppressed; foo is new.
+        let second = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &read_payload("src/c.rs", 70, 11),
+        )
+        .await?;
+        let context = second.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            !context.contains("src/bar.rs"),
+            "bar was already surfaced at these lines, got: {context}"
+        );
+        assert!(
+            context.contains("src/foo.rs"),
+            "foo is new context and must surface, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_hint_inside_previously_read_lines_is_suppressed() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // bar's only neighbor is foo.
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        // The session reads all of bar's chunk (lines 40-58) — which surfaces
+        // foo — and the read is recorded in the read ledger.
+        let bar_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/bar.rs", "offset": 40, "limit": 19 }
+        });
+        let first = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &bar_payload.to_string(),
+        )
+        .await?;
+        assert!(
+            first.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("src/foo.rs"),
+            "reading bar must surface foo"
+        );
+
+        // Reading foo would now hint at bar's lines 40-58 — but the session
+        // already read exactly those lines, so the hint is redundant.
+        let foo_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 12, "limit": 6 }
+        });
+        let second = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &foo_payload.to_string(),
+        )
+        .await?;
+        assert!(
+            second.is_none(),
+            "a hint pointing at lines the session read must be suppressed, got: {second:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn read_hint_partially_outside_previously_read_lines_still_fires() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // bar's only neighbor is foo.
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        // The session read only lines 45-46 of bar — inside the chunk, but not
+        // covering the whole 40-58 range the hint would name.
+        let bar_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/bar.rs", "offset": 45, "limit": 2 }
+        });
+        let _ = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &bar_payload.to_string(),
+        )
+        .await?;
+
+        let foo_payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 12, "limit": 6 }
+        });
+        let response = run(
+            fixture.root(),
+            HookEvent::PostToolUse,
+            &foo_payload.to_string(),
+        )
+        .await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            context.contains("src/bar.rs"),
+            "the read covered only part of the hinted range, so the hint must fire, got: {context}"
         );
         Ok(())
     }

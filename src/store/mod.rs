@@ -88,6 +88,20 @@ impl Clone for Store {
     }
 }
 
+/// Stable, filesystem-safe digest of a session id for per-session state file
+/// names: one session's records can never be rewritten by another session's
+/// events, and an arbitrary session id cannot spell a path.
+fn session_suffix(session_id: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(session_id.as_bytes());
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 impl Store {
     pub fn new(project_root: impl AsRef<Path>, config: &Config) -> Result<Self> {
         let project_root = project_root.as_ref().canonicalize()?;
@@ -148,10 +162,26 @@ impl Store {
         self.paths.state_dir.join("change-neighbors")
     }
 
-    /// Path to the per-session change-neighbors dedup ledger. Sibling of the
-    /// marker; reset on SessionStart so related-code surfaces fresh each session.
-    pub fn change_neighbors_seen_path(&self) -> PathBuf {
-        self.paths.state_dir.join("change-neighbors-seen")
+    /// Path to the per-session related-code dedup ledger (what this session has
+    /// already surfaced, keyed by file + symbol + line range). Sibling of the
+    /// marker; reset on SessionStart so related-code surfaces fresh each
+    /// session. Stale files of dead sessions are reaped by SessionStart's
+    /// age-gated sweep (`marker::change_neighbors::sweep_stale_ledgers`).
+    pub fn change_neighbors_seen_path(&self, session_id: &str) -> PathBuf {
+        self.paths.state_dir.join(format!(
+            "change-neighbors-seen-{}",
+            session_suffix(session_id)
+        ))
+    }
+
+    /// Path to the per-session read-tracking ledger (which file + line ranges
+    /// this session has Read, so hints naming lines the agent already has can be
+    /// suppressed). Same lifetime rules as [`Store::change_neighbors_seen_path`].
+    pub fn change_neighbors_read_path(&self, session_id: &str) -> PathBuf {
+        self.paths.state_dir.join(format!(
+            "change-neighbors-read-{}",
+            session_suffix(session_id)
+        ))
     }
 
     pub fn state_dir_path(&self) -> &Path {
@@ -167,17 +197,10 @@ impl Store {
     ///
     /// One file per session that ever hit a failed index; never removed. Accepted: tens of bytes per affected session, and any sweep would need an age gate so a live session's record is not deleted.
     pub fn index_failure_seen_path(&self, session_id: &str) -> PathBuf {
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(session_id.as_bytes());
-        let digest = hasher.finalize();
-        let suffix: String = digest
-            .iter()
-            .take(8)
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        self.paths
-            .state_dir
-            .join(format!("index-failure-seen-{suffix}.json"))
+        self.paths.state_dir.join(format!(
+            "index-failure-seen-{}.json",
+            session_suffix(session_id)
+        ))
     }
 
     pub fn ensure_layout(&self) -> Result<()> {
