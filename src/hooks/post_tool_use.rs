@@ -7,7 +7,7 @@ use crate::config::{self, Config};
 use crate::enumeration::WatchFilter;
 use crate::error::Result;
 use crate::prompts;
-use crate::search::neighbors::neighbors;
+use crate::search::neighbors::{Neighbor, neighbors};
 use crate::store::Store;
 use crate::store::marker::change_neighbors;
 use crate::types::RelativePath;
@@ -322,20 +322,33 @@ async fn read_surfacing_context(
         );
     }
 
-    let locations: Vec<String> = hits
+    // Source hits and doc hits render under separate labels; the dedupe layers
+    // and the floor run on the combined set, so this split is presentational
+    // only. Doc-ness is a property of the neighbor's path (see
+    // `prompts::hooks::is_doc_file`) — the read-side hits carry no chunk
+    // metadata beyond what `neighbors` returned.
+    let (code_hits, doc_hits): (Vec<_>, Vec<_>) = hits
         .iter()
-        .map(|n| {
-            prompts::hooks::read_neighbor_line(
-                &n.file_path,
-                n.line_start,
-                n.line_end,
-                n.name.as_deref(),
-                n.score,
-            )
-        })
-        .collect();
+        .partition(|n| !prompts::hooks::is_doc_file(&n.file_path));
+    let line = |n: &Neighbor| {
+        prompts::hooks::read_neighbor_line(
+            &n.file_path,
+            n.line_start,
+            n.line_end,
+            n.name.as_deref(),
+            n.score,
+        )
+    };
+    let code_locations: Vec<String> = code_hits.into_iter().map(line).collect();
+    let doc_locations: Vec<String> = doc_hits.into_iter().map(line).collect();
 
-    let context = prompts::hooks::read_related_context(read_path.as_str(), start, end, &locations);
+    let context = prompts::hooks::read_related_context(
+        read_path.as_str(),
+        start,
+        end,
+        &code_locations,
+        &doc_locations,
+    );
 
     Some(json!({
         "hookSpecificOutput": {
@@ -472,7 +485,7 @@ pub(super) fn take_change_neighbors_context(
     let read = change_neighbors::read_ranges(&read_path);
 
     let mut fresh: Vec<change_neighbors::SeenEntry> = Vec::new();
-    let hits: Vec<String> = marker
+    let (code_hits, doc_hits): (Vec<_>, Vec<_>) = marker
         .neighbors
         .iter()
         .filter(|n| n.file_path != marker.edited_path)
@@ -505,31 +518,38 @@ pub(super) fn take_change_neighbors_context(
         // top_k is actually applied — against unseen candidates rather than against
         // a pool the seen-filter has already eaten into.
         .take(cfg.hooks.related_top_k)
-        .map(|n| {
-            prompts::hooks::edit_neighbor_line(
-                &n.file_path,
-                n.line_start,
-                n.line_end,
-                n.name.as_deref(),
-                n.score,
-            )
-        })
-        .collect();
+        // Presentational split, after the cap: source hits render under
+        // `related code:`, doc hits under `related docs:`. Doc-ness is a
+        // property of the neighbor's path (`prompts::hooks::is_doc_file`), so
+        // a marker written by any binary version renders correctly.
+        .partition(|n| !prompts::hooks::is_doc_file(&n.file_path));
 
-    if hits.is_empty() {
+    if code_hits.is_empty() && doc_hits.is_empty() {
         return None;
     }
 
     // Record only the neighbors actually surfaced.
     change_neighbors::append_seen(&seen_path, &fresh);
 
+    let line = |n: &change_neighbors::NeighborEntry| {
+        prompts::hooks::edit_neighbor_line(
+            &n.file_path,
+            n.line_start,
+            n.line_end,
+            n.name.as_deref(),
+            n.score,
+        )
+    };
+    let code_lines: Vec<String> = code_hits.into_iter().map(line).collect();
+    let doc_lines: Vec<String> = doc_hits.into_iter().map(line).collect();
+
     let acked_own_edit = event_files
         .iter()
         .any(|file| canonical_dedup_key(project_root, file) == marker.edited_path);
     let context = if acked_own_edit {
-        prompts::hooks::edit_related_context(&marker.edited_path, &hits)
+        prompts::hooks::edit_related_context(&marker.edited_path, &code_lines, &doc_lines)
     } else {
-        prompts::hooks::recent_edit_related_context(&marker.edited_path, &hits)
+        prompts::hooks::recent_edit_related_context(&marker.edited_path, &code_lines, &doc_lines)
     };
 
     Some(json!({
@@ -1375,6 +1395,212 @@ mod tests {
         assert!(
             response.is_none(),
             "a neighbor surfaced once must not resurface via a different edited file, got: {response:?}"
+        );
+        Ok(())
+    }
+
+    // ── code/docs group rendering ──────────────────────────────────────────
+
+    /// The one line a rendered context devotes to a label, or `None` when the
+    /// group is empty (the label is omitted, never left bare).
+    fn labeled_line<'a>(context: &'a str, label: &str) -> Option<&'a str> {
+        context.lines().find(|l| l.starts_with(label))
+    }
+
+    /// Create a doc neighbor file on disk so the existence guard passes.
+    fn write_doc_neighbor_file(root: &Path, path: &str) {
+        let abs = root.join(path);
+        if let Some(parent) = abs.parent() {
+            assert!(fs::create_dir_all(parent).is_ok());
+        }
+        assert!(fs::write(&abs, "# seeded doc\n").is_ok());
+    }
+
+    /// Entry with no symbol name, the shape of a doc or nameless fallback chunk.
+    fn make_unnamed_entry(
+        file_path: &str,
+        score: f32,
+    ) -> crate::store::marker::change_neighbors::NeighborEntry {
+        let mut entry = make_neighbor_entry(file_path, "drop", score);
+        entry.name = None;
+        entry
+    }
+
+    #[tokio::test]
+    async fn edit_surfacing_splits_hits_into_code_and_doc_groups() -> Result<()> {
+        // The hq-5 verify line: an edit whose marker carries both kinds shows
+        // two labeled groups, each holding only its own hits.
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        write_doc_neighbor_file(fixture.root(), "docs/guide.md");
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![
+                make_neighbor_entry("src/math.rs", "add", 0.82),
+                make_unnamed_entry("docs/guide.md", 0.81),
+            ],
+        );
+
+        let payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Write",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+
+        let code_line = labeled_line(&context, "related code:").unwrap_or_default();
+        assert!(
+            code_line.contains("src/math.rs"),
+            "the code group must carry the source hit, got: {context}"
+        );
+        assert!(
+            !code_line.contains("docs/guide.md"),
+            "the code group must not carry the doc hit, got: {context}"
+        );
+        let doc_line = labeled_line(&context, "related docs:").unwrap_or_default();
+        assert!(
+            doc_line.contains("docs/guide.md"),
+            "the docs group must carry the doc hit, got: {context}"
+        );
+        assert!(
+            !doc_line.contains("src/math.rs"),
+            "the docs group must not carry the source hit, got: {context}"
+        );
+        assert!(
+            context.find("related code:").unwrap_or(usize::MAX)
+                < context.find("related docs:").unwrap_or(usize::MAX),
+            "the code group must precede the docs group, got: {context}"
+        );
+        assert!(
+            context.contains("your edit of `src/lib.rs`"),
+            "the own-edit wording must survive the split, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_only_hits_render_under_the_code_label() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            labeled_line(&context, "related code:").is_some_and(|l| l.contains("src/math.rs")),
+            "a source-only edit must render the hit under the code label, got: {context}"
+        );
+        assert!(
+            !context.contains("related docs:"),
+            "a source-only edit must not render a docs label, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn doc_only_hits_render_under_the_docs_label() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        write_doc_neighbor_file(fixture.root(), "docs/guide.md");
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_unnamed_entry("docs/guide.md", 0.82)],
+        );
+
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            labeled_line(&context, "related docs:").is_some_and(|l| l.contains("docs/guide.md")),
+            "a doc-only edit must render the hit under the docs label, got: {context}"
+        );
+        assert!(
+            !context.contains("related code:"),
+            "a doc-only edit must not render a code label, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unnamed_hits_still_render_under_their_label() -> Result<()> {
+        // A neighbor without a symbol name (doc chunks, nameless fallback
+        // chunks) must still group and render — the name is optional in the
+        // marker and the line format.
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        write_doc_neighbor_file(fixture.root(), "docs/guide.md");
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![
+                make_unnamed_entry("src/math.rs", 0.82),
+                make_unnamed_entry("docs/guide.md", 0.81),
+            ],
+        );
+
+        let response = take_change_neighbors_context(
+            Some(&store),
+            Some(&config),
+            "PostToolUse",
+            Some(TEST_SESSION),
+            &[],
+        );
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            labeled_line(&context, "related code:")
+                .is_some_and(|l| l.contains("src/math.rs:10-25")),
+            "an unnamed source hit must render its location under the code label, got: {context}"
+        );
+        assert!(
+            labeled_line(&context, "related docs:")
+                .is_some_and(|l| l.contains("docs/guide.md:10-25")),
+            "an unnamed doc hit must render its location under the docs label, got: {context}"
         );
         Ok(())
     }
@@ -2434,6 +2660,72 @@ mod tests {
         assert!(
             !context.contains("src/foo.rs:"),
             "read file must not be listed as its own neighbor, got: {context}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ranged_read_groups_code_and_doc_neighbors() -> Result<()> {
+        // Read-time surfacing shares the edit path's two-label rendering: a
+        // read whose neighbors mix source and doc files shows both groups.
+        let fixture = TestFixture::new("small_rust")?;
+        let config = read_config_on();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // seed_rows classifies by path at render time, so the doc row groups
+        // under `related docs:` regardless of the seeded chunk metadata.
+        seed_rows(
+            &store,
+            &config,
+            &[
+                (
+                    "src/foo.rs",
+                    "target",
+                    10,
+                    20,
+                    vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "src/bar.rs",
+                    "twin",
+                    40,
+                    58,
+                    vec![0.99, 0.01, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+                (
+                    "docs/guide.md",
+                    "guide",
+                    1,
+                    5,
+                    vec![0.98, 0.02, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                ),
+            ],
+        )
+        .await;
+
+        let payload = json!({
+            "tool_name": "Read",
+            "tool_input": { "file_path": "src/foo.rs", "offset": 12, "limit": 6 }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        let context = response.unwrap_or(Value::Null)["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+
+        assert!(
+            labeled_line(&context, "related code:").is_some_and(|l| l.contains("src/bar.rs")),
+            "the source neighbor must group under the code label, got: {context}"
+        );
+        assert!(
+            labeled_line(&context, "related docs:").is_some_and(|l| l.contains("docs/guide.md")),
+            "the doc neighbor must group under the docs label, got: {context}"
+        );
+        assert!(
+            context.contains("lines 12-17"),
+            "the read region naming must survive the split, got: {context}"
         );
         Ok(())
     }
