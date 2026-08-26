@@ -544,4 +544,29 @@ mod tests {
         );
         Ok(())
     }
+
+    /// The ensure_layout failure path must suppress the spawn: a layout that
+    /// fails partway (dirs created, the `.gitignore` write hitting a planted
+    /// directory) leaves no usable store, and the guard returning false must
+    /// be what stops the marker claim. An error-swallowing plant would claim
+    /// the marker and spawn anyway, so this test reds on that plant.
+    #[tokio::test]
+    async fn spawn_background_index_skips_when_layout_unwritable() -> crate::error::Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+
+        let store = crate::store::Store::new(fixture.root(), &config)?;
+        let state_dir = store.state_dir_path();
+        fs::create_dir_all(state_dir)?;
+        // A directory in place of the `.gitignore` file makes ensure_layout's
+        // final write fail (EISDIR) after the index dir was created.
+        fs::create_dir_all(state_dir.join(".gitignore"))?;
+
+        assert!(
+            !spawn_background_index(fixture.root(), &config),
+            "a failing store layout must suppress the spawn"
+        );
+        Ok(())
+    }
 }
