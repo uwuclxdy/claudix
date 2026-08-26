@@ -1,5 +1,6 @@
 ---
-description: This skill should be used when working with claudix semantic search beyond plain queries — building or rebuilding the index, controlling what gets indexed (indexing gitignored files, excluding paths, `.indexignore`/`.indexinclude` rules), switching embedding providers or models (bundled, LM Studio, Ollama), setting up cross-repo search, tuning or disabling grep interception and related-code surfacing, or recovering from a stale or corrupted index.
+description: "This skill should be used when working with claudix semantic search beyond plain queries (indexing, embedding providers, cross-repo search, grep interception, index recovery)."
+when_to_use: "Use when building or rebuilding the index, controlling what gets indexed (`.indexignore`/`.indexinclude` rules, gitignored files), switching embedding providers or models (bundled, LM Studio, Ollama), setting up cross-repo search, tuning or disabling grep interception and related-code surfacing, or recovering from a stale or corrupted index."
 ---
 
 # claudix
