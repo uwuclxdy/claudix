@@ -92,6 +92,8 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: clippy (-D warnings)
         run: cargo clippy --all-targets --all-features --release -- -D warnings
+      - name: build binary (mcp e2e spawns it)
+        run: cargo build --release --bin claudix
       - name: test
         # --no-fail-fast: surface every platform-specific failure in one run
         # instead of masking all but the first (tests are ~seconds; compile dominates).

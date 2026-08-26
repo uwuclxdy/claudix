@@ -372,7 +372,7 @@ Key modules:
 
 - `src/chunking/` — tree-sitter code splitting
 - `src/embedding/` — bundled (ONNX) and http (LM Studio, Ollama) providers
-- `src/store/` — LanceDB for vector + FTS
+- `src/store/` — LanceDB for vector storage
 - `src/search/` — hybrid retrieval
 - `src/mcp/` — Model Context Protocol
 - `src/hooks/` — SessionStart, PostToolUse, PreToolUse handlers

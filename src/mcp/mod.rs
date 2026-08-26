@@ -29,9 +29,10 @@ use crate::store::Store;
 type ToolOutcome = std::result::Result<CallToolResult, ErrorData>;
 
 /// Freshness bound on the served tool catalog. The catalog cannot change while
-/// the server process lives, so the field's only job is satisfying the
-/// `2026-07-28` schema; the value just decides whether a client refetches.
-const TOOL_CATALOG_TTL_MS: u64 = 1_000;
+/// the server process lives, and stdio bounds staleness anyway (server death is
+/// connection death, so a client refetches regardless), so an hour is honest
+/// and lets a client cache the catalog across turns.
+const TOOL_CATALOG_TTL_MS: u64 = 3_600_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct SearchCodeRequest {

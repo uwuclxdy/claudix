@@ -424,13 +424,11 @@ async fn run_hook_command(project_root: &std::path::Path, event: hooks::HookEven
     // background-spawn paths (which return promptly) never trip it. On elapse we
     // emit no JSON and exit normally; the session continues.
     //
-    // The hook body calls into the same lancedb/moka search pipeline the MCP
-    // driver serves. Both arms' search futures are `Send` — the lancedb 0.37
-    // query path holds no `!Send` reader state — but `futures_work` in
-    // pre_tool_use erases the bound when boxing the two arms into one future
-    // type, so the hook body stays `!Send`; run it on a `LocalSet` like the
-    // MCP driver. `spawn_local` still yields a `JoinError` on panic,
-    // preserving the fail-open contract below.
+    // The hook body calls into the same search pipeline the MCP driver serves.
+    // `futures_work` in pre_tool_use erases the `Send` bound when boxing the two
+    // arms into one future type, so the hook body stays `!Send`; run it on a
+    // `LocalSet` like the MCP driver. `spawn_local` still yields a `JoinError`
+    // on panic, preserving the fail-open contract below.
     let local = tokio::task::LocalSet::new();
     let outcome = local
         .run_until(async move {
