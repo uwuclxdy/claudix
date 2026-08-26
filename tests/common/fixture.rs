@@ -58,6 +58,7 @@ impl TestFixture {
     /// qualifies.
     #[allow(dead_code)]
     fn tempdir_outside_git() -> std::io::Result<TempDir> {
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut candidates = vec![std::env::temp_dir()];
         #[cfg(unix)]
         candidates.push(PathBuf::from("/tmp"));
