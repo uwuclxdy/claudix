@@ -23,23 +23,23 @@ pub(super) fn spawn_background_index(project_root: &Path, config: &Config) -> bo
     let marker_path = store.pending_index_marker_path();
     let manifest = store.read_manifest().ok().flatten();
 
-    // Mismatched embedding model means the existing chunks have the wrong
-    // dimension. Spawning `claudix index` without `--force` would either fail
-    // or append vectors of a different shape — the user has to run
-    // `claudix index --force` themselves; the session-start
-    // additionalContext already tells them so.
-    if let Some(ref manifest) = manifest
-        && manifest.chunk_count > 0
-        && manifest.embedding_model != config.embedding.model
-    {
-        return false;
-    }
+    // A store whose model differs from the configured one must rebuild even
+    // when fresh: plain `claudix index` auto-clears model, dimension, and
+    // schema mismatches, so SessionStart heals the store in the background
+    // with no user action (ruling 2026-08-26). The freshness skip below is
+    // gated on this instead of refusing to spawn. No chunk-count condition:
+    // the freshness skip itself requires chunk_count > 0, so a 0-chunk
+    // mismatched store spawns either way, and plain index clears it too.
+    let model_mismatched = manifest
+        .as_ref()
+        .is_some_and(|m| m.embedding_model != config.embedding.model);
 
-    // Skip respawning when the existing index is fresh and populated. Without
-    // this guard every SessionStart after the 60s marker window triggers a
-    // full reindex of an unchanged repo.
+    // Skip respawning when the existing index is fresh, populated, and built
+    // with the active model. Without this guard every SessionStart after the
+    // 60s marker window triggers a full reindex of an unchanged repo.
     if let Some(ref manifest) = manifest
         && manifest.chunk_count > 0
+        && !model_mismatched
         && !manifest.is_stale(config)
     {
         return false;
@@ -269,6 +269,8 @@ mod tests {
 
     use crate::Claudix;
     use crate::config::Config;
+    use crate::store::Manifest;
+    use crate::util::now_rfc3339;
 
     mod fixture {
         include!(concat!(
@@ -486,6 +488,59 @@ mod tests {
         assert!(
             spawn_background_index(fixture.root(), &config),
             "missing manifest must trigger a spawn"
+        );
+        Ok(())
+    }
+
+    /// A model-mismatched store must spawn a rebuild even when the manifest is
+    /// fresh and populated: plain `claudix index` auto-clears the mismatch, so
+    /// the freshness skip must not apply to it (ruling 2026-08-26).
+    #[tokio::test]
+    async fn spawn_background_index_spawns_when_model_mismatched_even_if_fresh()
+    -> crate::error::Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+
+        let store = crate::store::Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+        let mut manifest = Manifest::new("other-model", config.embedding.dimensions);
+        manifest.chunk_count = 42;
+        manifest.file_count = 7;
+        // Fresh: without the mismatch exception the freshness skip would
+        // suppress this spawn, and that is exactly the regression to pin.
+        manifest.last_full_index_at = Some(now_rfc3339());
+        store.write_manifest(&manifest)?;
+
+        assert!(
+            spawn_background_index(fixture.root(), &config),
+            "a fresh model-mismatched store must still spawn the rebuild"
+        );
+        Ok(())
+    }
+
+    /// A live full-index lock must suppress the spawn: the mismatch arm leans
+    /// on this guard to avoid double-spawning against a manual `claudix index`
+    /// run, and a mismatch spawn would otherwise claim the marker under the
+    /// manual run's nose.
+    #[tokio::test]
+    async fn spawn_background_index_skips_when_full_index_running() -> crate::error::Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+
+        let store = crate::store::Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+        // File name pairs `store::lock::LOCK_FILE_NAME` ("index.lock");
+        // this test process is a live PID, so the lock reads as held.
+        fs::write(
+            store.state_dir_path().join("index.lock"),
+            std::process::id().to_string(),
+        )?;
+
+        assert!(
+            !spawn_background_index(fixture.root(), &config),
+            "a live full-index lock must suppress the spawn"
         );
         Ok(())
     }

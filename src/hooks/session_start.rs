@@ -110,7 +110,7 @@ mod tests {
 
     use crate::config::Config;
     use crate::hooks::{HookEvent, run};
-    use crate::store::Store;
+    use crate::store::{Manifest, Store};
     use crate::util::now_rfc3339;
 
     mod fixture {
@@ -210,6 +210,35 @@ mod tests {
         assert!(context.contains("Use Grep for exact literals"));
     }
 
+    #[test]
+    fn session_start_context_reports_background_rebuild_on_model_mismatch() {
+        let in_flight = session_start_response(42, 683, false, true, true, None);
+        let context = in_flight["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("different embedding model"),
+            "mismatch must be named, got: {context}"
+        );
+        assert!(
+            context.contains("rebuild is in progress"),
+            "an in-flight mismatch rebuild must be announced, got: {context}"
+        );
+        assert!(
+            !context.contains("Call the reindex tool"),
+            "an in-flight rebuild must not ask the user to act, got: {context}"
+        );
+
+        let not_in_flight = session_start_response(42, 683, false, true, false, None);
+        let context = not_in_flight["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("Call the reindex tool"),
+            "a mismatch without a running rebuild must keep the manual guidance, got: {context}"
+        );
+    }
+
     #[tokio::test]
     async fn session_start_reports_indexing_in_flight_when_marker_exists()
     -> crate::error::Result<()> {
@@ -231,6 +260,37 @@ mod tests {
         assert!(
             context.contains("building its first index"),
             "expected in-flight message for empty manifest with pending marker, got: {context}"
+        );
+        Ok(())
+    }
+
+    /// SessionStart on a fresh, populated, model-mismatched store must spawn
+    /// the background rebuild (plain `claudix index` auto-clears) and say so —
+    /// not tell the user to act (ruling 2026-08-26).
+    #[tokio::test]
+    async fn session_start_spawns_background_rebuild_on_model_mismatch() -> crate::error::Result<()>
+    {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+        let mut manifest = Manifest::new("other-model", config.embedding.dimensions);
+        manifest.chunk_count = 42;
+        manifest.file_count = 7;
+        // Fresh so the spawn must happen because of the mismatch alone.
+        manifest.last_full_index_at = Some(now_rfc3339());
+        store.write_manifest(&manifest)?;
+
+        let response = run(fixture.root(), HookEvent::SessionStart, "{}").await?;
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("rebuild is in progress"),
+            "a model-mismatched store must start a rebuild at SessionStart, got: {context}"
         );
         Ok(())
     }

@@ -46,7 +46,11 @@ pub(super) fn check_index_ready(
         .and_then(|m| m.last_full_index_at.as_deref())
         .unwrap_or("none");
 
-    if current_ts != marker.prior_ts {
+    // A reset to "none" (the clean-reindex path wrote `Manifest::for_config`
+    // and the rebuild then failed before finishing) is not a completion: the
+    // manifest moved but the store holds nothing usable, so it routes into
+    // the failure arm below instead of consuming the marker.
+    if current_ts != marker.prior_ts && current_ts != "none" {
         let _ = fs::remove_file(&marker_path);
         let _ = fs::remove_file(&ack_path);
         let Some(manifest) = manifest else {
@@ -65,10 +69,11 @@ pub(super) fn check_index_ready(
         ));
     }
 
-    // Manifest timestamp unchanged AND no index lock holder. If the spawned
-    // child is still alive we're inside the slow-boot window (cold ONNX
-    // load, large config parse) — never declare failure yet. Only after the
-    // PID exits and the failure grace has elapsed do we surface a failure.
+    // Manifest timestamp unchanged or reset to "none", AND no index lock
+    // holder. If the spawned child is still alive we're inside the slow-boot
+    // window (cold ONNX load, large config parse) — never declare failure
+    // yet. Only after the PID exits and the failure grace has elapsed do we
+    // surface a failure.
     if marker
         .child_pid
         .is_some_and(crate::store::marker::process_running)
@@ -172,7 +177,7 @@ mod tests {
     use std::fs;
 
     use crate::config::Config;
-    use crate::store::Store;
+    use crate::store::{Manifest, Store};
 
     mod fixture {
         include!(concat!(
@@ -388,6 +393,47 @@ mod tests {
         assert!(
             store.pending_index_marker_path().exists(),
             "marker must survive the surfaced failure so later turns can resurface it"
+        );
+        Ok(())
+    }
+
+    /// hq-13: a mismatched store's spawned rebuild clears the store first
+    /// (`clear_chunks` resets the manifest to `for_config`, so
+    /// `last_full_index_at` becomes `None`). If the rebuild then fails, that
+    /// reset must read as a failed run — never as a false
+    /// "indexing complete: 0 files, 0 chunks" success that also consumes the
+    /// marker and silences every later turn.
+    #[tokio::test]
+    async fn check_index_ready_reads_reset_manifest_as_failed_run() -> crate::error::Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        // The spawn claimed the marker against the old build's timestamp;
+        // the child's clean-reindex path then reset the manifest.
+        let stale_created_at = "2025-01-01T00:00:00Z";
+        let payload = format!("2026-04-20T00:00:00Z\n{stale_created_at}\n0\n");
+        fs::write(store.pending_index_marker_path(), payload)?;
+        store.write_manifest(&Manifest::for_config(&config))?;
+
+        let response = check_index_ready(&store, &config, "PostToolUse", None, None);
+        let response = response.unwrap_or(Value::Null);
+        let context = response["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            context.contains("ended without updating the index"),
+            "a reset manifest must read as a failed run, got: {context}"
+        );
+        assert!(
+            !context.contains("indexing complete"),
+            "a reset manifest must not announce success, got: {context}"
+        );
+        assert!(
+            store.pending_index_marker_path().exists(),
+            "marker must survive so later turns can resurface the failure"
         );
         Ok(())
     }

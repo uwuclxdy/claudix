@@ -275,7 +275,7 @@ async fn run() -> Result<()> {
             if output.embedding_model_mismatch {
                 eprintln!(
                     "\nembedding model mismatch — the index was built with a different model.\n\
-                     Fix: run `claudix index --force` to rebuild with the active model."
+                     Fix: run `claudix index` to rebuild with the active model."
                 );
             } else if !output.embedding_healthy {
                 match &output.embedding_error {

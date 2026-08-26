@@ -32,7 +32,15 @@ pub fn session_start_response(
     let progress_suffix = log_hint
         .map(|p| format!(" Tail `{p}` to check progress."))
         .unwrap_or_default();
-    let additional_context = if model_mismatch {
+    // No "you'll be notified" promise and no "background" here: this arm also
+    // fires for a manual `claudix index` run (full_index_running), which is
+    // foreground for the user and writes no pending-index marker, so no
+    // completion notice will ever fire.
+    let additional_context = if model_mismatch && indexing_in_flight {
+        format!(
+            "claudix semantic search unavailable: the index was built with a different embedding model. A rebuild is in progress; carry on with Grep or Read until then.{progress_suffix}"
+        )
+    } else if model_mismatch {
         "claudix semantic search unavailable: the index was built with a different embedding model. Call the reindex tool (or run `claudix index`) to rebuild.".to_owned()
     } else if chunk_count == 0 && indexing_in_flight {
         format!(
