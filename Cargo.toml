@@ -54,8 +54,8 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
 # LanceDB for storage and FTS
-lancedb = "0.31.0"
-# arrow MUST match the major lancedb/lance re-export (lancedb 0.31 still re-exports
+lancedb = "0.37.1"
+# arrow MUST match the major lancedb/lance re-export (lancedb 0.37 still re-exports
 # arrow 58; a newer arrow here splits the tree into two majors that don't interop
 # at the lancedb boundary).
 arrow = { version = "58.3.0" }
@@ -93,7 +93,7 @@ shell-words = "1.1.1"
 # assets against their published digests (already in the tree via datafusion, so
 # this is a direct edge on an existing crate, not a new build).
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 
 # ONNX inference for bundled embedder
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
@@ -108,9 +108,10 @@ async-trait = "0.1.89"
 
 # MCP server. schemars (must stay 1.x to match rmcp) derives the tool-arg schemas
 # the #[tool] macro requires. The `local` feature drops the `Send` bound on tool
-# handlers — the lancedb/moka search pipeline holds `!Send` state across awaits,
-# so the service is driven single-threaded inside a `LocalSet` (fine for one
-# stdio client); handlers still use the multi-thread runtime for spawn_blocking.
+# handlers — the reindex handler holds `&mut dyn IndexProgress` (no `Send`
+# supertrait on the trait object) across awaits, so the service is driven
+# single-threaded inside a `LocalSet` (fine for one stdio client); handlers
+# still use the multi-thread runtime for spawn_blocking.
 rmcp = { version = "2.1", features = ["server", "macros", "transport-io", "schemars", "local"] }
 schemars = "1"
 
@@ -159,11 +160,17 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.lance-arrow]
 opt-level = 2
+[profile.dev.package.lance-arrow-scalar]
+opt-level = 2
+[profile.dev.package.lance-arrow-stats]
+opt-level = 2
 [profile.dev.package.lance-bitpacking]
 opt-level = 2
 [profile.dev.package.lance-core]
 opt-level = 2
 [profile.dev.package.lance-datafusion]
+opt-level = 2
+[profile.dev.package.lance-datagen]
 opt-level = 2
 [profile.dev.package.lance-encoding]
 opt-level = 2
@@ -171,11 +178,23 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.lance-index]
 opt-level = 2
+[profile.dev.package.lance-index-core]
+opt-level = 2
 [profile.dev.package.lance-io]
 opt-level = 2
 [profile.dev.package.lance-linalg]
 opt-level = 2
+[profile.dev.package.lance-namespace]
+opt-level = 2
+[profile.dev.package.lance-namespace-impls]
+opt-level = 2
+[profile.dev.package.lance-namespace-reqwest-client]
+opt-level = 2
+[profile.dev.package.lance-select]
+opt-level = 2
 [profile.dev.package.lance-table]
+opt-level = 2
+[profile.dev.package.lance-tokenizer]
 opt-level = 2
 
 [profile.dev.package.datafusion]
@@ -190,6 +209,14 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.datafusion-datasource]
 opt-level = 2
+[profile.dev.package.datafusion-datasource-arrow]
+opt-level = 2
+[profile.dev.package.datafusion-datasource-csv]
+opt-level = 2
+[profile.dev.package.datafusion-datasource-json]
+opt-level = 2
+[profile.dev.package.datafusion-doc]
+opt-level = 2
 [profile.dev.package.datafusion-execution]
 opt-level = 2
 [profile.dev.package.datafusion-expr]
@@ -202,9 +229,19 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.datafusion-functions-aggregate-common]
 opt-level = 2
+[profile.dev.package.datafusion-functions-nested]
+opt-level = 2
+[profile.dev.package.datafusion-functions-table]
+opt-level = 2
+[profile.dev.package.datafusion-functions-window]
+opt-level = 2
+[profile.dev.package.datafusion-functions-window-common]
+opt-level = 2
 [profile.dev.package.datafusion-optimizer]
 opt-level = 2
 [profile.dev.package.datafusion-physical-expr]
+opt-level = 2
+[profile.dev.package.datafusion-physical-expr-adapter]
 opt-level = 2
 [profile.dev.package.datafusion-physical-expr-common]
 opt-level = 2
@@ -214,10 +251,14 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.datafusion-pruning]
 opt-level = 2
+[profile.dev.package.datafusion-session]
+opt-level = 2
 [profile.dev.package.datafusion-sql]
 opt-level = 2
 
 [profile.dev.package.arrow]
+opt-level = 2
+[profile.dev.package.arrow-arith]
 opt-level = 2
 [profile.dev.package.arrow-array]
 opt-level = 2
@@ -225,13 +266,23 @@ opt-level = 2
 opt-level = 2
 [profile.dev.package.arrow-cast]
 opt-level = 2
+[profile.dev.package.arrow-csv]
+opt-level = 2
 [profile.dev.package.arrow-data]
 opt-level = 2
 [profile.dev.package.arrow-ipc]
 opt-level = 2
+[profile.dev.package.arrow-json]
+opt-level = 2
+[profile.dev.package.arrow-ord]
+opt-level = 2
+[profile.dev.package.arrow-row]
+opt-level = 2
 [profile.dev.package.arrow-schema]
 opt-level = 2
 [profile.dev.package.arrow-select]
+opt-level = 2
+[profile.dev.package.arrow-string]
 opt-level = 2
 
 [profile.dev.package.tree-sitter]
