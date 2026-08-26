@@ -76,8 +76,8 @@ tree-sitter-c-sharp = "0.23.5"
 tree-sitter-sequel = "0.3.11"
 
 # Git enumeration (pure Rust, no C dep)
-gix = { version = "0.85", default-features = false, features = ["index", "sha1"] }
-gix-hash = { version = "0.25.1", features = ["sha1"] }
+gix = { version = "0.87", default-features = false, features = ["index", "sha1"] }
+gix-hash = { version = "0.26.2", features = ["sha1"] }
 
 # File walking with gitignore support
 ignore = "0.4.26"
