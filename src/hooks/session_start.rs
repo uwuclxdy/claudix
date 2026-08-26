@@ -31,9 +31,11 @@ async fn handle_session_start_with_starts(
     payload: HookPayload,
     start_dirs: Vec<PathBuf>,
 ) -> Result<Option<Value>> {
-    // Write path (the background index/watch spawns below): a pre-fix binary
-    // may have left a `.claudix/` between the session's start dir and this
-    // resolved root. Clean it up first (ruling 2026-08-25); fail-open.
+    // Delete nested stores before the background spawns below. The order is
+    // inert today: no spawn reads a nested store, so a delete moved after the
+    // spawn block would change nothing. It turns load-bearing once a spawn
+    // resolves the start dir instead of the project root, at which point the
+    // child would race this cleanup. (Ruling 2026-08-25; fail-open.)
     crate::enumeration::delete_nested_stores_from(project_root, start_dirs);
     let config = config::load(project_root).ok();
 
