@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -15,6 +15,26 @@ pub(super) async fn handle_session_start(
     project_root: &Path,
     payload: HookPayload,
 ) -> Result<Option<Value>> {
+    handle_session_start_with_starts(
+        project_root,
+        payload,
+        crate::enumeration::nested_store_start_dirs(),
+    )
+    .await
+}
+
+/// [`handle_session_start`] with explicit start dirs, so the cleanup can be
+/// driven from a planted fixture store without touching the process
+/// environment.
+async fn handle_session_start_with_starts(
+    project_root: &Path,
+    payload: HookPayload,
+    start_dirs: Vec<PathBuf>,
+) -> Result<Option<Value>> {
+    // Write path (the background index/watch spawns below): a pre-fix binary
+    // may have left a `.claudix/` between the session's start dir and this
+    // resolved root. Clean it up first (ruling 2026-08-25); fail-open.
+    crate::enumeration::delete_nested_stores_from(project_root, start_dirs);
     let config = config::load(project_root).ok();
 
     let indexing_spawned = if let Some(ref config) = config
@@ -156,6 +176,77 @@ mod tests {
         let response = run(fixture.root(), HookEvent::SessionStart, "").await;
         assert!(response.is_ok(), "empty payload must not error");
         assert!(response.ok().unwrap_or_else(|| unreachable!()).is_some());
+    }
+
+    #[tokio::test]
+    async fn session_start_from_subdir_lays_store_at_resolved_repo_root() -> Result<()> {
+        // A session started in a subdir must act on the resolved repo root:
+        // the store lands at `<repo>/.claudix`, never in the subdir (ruling
+        // 2026-08-25). The process entry resolves the start dir before the
+        // hook runs; this test composes that resolution with the SessionStart
+        // write path.
+        let fixture = TestFixture::new("small_rust")?;
+        let subdir = fixture.root().join("website/worker");
+        assert!(fs::create_dir_all(&subdir).is_ok());
+        write_config(fixture.root(), &stub_config());
+
+        let project_root = crate::enumeration::resolve_project_root(&subdir);
+        assert_eq!(
+            project_root,
+            fixture.root().to_path_buf(),
+            "a subdir start must resolve to the enclosing repo root"
+        );
+
+        let response = run(&project_root, HookEvent::SessionStart, "{}").await?;
+        assert!(response.is_some());
+
+        assert!(
+            fixture.root().join(".claudix").exists(),
+            "the store must land at the resolved repo root"
+        );
+        assert!(
+            !subdir.join(".claudix").exists(),
+            "no state may be created in the start subdir"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_start_deletes_planted_nested_store() -> Result<()> {
+        // The SessionStart write path must delete a pre-fix nested store, not
+        // merely avoid creating one (the delete half of the 2026-08-25
+        // ruling). The start dirs are explicit here — the env-derived ones
+        // cannot reach a fixture in the test process.
+        let fixture = TestFixture::new("small_rust")?;
+        let subdir = fixture.root().join("website/worker");
+        let nested_store = subdir.join(".claudix");
+        assert!(fs::create_dir_all(&nested_store).is_ok());
+        assert!(fs::write(nested_store.join("manifest.json"), "{}").is_ok());
+        write_config(fixture.root(), &stub_config());
+
+        let project_root = crate::enumeration::resolve_project_root(&subdir);
+        let response = super::handle_session_start_with_starts(
+            &project_root,
+            HookPayload {
+                tool_name: None,
+                tool_input: None,
+                session_id: None,
+                prompt_id: None,
+            },
+            vec![subdir.clone()],
+        )
+        .await?;
+        assert!(response.is_some());
+
+        assert!(
+            !nested_store.exists(),
+            "SessionStart must delete a planted nested pre-fix store"
+        );
+        assert!(
+            fixture.root().join(".claudix").exists(),
+            "the root store is still created as usual"
+        );
+        Ok(())
     }
 
     #[tokio::test]

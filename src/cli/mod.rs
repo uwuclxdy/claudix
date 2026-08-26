@@ -816,6 +816,10 @@ impl IndexSession {
     async fn new(project_root: impl AsRef<Path>) -> Result<Self> {
         let project_root = canonical_project_root(project_root.as_ref())?;
         require_git_repo(&project_root)?;
+        // Write path: a pre-fix binary may have left a store-shaped `.claudix/`
+        // between the session's start dir and this resolved root. Clean it up
+        // before laying down state (ruling 2026-08-25); fail-open.
+        crate::enumeration::delete_nested_stores(&project_root);
         let config = config::load(&project_root)?;
         let store = Store::new(&project_root, &config)?;
         let lock = store
@@ -850,6 +854,7 @@ pub async fn run_reindex_file(
 ) -> Result<IndexOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
     require_git_repo(&project_root)?;
+    crate::enumeration::delete_nested_stores(&project_root);
     let config = config::load(&project_root)?;
     let store = Store::new(&project_root, &config)?;
 
@@ -934,6 +939,11 @@ fn install_data_dir() -> Option<PathBuf> {
 
 pub async fn run_clear_index(project_root: impl AsRef<Path>) -> Result<ClearOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
+    // `clear_chunks` goes through `ensure_layout`, so clear is a write path:
+    // it must refuse non-git dirs and clean up pre-fix nested stores like the
+    // other state-creating subcommands (ruling 2026-08-25).
+    require_git_repo(&project_root)?;
+    crate::enumeration::delete_nested_stores(&project_root);
     let config = config::load(&project_root)?;
     let store = Store::new(&project_root, &config)?;
     store.clear_chunks(&config).await?;
@@ -1246,6 +1256,26 @@ mod tests {
         let top_hit = &output.groups[0].hits[0];
         assert_eq!(top_hit.name.as_deref(), Some("add"));
         assert_eq!(top_hit.file_path, "src/math.rs");
+    }
+
+    /// `clear` goes through `ensure_layout`, so outside a git repo it must
+    /// refuse instead of laying down state (ruling 2026-08-25; the same gate
+    /// as the other state-creating subcommands).
+    #[tokio::test]
+    async fn clear_index_in_non_git_dir_fails_without_creating_state() -> Result<()> {
+        let fixture = TestFixture::without_git("small_rust")?;
+
+        let result = run_clear_index(fixture.root()).await;
+
+        assert!(
+            matches!(result, Err(ClaudixError::NotAGitRepository { .. })),
+            "expected NotAGitRepository, got {result:?}"
+        );
+        assert!(
+            !fixture.root().join(".claudix").exists(),
+            "clear must not create state outside a git repo"
+        );
+        Ok(())
     }
 
     /// A healthy search carries no degradation notice; an endpoint-down search

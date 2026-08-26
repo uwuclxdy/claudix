@@ -1,10 +1,9 @@
-use std::env;
 use std::io::{self, Read};
 use std::panic;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use claudix::{ClaudixError, cli, hooks, mcp};
+use claudix::{ClaudixError, cli, enumeration, hooks, mcp};
 use serde_json::to_string;
 
 #[derive(Debug, Parser)]
@@ -131,7 +130,7 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let project_root = active_project_root()?;
+    let project_root = enumeration::active_project_root()?;
 
     match cli.command {
         Command::Index { force, progress } => {
@@ -387,13 +386,6 @@ fn print_index_stats(
     }
     if let Some(dimensions) = dimensions {
         println!("dimensions: {dimensions}");
-    }
-}
-
-fn active_project_root() -> Result<std::path::PathBuf> {
-    match env::var_os("CLAUDE_PROJECT_DIR") {
-        Some(path) => Ok(path.into()),
-        None => Ok(env::current_dir()?),
     }
 }
 

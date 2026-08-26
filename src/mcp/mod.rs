@@ -201,7 +201,13 @@ pub async fn run(project_root: impl AsRef<Path>) -> crate::error::Result<()> {
     // repo, where there is nothing to index and `ensure_layout` would create a
     // stray `.claudix/`.
     let embed_marker = crate::enumeration::is_git_repo(&project_root)
-        .then(|| config::load(&project_root).ok())
+        .then(|| {
+            // `ensure_layout` below is a write: clean up any pre-fix nested
+            // store between the session's start dir and this resolved root
+            // first (ruling 2026-08-25); fail-open.
+            crate::enumeration::delete_nested_stores(&project_root);
+            config::load(&project_root).ok()
+        })
         .flatten()
         .and_then(|config| Store::new(&project_root, &config).ok())
         // On a never-indexed repo the state dir doesn't exist yet and the
