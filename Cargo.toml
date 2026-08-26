@@ -106,13 +106,16 @@ tempfile = "3.27.0"
 # Async trait support for embedding provider traits
 async-trait = "0.1.89"
 
-# MCP server. schemars (must stay 1.x to match rmcp) derives the tool-arg schemas
-# the #[tool] macro requires. The `local` feature drops the `Send` bound on tool
-# handlers — the reindex handler holds `&mut dyn IndexProgress` (no `Send`
-# supertrait on the trait object) across awaits, so the service is driven
-# single-threaded inside a `LocalSet` (fine for one stdio client); handlers
-# still use the multi-thread runtime for spawn_blocking.
-rmcp = { version = "2.1", features = ["server", "macros", "transport-io", "schemars", "local"] }
+# MCP server. rmcp 3 speaks the stateless 2026-07-28 revision and serves both
+# eras by default (dual-era posture; do not narrow supported_protocol_versions).
+# schemars (must stay 1.x to match rmcp) derives the tool-arg schemas the
+# #[tool] macro requires. The `local` feature drops the `Send` bound on tool
+# handlers — the search path is Send under lancedb 0.37, but the reindex
+# handler still holds `&mut dyn IndexProgress` (no `Send` supertrait on the
+# trait object) across awaits, so the service is driven single-threaded inside
+# a `LocalSet` (fine for one stdio client); handlers still use the multi-thread
+# runtime for spawn_blocking.
+rmcp = { version = "3", features = ["server", "macros", "transport-io", "schemars", "local"] }
 schemars = "1"
 
 [dev-dependencies]

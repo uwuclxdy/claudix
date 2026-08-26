@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, JsonObject, ListToolsResult,
+    CacheScope, CallToolResult, ContentBlock, Implementation, JsonObject, ListToolsResult,
     PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
@@ -27,6 +27,11 @@ use crate::store::Store;
 /// `CallToolResult`; a failed tool run is an `Ok(CallToolResult::error(..))`, not
 /// an `Err`, so the message reaches the caller instead of being rendered opaque.
 type ToolOutcome = std::result::Result<CallToolResult, ErrorData>;
+
+/// Freshness bound on the served tool catalog. The catalog cannot change while
+/// the server process lives, so the field's only job is satisfying the
+/// `2026-07-28` schema; the value just decides whether a client refetches.
+const TOOL_CATALOG_TTL_MS: u64 = 1_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 pub struct SearchCodeRequest {
@@ -170,12 +175,19 @@ impl ServerHandler for ClaudixServer {
 
     /// Serve the centralized catalog from `prompts::mcp`, not the macro-derived
     /// per-tool schemas, so descriptions and order stay the single source.
+    ///
+    /// `with_all_items` fills the modern `resultType` discriminator but leaves
+    /// `ttlMs`/`cacheScope` unset, and the spec requires both on `tools/list`
+    /// for `2026-07-28` peers. The catalog is static per server process, so any
+    /// nonzero freshness bound is honest; the value only saves a refetch.
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
-        Ok(ListToolsResult::with_all_items(tool_catalog()?))
+        Ok(ListToolsResult::with_all_items(tool_catalog()?)
+            .with_ttl_ms(TOOL_CATALOG_TTL_MS)
+            .with_cache_scope(CacheScope::Private))
     }
 }
 
