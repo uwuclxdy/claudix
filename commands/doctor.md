@@ -1,5 +1,5 @@
 ---
-description: Diagnose claudix binary, index, and embedding provider. Use when search errors, the index won't build, or the embedding provider is unreachable.
+description: Diagnoses claudix binary, index, and embedding provider. Use when search errors, the index won't build, or the embedding provider is unreachable.
 allowed-tools: Bash(node:*)
 ---
 
