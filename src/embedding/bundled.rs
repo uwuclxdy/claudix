@@ -646,7 +646,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn default_cache_dir() -> Result<PathBuf> {
-    dirs::home_dir()
+    crate::util::home_root()
         .map(|home| home.join(".claude").join("claudix").join("models"))
         .ok_or_else(|| {
             ClaudixError::Embedding("failed to resolve bundled model cache directory".into())

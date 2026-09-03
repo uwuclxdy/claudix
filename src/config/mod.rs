@@ -278,7 +278,7 @@ pub(crate) fn validate_project_relative_path(path: &Path, field_name: &'static s
 }
 
 fn dirs_global() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("claudix.toml"))
+    crate::util::global_config_path()
 }
 
 fn cirrus_config_path() -> Option<PathBuf> {

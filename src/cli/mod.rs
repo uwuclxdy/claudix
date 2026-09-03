@@ -918,23 +918,32 @@ pub async fn run_doctor(project_root: impl AsRef<Path>) -> Result<DoctorOutput> 
     })
 }
 
-/// Resolve the claudix binary cache dir from the environment, mirroring
-/// `bin/claudix-bootstrap.js`'s resolution so `/doctor` reads the same
-/// `install.log` the bootstrap writes. `None` when no env hints a cache dir
-/// (e.g. `claudix doctor` run manually from a shell).
+/// Resolve the claudix binary cache dir, mirroring `bin/claudix-bootstrap.js`'s
+/// resolution so `/doctor` reads the same `install.log` the bootstrap writes.
+/// `None` only when the home root itself cannot be resolved.
 fn install_data_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_PLUGIN_DATA").map(PathBuf::from) {
-        return Some(dir);
+    // A `test-stub` build ignores all three hints and roots at the sandbox
+    // instead. Every one of them is set on ordinary machines and inside a
+    // Claude Code session, so honoring them would put the suite back on the
+    // developer's own files depending on where it happens to run.
+    #[cfg(not(feature = "test-stub"))]
+    {
+        if let Some(dir) = std::env::var_os("CLAUDE_PLUGIN_DATA").map(PathBuf::from) {
+            return Some(dir);
+        }
+        if let Some(dir) = std::env::var_os("CLAUDIX_HOME").map(PathBuf::from) {
+            return Some(dir);
+        }
+        if let Some(base) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+            return Some(base.join("claudix"));
+        }
     }
-    if let Some(dir) = std::env::var_os("CLAUDIX_HOME").map(PathBuf::from) {
-        return Some(dir);
-    }
-    let base = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from);
-    let base = match base {
-        Some(base) => base,
-        None => dirs::home_dir()?.join(".local").join("share"),
-    };
-    Some(base.join("claudix"))
+    Some(
+        crate::util::home_root()?
+            .join(".local")
+            .join("share")
+            .join("claudix"),
+    )
 }
 
 pub async fn run_clear_index(project_root: impl AsRef<Path>) -> Result<ClearOutput> {

@@ -308,12 +308,10 @@ fn is_claudix_plugin_root(path: &Path) -> bool {
 }
 
 fn global_config_path() -> Result<PathBuf> {
-    dirs::home_dir()
-        .map(|home| home.join(".claude").join("claudix.toml"))
-        .ok_or_else(|| ClaudixError::ConfigInvalid {
-            message: "home directory is not available".into(),
-            recovery: RecoveryHint(hints::SET_HOME_FOR_INSTALL),
-        })
+    crate::util::global_config_path().ok_or_else(|| ClaudixError::ConfigInvalid {
+        message: "home directory is not available".into(),
+        recovery: RecoveryHint(hints::SET_HOME_FOR_INSTALL),
+    })
 }
 
 #[cfg(test)]

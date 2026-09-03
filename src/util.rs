@@ -1,11 +1,43 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::{ClaudixError, RecoveryHint, Result};
 use crate::prompts::hints;
 
 const SECONDS_PER_DAY: i64 = 86_400;
+
+/// Root of every claudix path outside the project: the global config, the
+/// bundled model cache, the install log.
+///
+/// A `test-stub` build resolves it from `CLAUDIX_SANDBOX_HOME` and nothing
+/// else, so no test can reach the developer's own `~/.claude`, and a spawned
+/// `claudix` binary inherits the same sandbox. `.cargo/config.toml` sets that
+/// variable for every process cargo starts. An unset variable aborts instead
+/// of falling back, because falling back is how a suite ends up asserting
+/// against whatever the machine running it happens to have configured.
+#[cfg_attr(feature = "test-stub", allow(clippy::panic))]
+pub(crate) fn home_root() -> Option<PathBuf> {
+    #[cfg(feature = "test-stub")]
+    {
+        match std::env::var_os("CLAUDIX_SANDBOX_HOME") {
+            Some(dir) => Some(PathBuf::from(dir)),
+            None => panic!(
+                "CLAUDIX_SANDBOX_HOME is unset in a test-stub build: a test must never read real user paths. `.cargo/config.toml` sets it for every process cargo starts."
+            ),
+        }
+    }
+    #[cfg(not(feature = "test-stub"))]
+    {
+        dirs::home_dir()
+    }
+}
+
+/// The global config file, resolved in one place so config loading and
+/// `claudix install` can never disagree about where it lives.
+pub(crate) fn global_config_path() -> Option<PathBuf> {
+    home_root().map(|home| home.join(".claude").join("claudix.toml"))
+}
 
 pub fn now_rfc3339() -> String {
     format_rfc3339(SystemTime::now())
