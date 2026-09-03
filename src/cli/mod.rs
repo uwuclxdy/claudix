@@ -175,8 +175,9 @@ pub struct StatusOutput {
     pub last_incremental_at: Option<String>,
     /// True when the index is missing or older than `reindex_after_hours`.
     pub stale: bool,
-    /// In-flight full-index progress, present only while the store's lock
-    /// names a live process whose own `index.log` marker matches it.
+    /// In-flight index progress, present whenever the store's lock names a
+    /// live process. Its `total` is `None` until that run's own log marker can
+    /// be read and attributed to it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub indexing: Option<IndexingStatus>,
 }
@@ -1121,14 +1122,18 @@ async fn status_from_store(store: &Store, config: &crate::config::Config) -> Res
 /// In-flight indexing block, derived entirely from state the run already
 /// writes: the live `index.lock` (liveness + pid), the pending-index marker
 /// (start time), and the run's own `total <n> pid <p>` marker in `index.log`.
-/// Returns `None` whenever nothing is running or the log marker does not match
-/// the lock pid (an older run's log, or a per-file reindex sharing the lock).
+/// `None` only when nothing holds the lock. A run whose counts cannot be read
+/// yet still reports its pid and elapsed time with `total: None`, which renders
+/// as `scanning`.
 fn indexing_status(store: &Store, config: &crate::config::Config) -> Option<IndexingStatus> {
     if !store.full_index_running() {
         return None;
     }
     let lock_path = store.index_lock_path();
     let live_pid = crate::store::marker::read_pid(&lock_path)?;
+    let lock_mtime = fs::metadata(&lock_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
 
     let pending = crate::store::marker::pending_index::read(&store.pending_index_marker_path());
     let (started_at, elapsed_secs) = match pending {
@@ -1136,20 +1141,27 @@ fn indexing_status(store: &Store, config: &crate::config::Config) -> Option<Inde
             Some(marker.created_at_raw),
             elapsed_since(marker.created_at),
         ),
-        _ => {
-            let lock_mtime = fs::metadata(&lock_path)
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            (None, lock_mtime.map(elapsed_since).unwrap_or(0))
-        }
+        _ => (None, lock_mtime.map(elapsed_since).unwrap_or(0)),
     };
 
     let log_path = store
         .project_root()
         .join(&config.paths.log_dir)
         .join("index.log");
-    let log = fs::read_to_string(log_path).ok()?;
-    let (done, total) = parse_indexing_progress(&log, live_pid);
+    // A missing log is the normal state for the first seconds of a run: the
+    // lock is taken in `IndexSession::new`, which can spend minutes on a model
+    // download and a cold ONNX load before `FileIndexProgress` creates the log.
+    // Dropping the whole block there would leave `claudix status` silent for
+    // exactly the window the SessionStart hint sends the reader to it.
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let log_mtime = fs::metadata(&log_path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let (done, total) = if log_belongs_to_run(log_mtime, lock_mtime) {
+        parse_indexing_progress(&log, live_pid)
+    } else {
+        (0, None)
+    };
 
     Some(IndexingStatus {
         pid: live_pid,
@@ -1158,6 +1170,24 @@ fn indexing_status(store: &Store, config: &crate::config::Config) -> Option<Inde
         done,
         total,
     })
+}
+
+/// Whether `index.log` was written by the run that holds `index.lock`.
+///
+/// The pid alone cannot answer this. `acquire_reindex_lock` writes the same
+/// lock file for a per-file reindex, and the MCP server runs `run_index` and
+/// `run_reindex_file` in ONE process, so a finished full index's marker can
+/// carry the pid that a later single-file reindex writes into the lock; without
+/// this test `claudix status` reports that finished run's counts, at 100%, for
+/// a job that is embedding one file. A full index takes the lock first and then
+/// creates and appends to its log, so its log is never the older of the two.
+/// Anything unreadable answers `false`: the counts are the part worth
+/// withholding, and the caller still reports the run itself.
+fn log_belongs_to_run(log_mtime: Option<SystemTime>, lock_mtime: Option<SystemTime>) -> bool {
+    match (log_mtime, lock_mtime) {
+        (Some(log), Some(lock)) => log >= lock,
+        _ => false,
+    }
 }
 
 /// Elapsed seconds since `start`, saturating at `0` for a future timestamp
@@ -1587,6 +1617,31 @@ mod tests {
     fn parse_indexing_progress_only_last_total_line_counts() {
         let log = "total 9 pid 4242\nindexed src/a.rs\ntotal 3 pid 4242\nindexed src/b.rs\n";
         assert_eq!(parse_indexing_progress(log, 4242), (1, Some(3)));
+    }
+
+    #[test]
+    fn log_belongs_to_run_rejects_a_log_older_than_the_lock() {
+        let lock = SystemTime::now();
+        let log = lock - std::time::Duration::from_secs(30);
+        assert!(
+            !log_belongs_to_run(Some(log), Some(lock)),
+            "a finished run's log under a freshly taken reindex lock must not be counted"
+        );
+        assert!(
+            log_belongs_to_run(Some(lock + std::time::Duration::from_secs(1)), Some(lock)),
+            "a log written after the lock is this run's"
+        );
+        assert!(
+            log_belongs_to_run(Some(lock), Some(lock)),
+            "a log and lock written in the same instant belong to one run"
+        );
+    }
+
+    #[test]
+    fn log_belongs_to_run_rejects_unreadable_timestamps() {
+        let now = SystemTime::now();
+        assert!(!log_belongs_to_run(None, Some(now)), "no log, no counts");
+        assert!(!log_belongs_to_run(Some(now), None), "no lock, no counts");
     }
 
     #[test]

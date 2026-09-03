@@ -58,4 +58,4 @@ All under `[hooks]`:
 
 ## Verify and troubleshoot
 
-`claudix status` shows file/chunk counts, the embedding model, staleness — SessionStart already reports these, so reach for it only mid-session. `/claudix:doctor` diagnoses the binary, index, provider health, config errors. Logs: `.claudix/logs/index.log`; `RUST_LOG=debug` on any CLI subcommand for verbose output.
+`claudix status` shows file/chunk counts, the embedding model, staleness, and the progress of an index running right now (`indexing: 142/193 files (74%)`), which is the one thing SessionStart cannot report. `/claudix:doctor` diagnoses the binary, index, provider health, config errors. Logs: `.claudix/logs/index.log`; `RUST_LOG=debug` on any CLI subcommand for verbose output.

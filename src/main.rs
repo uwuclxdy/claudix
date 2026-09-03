@@ -395,6 +395,12 @@ fn print_index_stats(
 fn print_indexing_status(indexing: &cli::IndexingStatus) {
     let elapsed = format_elapsed(indexing.elapsed_secs);
     match indexing.total {
+        // A run with nothing to embed has no fraction to show, and "0%" reads
+        // as stalled rather than as finished.
+        Some(0) => println!(
+            "indexing: no files to embed, pid {}, {} elapsed",
+            indexing.pid, elapsed
+        ),
         Some(total) => {
             let percent = (indexing.done * 100).checked_div(total).unwrap_or(0);
             println!(
@@ -409,11 +415,13 @@ fn print_indexing_status(indexing: &cli::IndexingStatus) {
     }
 }
 
+/// Carries an hour unit because a full rebuild of a large repository runs for
+/// hours, and `184m12s` is the shape that reads as a bug.
 fn format_elapsed(secs: u64) -> String {
-    if secs < 60 {
-        format!("{secs}s")
-    } else {
-        format!("{}m{}s", secs / 60, secs % 60)
+    match (secs / 3_600, (secs % 3_600) / 60, secs % 60) {
+        (0, 0, seconds) => format!("{seconds}s"),
+        (0, minutes, seconds) => format!("{minutes}m{seconds}s"),
+        (hours, minutes, _) => format!("{hours}h{minutes}m"),
     }
 }
 
@@ -506,5 +514,25 @@ fn read_stdin_payload() -> String {
         payload
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_elapsed_carries_an_hour_unit() {
+        assert_eq!(format_elapsed(0), "0s");
+        assert_eq!(format_elapsed(59), "59s");
+        assert_eq!(format_elapsed(60), "1m0s");
+        assert_eq!(format_elapsed(253), "4m13s");
+        assert_eq!(format_elapsed(3_599), "59m59s");
+        assert_eq!(
+            format_elapsed(11_052),
+            "3h4m",
+            "a multi-hour rebuild must not render as minutes"
+        );
     }
 }

@@ -51,7 +51,92 @@ async fn full_index_enumerates_and_persists_chunks() {
     );
 }
 
+/// Records what `index_full` reports, split at the `embed_total` marker.
+///
+/// `after_total` counts only the events the embed loop emits, because the
+/// enumeration and store passes report every file before the loop starts and
+/// counting those together is the mistake the marker exists to prevent.
+#[derive(Default)]
+struct ProgressRecorder {
+    total: Option<usize>,
+    before_total: usize,
+    after_total: usize,
+}
+
+impl claudix::IndexProgress for ProgressRecorder {
+    fn file(
+        &mut self,
+        _path: &RelativePath,
+        _status: claudix::IndexFileStatus,
+    ) -> Result<(), ClaudixError> {
+        if self.total.is_some() {
+            self.after_total += 1;
+        } else {
+            self.before_total += 1;
+        }
+        Ok(())
+    }
+
+    fn embed_total(&mut self, total: usize) -> Result<(), ClaudixError> {
+        self.total = Some(total);
+        Ok(())
+    }
+}
+
 // ── b ──────────────────────────────────────────────────────────────────────
+
+/// The denominator is the embed loop's list, which an incremental pass is the
+/// only way to observe: against an empty store every enumerated file is also a
+/// changed file, so a total taken from the enumeration is indistinguishable
+/// from the correct one, and every assertion on a first index passes either
+/// way. After one edit the two diverge, and reporting the enumeration would
+/// show a second pass as large as the first.
+#[tokio::test]
+async fn incremental_embed_total_counts_only_changed_files() {
+    let fixture = TestFixture::new("small_rust");
+    assert!(fixture.is_ok(), "fixture setup failed");
+    let fixture = fixture.ok().unwrap_or_else(|| unreachable!());
+
+    let claudix = Claudix::new(fixture.root().to_path_buf(), Arc::new(stub_config())).await;
+    assert!(claudix.is_ok(), "Claudix::new failed");
+    let claudix = claudix.ok().unwrap_or_else(|| unreachable!());
+
+    let mut first = ProgressRecorder::default();
+    let indexed = claudix.index_full(&mut first).await;
+    assert!(indexed.is_ok(), "initial index_full failed: {indexed:?}");
+
+    let write = std::fs::write(
+        fixture.root().join("src/math.rs"),
+        "pub fn square(x: i32) -> i32 { x * x }\n",
+    );
+    assert!(write.is_ok(), "write math.rs failed");
+
+    let mut second = ProgressRecorder::default();
+    let reindexed = claudix.index_full(&mut second).await;
+    assert!(reindexed.is_ok(), "reindex failed: {reindexed:?}");
+
+    let first_total = first.total;
+    let second_total = second.total;
+    assert_eq!(
+        first_total,
+        Some(first.after_total),
+        "first pass: the reported total must equal the files the loop reported"
+    );
+    assert_eq!(
+        second_total,
+        Some(second.after_total),
+        "second pass: the reported total must equal the files the loop reported"
+    );
+    assert!(
+        second_total < first_total,
+        "an incremental pass must report fewer files than the first: got {second_total:?} after {first_total:?}, \
+         which is what a total taken from the enumeration would produce"
+    );
+    assert!(
+        second.before_total > 0,
+        "the store pass must still report the files it walked before the loop"
+    );
+}
 
 #[tokio::test]
 async fn full_reindex_after_file_edit_reflects_changes() {
@@ -498,11 +583,9 @@ fn index_progress_writes_status_to_stderr() {
         !stdout.contains("indexed src/lib.rs"),
         "progress status leaked to stdout: {stdout}"
     );
-    // The denominator is the embed loop's own file list: six enumerated files,
-    // four of which yield no chunks. Asserting the number rather than the
-    // marker's presence is what catches a total taken from the store pass,
-    // which logs those same six a second time before the loop and would read
-    // as twelve.
+    // Pins the marker's shape and its number on the stderr path. Only the
+    // incremental test above can separate this number from the enumeration's,
+    // since every enumerated file is also a changed file on a first index.
     assert!(
         stderr.contains("total 6 pid "),
         "expected the embed-loop total marker on stderr, got: {stderr}"
