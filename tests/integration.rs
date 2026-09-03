@@ -498,6 +498,15 @@ fn index_progress_writes_status_to_stderr() {
         !stdout.contains("indexed src/lib.rs"),
         "progress status leaked to stdout: {stdout}"
     );
+    // The denominator is the embed loop's own file list: six enumerated files,
+    // four of which yield no chunks. Asserting the number rather than the
+    // marker's presence is what catches a total taken from the store pass,
+    // which logs those same six a second time before the loop and would read
+    // as twelve.
+    assert!(
+        stderr.contains("total 6 pid "),
+        "expected the embed-loop total marker on stderr, got: {stderr}"
+    );
 }
 
 #[test]

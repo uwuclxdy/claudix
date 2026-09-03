@@ -38,6 +38,12 @@ impl Drop for IndexLockGuard {
 }
 
 impl Store {
+    /// Path of the shared chunk-writer lock, so callers that read the lock
+    /// for liveness or its pid don't duplicate [`LOCK_FILE_NAME`] and drift.
+    pub fn index_lock_path(&self) -> PathBuf {
+        self.state_dir_path().join(LOCK_FILE_NAME)
+    }
+
     /// Block until the shared chunk-writer lock is available, then claim it.
     ///
     /// Shares [`LOCK_FILE_NAME`] with [`Self::acquire_index_lock`] so a full

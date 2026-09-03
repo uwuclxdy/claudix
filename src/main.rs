@@ -229,6 +229,9 @@ async fn run() -> Result<()> {
                 println!("last_incremental_at: {last_incremental_at}");
             }
             println!("stale: {}", output.stale);
+            if let Some(indexing) = output.indexing {
+                print_indexing_status(&indexing);
+            }
         }
         Command::ReindexFile { path } => {
             let output = cli::run_reindex_file(&project_root, path).await?;
@@ -386,6 +389,31 @@ fn print_index_stats(
     }
     if let Some(dimensions) = dimensions {
         println!("dimensions: {dimensions}");
+    }
+}
+
+fn print_indexing_status(indexing: &cli::IndexingStatus) {
+    let elapsed = format_elapsed(indexing.elapsed_secs);
+    match indexing.total {
+        Some(total) => {
+            let percent = (indexing.done * 100).checked_div(total).unwrap_or(0);
+            println!(
+                "indexing: {}/{} files ({}%), pid {}, {} elapsed",
+                indexing.done, total, percent, indexing.pid, elapsed
+            );
+        }
+        None => println!(
+            "indexing: scanning, pid {}, {} elapsed",
+            indexing.pid, elapsed
+        ),
+    }
+}
+
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{}s", secs / 60, secs % 60)
     }
 }
 

@@ -30,7 +30,7 @@ pub fn session_start_response(
     log_hint: Option<&str>,
 ) -> Value {
     let progress_suffix = log_hint
-        .map(|p| format!(" Tail `{p}` to check progress."))
+        .map(|p| format!(" Run `claudix status` to check progress, or tail `{p}`."))
         .unwrap_or_default();
     // No "you'll be notified" promise and no "background" here: this arm also
     // fires for a manual `claudix index` run (full_index_running), which is

@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde::Serialize;
 
@@ -115,6 +116,13 @@ impl IndexProgress for StderrIndexProgress {
         stderr.flush()?;
         Ok(())
     }
+
+    fn embed_total(&mut self, total: usize) -> Result<()> {
+        let mut stderr = io::stderr().lock();
+        writeln!(stderr, "total {total} pid {}", std::process::id())?;
+        stderr.flush()?;
+        Ok(())
+    }
 }
 
 struct FileIndexProgress {
@@ -144,6 +152,12 @@ impl IndexProgress for FileIndexProgress {
         self.writer.flush()?;
         Ok(())
     }
+
+    fn embed_total(&mut self, total: usize) -> Result<()> {
+        writeln!(self.writer, "total {total} pid {}", std::process::id())?;
+        self.writer.flush()?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -161,6 +175,24 @@ pub struct StatusOutput {
     pub last_incremental_at: Option<String>,
     /// True when the index is missing or older than `reindex_after_hours`.
     pub stale: bool,
+    /// In-flight full-index progress, present only while the store's lock
+    /// names a live process whose own `index.log` marker matches it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexing: Option<IndexingStatus>,
+}
+
+/// Progress of a full index that is running right now, read back from the
+/// run's own `index.log` marker and the store's existing lock/pending markers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IndexingStatus {
+    pub pid: u32,
+    /// RFC3339 start time from the pending-index marker, only when that
+    /// marker's child pid is the live lock holder. `None` for a manual
+    /// foreground `claudix index`, which writes no such marker.
+    pub started_at: Option<String>,
+    pub elapsed_secs: u64,
+    pub done: usize,
+    pub total: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1082,7 +1114,103 @@ async fn status_from_store(store: &Store, config: &crate::config::Config) -> Res
             .as_ref()
             .and_then(|manifest| manifest.last_incremental_at.clone()),
         stale,
+        indexing: indexing_status(store, config),
     })
+}
+
+/// In-flight indexing block, derived entirely from state the run already
+/// writes: the live `index.lock` (liveness + pid), the pending-index marker
+/// (start time), and the run's own `total <n> pid <p>` marker in `index.log`.
+/// Returns `None` whenever nothing is running or the log marker does not match
+/// the lock pid (an older run's log, or a per-file reindex sharing the lock).
+fn indexing_status(store: &Store, config: &crate::config::Config) -> Option<IndexingStatus> {
+    if !store.full_index_running() {
+        return None;
+    }
+    let lock_path = store.index_lock_path();
+    let live_pid = crate::store::marker::read_pid(&lock_path)?;
+
+    let pending = crate::store::marker::pending_index::read(&store.pending_index_marker_path());
+    let (started_at, elapsed_secs) = match pending {
+        Some(marker) if marker.child_pid == Some(live_pid) => (
+            Some(marker.created_at_raw),
+            elapsed_since(marker.created_at),
+        ),
+        _ => {
+            let lock_mtime = fs::metadata(&lock_path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            (None, lock_mtime.map(elapsed_since).unwrap_or(0))
+        }
+    };
+
+    let log_path = store
+        .project_root()
+        .join(&config.paths.log_dir)
+        .join("index.log");
+    let log = fs::read_to_string(log_path).ok()?;
+    let (done, total) = parse_indexing_progress(&log, live_pid);
+
+    Some(IndexingStatus {
+        pid: live_pid,
+        started_at,
+        elapsed_secs,
+        done,
+        total,
+    })
+}
+
+/// Elapsed seconds since `start`, saturating at `0` for a future timestamp
+/// (clock skew or restore-from-backup) instead of underflowing.
+fn elapsed_since(start: SystemTime) -> u64 {
+    SystemTime::now()
+        .duration_since(start)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Parse the LAST `total <n> pid <p>` marker in `index.log` and count the
+/// file-result lines (`indexed`/`verified`/`skipped`) after it. A missing
+/// marker, a malformed marker, or a marker whose pid differs from `live_pid`
+/// all read as `(0, None)`: the log belongs to an older run, or the lock
+/// belongs to a per-file reindex.
+fn parse_indexing_progress(log: &str, live_pid: u32) -> (usize, Option<usize>) {
+    let lines: Vec<&str> = log.lines().collect();
+    let Some(marker_idx) = lines.iter().rposition(|line| line.starts_with("total ")) else {
+        return (0, None);
+    };
+    let Some((total, pid)) = parse_total_marker(&lines[marker_idx]["total ".len()..]) else {
+        return (0, None);
+    };
+    if pid != live_pid {
+        return (0, None);
+    }
+    let done = lines[marker_idx + 1..]
+        .iter()
+        .filter(|line| {
+            matches!(
+                line.split_whitespace().next(),
+                Some("indexed" | "verified" | "skipped")
+            )
+        })
+        .count();
+    (done, Some(total))
+}
+
+/// Parse the `<n> pid <p>` tail of a `total ` log line. Malformed input
+/// (missing or extra tokens, a non-`pid` second token, unparseable numbers)
+/// yields `None` — never a panic, never a partial parse.
+fn parse_total_marker(rest: &str) -> Option<(usize, u32)> {
+    let mut parts = rest.split_whitespace();
+    let total = parts.next()?.parse::<usize>().ok()?;
+    if parts.next()? != "pid" {
+        return None;
+    }
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((total, pid))
 }
 
 fn require_git_repo(project_root: &Path) -> Result<()> {
@@ -1423,6 +1551,79 @@ mod tests {
             text.starts_with("error:") && text.contains("boom"),
             "log must capture the terminal error so the failure notice can quote it, got: {text}"
         );
+    }
+
+    #[test]
+    fn parse_indexing_progress_reads_marker_with_matching_pid() {
+        let log = "total 5 pid 4242\nindexed src/a.rs\nskipped src/b.rs: no indexable chunks\n";
+        assert_eq!(parse_indexing_progress(log, 4242), (2, Some(5)));
+    }
+
+    #[test]
+    fn parse_indexing_progress_rejects_marker_with_foreign_pid() {
+        let log = "total 5 pid 4242\nindexed src/a.rs\n";
+        assert_eq!(parse_indexing_progress(log, 9999), (0, None));
+    }
+
+    #[test]
+    fn parse_indexing_progress_returns_none_without_marker() {
+        let log = "indexed src/a.rs\nindexed src/b.rs\n";
+        assert_eq!(parse_indexing_progress(log, 4242), (0, None));
+    }
+
+    #[test]
+    fn parse_indexing_progress_counts_indexed_and_skipped_lines_after_marker() {
+        let log = "verified src/a.rs\ntotal 2 pid 4242\nindexed src/a.rs\nskipped src/b.rs: no indexable chunks\n";
+        assert_eq!(parse_indexing_progress(log, 4242), (2, Some(2)));
+    }
+
+    #[test]
+    fn parse_indexing_progress_ignores_error_lines_after_marker() {
+        let log = "total 1 pid 4242\nindexed src/a.rs\nerror: boom\n";
+        assert_eq!(parse_indexing_progress(log, 4242), (1, Some(1)));
+    }
+
+    #[test]
+    fn parse_indexing_progress_only_last_total_line_counts() {
+        let log = "total 9 pid 4242\nindexed src/a.rs\ntotal 3 pid 4242\nindexed src/b.rs\n";
+        assert_eq!(parse_indexing_progress(log, 4242), (1, Some(3)));
+    }
+
+    #[test]
+    fn elapsed_since_future_timestamp_is_zero() {
+        let future = SystemTime::now() + std::time::Duration::from_secs(3_600);
+        assert_eq!(elapsed_since(future), 0);
+    }
+
+    /// The invariant that matters end to end: after a file-log run completes,
+    /// the marker's `n` equals the number of file-result lines (`indexed` /
+    /// `verified` / `skipped`) written after it. A test asserting only "the
+    /// line exists" would pass on a marker that counts enumeration/store-phase
+    /// lines, which is the defect this exists to prevent.
+    #[tokio::test]
+    async fn run_index_log_marker_total_equals_lines_after() -> Result<()> {
+        let fixture = TestFixture::new("small_rust")?;
+        write_fixture_config(fixture.root(), &stub_config())?;
+
+        run_index(fixture.root(), false).await?;
+
+        let log_path = fixture
+            .root()
+            .join(&stub_config().paths.log_dir)
+            .join("index.log");
+        let log = std::fs::read_to_string(&log_path)
+            .unwrap_or_else(|_| unreachable!("index.log must exist at {log_path:?}"));
+        let (done, total) = parse_indexing_progress(&log, std::process::id());
+
+        let total = total.unwrap_or_else(|| {
+            unreachable!("log must carry a `total <n> pid <pid>` marker, got: {log}")
+        });
+        assert!(total > 0, "the embed loop must walk at least one file");
+        assert_eq!(
+            done, total,
+            "the marker's total must equal the number of lines after it, got: {log}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

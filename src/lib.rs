@@ -162,6 +162,13 @@ impl<'a> Window<'a> {
 
 pub trait IndexProgress {
     fn file(&mut self, path: &RelativePath, status: IndexFileStatus) -> Result<()>;
+
+    /// The total number of files the embed loop is about to walk, reported
+    /// once before the loop begins. The default keeps every lightweight impl
+    /// (`()`, test doubles) compiling without opting in.
+    fn embed_total(&mut self, _total: usize) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Unit implements `IndexProgress` as a no-op, so callers that don't care
@@ -362,10 +369,16 @@ impl Claudix {
         // what the manifest claims and the row-count gate forces a rebuild.
         let mut window = Window::default();
 
-        for file in files
+        // Collect the loop's targets once so the reported total and the loop
+        // walk the same list — two copies of the predicate would silently
+        // diverge as the filter evolves.
+        let targets: Vec<&EnumeratedFile> = files
             .iter()
             .filter(|file| changed_paths.contains(file.relative_path.as_str()))
-        {
+            .collect();
+        progress.embed_total(targets.len())?;
+
+        for file in targets {
             let chunks = self.collect_file_chunks(file).await?;
             if chunks.is_empty() {
                 progress.file(
