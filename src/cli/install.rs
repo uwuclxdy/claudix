@@ -13,7 +13,7 @@ use super::{InstallOutput, SetupState, canonical_project_root};
 pub async fn run_install(project_root: impl AsRef<Path>) -> Result<InstallOutput> {
     let project_root = canonical_project_root(project_root.as_ref())?;
     let source_root = install_source_root(&project_root)?;
-    let plugin_root = plugin_root_from_env(&project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT"))?;
+    let plugin_root = plugin_root_from_env(&project_root, plugin_root_env())?;
     let binary_path = plugin_root.join("bin").join("claudix");
     let config_path = global_config_path()?;
 
@@ -37,7 +37,7 @@ pub async fn setup_state(project_root: impl AsRef<Path>) -> SetupState {
     let project_root = project_root.as_ref();
     let mut missing = Vec::new();
 
-    if plugin_root_from_env(project_root, std::env::var_os("CLAUDE_PLUGIN_ROOT")).is_err() {
+    if plugin_root_from_env(project_root, plugin_root_env()).is_err() {
         missing.push("plugin files");
     }
     match global_config_path() {
@@ -271,9 +271,27 @@ fn install_source_root(project_root: &Path) -> Result<PathBuf> {
         return Ok(project_root.to_path_buf());
     }
 
-    match std::env::var_os("CLAUDE_PLUGIN_ROOT") {
+    match plugin_root_env() {
         Some(path) => Ok(PathBuf::from(path)),
         None => Ok(PathBuf::from(env!("CARGO_MANIFEST_DIR"))),
+    }
+}
+
+/// `CLAUDE_PLUGIN_ROOT` as production sees it, read in one place so no install
+/// path can reach the variable directly.
+///
+/// A test build reads `None`. A Claude Code session exports this variable, so
+/// honoring it would let an install run under test copy plugin assets into the
+/// operator's real plugin tree, and which paths a test writes would depend on
+/// where it was run.
+fn plugin_root_env() -> Option<std::ffi::OsString> {
+    #[cfg(any(test, feature = "test-stub"))]
+    {
+        None
+    }
+    #[cfg(not(any(test, feature = "test-stub")))]
+    {
+        std::env::var_os("CLAUDE_PLUGIN_ROOT")
     }
 }
 

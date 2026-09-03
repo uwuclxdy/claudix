@@ -10,24 +10,29 @@ const SECONDS_PER_DAY: i64 = 86_400;
 /// Root of every claudix path outside the project: the global config, the
 /// bundled model cache, the install log.
 ///
-/// A `test-stub` build resolves it from `CLAUDIX_SANDBOX_HOME` and nothing
-/// else, so no test can reach the developer's own `~/.claude`, and a spawned
-/// `claudix` binary inherits the same sandbox. `.cargo/config.toml` sets that
-/// variable for every process cargo starts. An unset variable aborts instead
-/// of falling back, because falling back is how a suite ends up asserting
-/// against whatever the machine running it happens to have configured.
-#[cfg_attr(feature = "test-stub", allow(clippy::panic))]
+/// A test build resolves it from `CLAUDIX_SANDBOX_HOME` and nothing else, so
+/// no test can reach the developer's own `~/.claude`, and a spawned `claudix`
+/// binary inherits the same sandbox. `.cargo/config.toml` sets that variable
+/// for every process cargo starts. An unset variable aborts instead of falling
+/// back, because falling back is how a suite ends up asserting against
+/// whatever the machine running it happens to have configured.
+///
+/// The condition carries `test` as well as the feature: `cargo test --lib`
+/// enables neither `--all-features` nor `test-stub`, and a feature-only guard
+/// leaves those unit tests reading the real home. It matches the spelling every
+/// other test-only path in this crate already uses.
+#[cfg_attr(any(test, feature = "test-stub"), allow(clippy::panic))]
 pub(crate) fn home_root() -> Option<PathBuf> {
-    #[cfg(feature = "test-stub")]
+    #[cfg(any(test, feature = "test-stub"))]
     {
         match std::env::var_os("CLAUDIX_SANDBOX_HOME") {
             Some(dir) => Some(PathBuf::from(dir)),
             None => panic!(
-                "CLAUDIX_SANDBOX_HOME is unset in a test-stub build: a test must never read real user paths. `.cargo/config.toml` sets it for every process cargo starts."
+                "CLAUDIX_SANDBOX_HOME is unset in a test build: a test must never read real user paths. `.cargo/config.toml` sets it for every process cargo starts."
             ),
         }
     }
-    #[cfg(not(feature = "test-stub"))]
+    #[cfg(not(any(test, feature = "test-stub")))]
     {
         dirs::home_dir()
     }

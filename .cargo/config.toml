@@ -3,10 +3,14 @@
 # Windows keep their default linkers. Requires clang + lld on PATH (CI installs
 # them in .github/workflows). Emits a standard portable ELF, no runtime lld dep.
 # Every process cargo starts gets a sandbox home, spawned `claudix` binaries
-# included. A `test-stub` build resolves the global config, the model cache and
-# the install log from this and refuses to fall back to the real `$HOME`, so a
-# test can neither read nor write the developer's own `~/.claude`. Deleting
-# this entry does not weaken the suite quietly: it aborts it.
+# included. A test build resolves the global config, the model cache and the
+# install log from this and refuses to fall back to the real `$HOME`, so a test
+# can neither read nor write the developer's own `~/.claude`. Deleting this
+# entry does not weaken the suite quietly: it aborts it.
+#
+# The path is relative to this file's parent, so it lands in the checkout even
+# when `CARGO_TARGET_DIR` points elsewhere, and `cargo clean` then leaves it
+# behind. It stays under the gitignored `target/` for that reason.
 [env]
 CLAUDIX_SANDBOX_HOME = { value = "target/test-home", relative = true }
 
