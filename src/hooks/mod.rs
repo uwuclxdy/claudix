@@ -39,6 +39,7 @@ pub async fn run(project_root: &Path, event: HookEvent, payload: &str) -> Result
             tool_input: None,
             session_id: None,
             prompt_id: None,
+            tool_response: None,
         }
     } else {
         serde_json::from_str(payload)?

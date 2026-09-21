@@ -8,8 +8,9 @@
 //! ```
 //!
 //! The hook reads, surfaces, and atomically deletes this file on the next
-//! `PostToolUse` or `UserPromptSubmit` event. If it does not exist the hook
-//! produces no neighbors output.
+//! edit-tool `PostToolUse` (`Edit`/`Write`/`NotebookEdit`/`MultiEdit`) or
+//! `UserPromptSubmit` event. If it does not exist the hook produces no
+//! neighbors output.
 //!
 //! `session_id` names the session whose edit produced the marker; the acking
 //! hook drops (without surfacing) any marker whose session is not the acking

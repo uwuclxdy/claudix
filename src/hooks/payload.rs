@@ -17,6 +17,12 @@ pub(super) struct HookPayload {
     /// on older clients or before the first user input.
     #[serde(default)]
     pub prompt_id: Option<String>,
+    /// The tool's structured output (`tool_response` of the PostToolUse
+    /// payload). `None` on an older client, a partial payload, or an event
+    /// whose tool has no response. Used to confirm an Edit actually changed the
+    /// file before a reindex is enqueued.
+    #[serde(default)]
+    pub tool_response: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -33,6 +33,40 @@ const READ_SURFACING_MAX_CHUNKS: usize = 50_000;
 /// the session never saw. Under-claiming only costs a repeated hint (fail-open).
 const READ_TOOL_MAX_LINES: u32 = 2000;
 
+/// Whether a tool result signals an errored call. `PostToolUse` is normally
+/// only dispatched for successful calls, but claudix registers no
+/// `PostToolUseFailure` event, so a misrouted failure is only kept from
+/// resurfacing "your edit" by inspecting the result here.
+fn tool_result_is_error(tool_response: Option<&Value>) -> bool {
+    let Some(response) = tool_response else {
+        return false;
+    };
+    response.get("is_error").and_then(Value::as_bool) == Some(true)
+        || response.get("success").and_then(Value::as_bool) == Some(false)
+        || response.get("error").is_some_and(|error| !error.is_null())
+}
+
+/// Whether the tool result this PostToolUse accompanies reports an actual file
+/// change. An errored result is not a change and skips both the reindex enqueue
+/// and the marker ack. Otherwise fail-open: an unreadable/absent response, or
+/// an Edit whose result omits `structuredPatch`, counts as a change; only the
+/// Edit tool's own empty `structuredPatch` proves a no-op edit.
+fn tool_result_changed_file(tool_name: Option<&str>, tool_response: Option<&Value>) -> bool {
+    if tool_result_is_error(tool_response) {
+        return false;
+    }
+    if tool_name != Some("Edit") {
+        return true;
+    }
+    let Some(response) = tool_response else {
+        return true;
+    };
+    match response.get("structuredPatch") {
+        Some(Value::Array(hunks)) => !hunks.is_empty(),
+        _ => true,
+    }
+}
+
 pub(super) async fn handle_post_tool_use(
     project_root: &Path,
     payload: HookPayload,
@@ -65,10 +99,26 @@ pub(super) async fn handle_post_tool_use(
 
     let session_id = payload.session_id.as_deref();
 
+    // Whether this PostToolUse accompanies an edit tool. The change-neighbors
+    // hint is derived from the tool's own result: only an edit tool's event may
+    // ack the marker (and only its own input may claim "your edit"), so a
+    // zero-edit turn — one whose tools only Read or Grep — surfaces nothing.
+    let edit_tool = matches!(
+        tool_name,
+        Some("Edit" | "Write" | "NotebookEdit" | "MultiEdit")
+    );
+
+    // An edit event only counts as an edit when its result reports an actual
+    // change: a no-op Edit (empty `structuredPatch`) or an errored result
+    // changed no file, so it neither enqueues a reindex nor acks the marker —
+    // the same shape as a zero-edit turn. Fail-open: an unreadable result
+    // counts as a change.
+    let changed_file = tool_result_changed_file(tool_name, payload.tool_response.as_ref());
+
     // Files this event itself edited (any spelling: file_path, notebook_path,
     // or the files_modified list). The change-neighbors ack compares these
     // against the marker's edited_path, so "your edit" is only ever claimed by
-    // the event that actually edited that file.
+    // the edit event that actually edited that file.
     let event_files: Vec<String> = payload
         .tool_input
         .as_ref()
@@ -94,12 +144,12 @@ pub(super) async fn handle_post_tool_use(
     //
     // When the live watcher owns reindexing (`watcher_alive`) or auto-reembed is
     // off, this whole branch is skipped and nothing touches the queue.
-    let read_input = if let Some(name) = tool_name
-        && matches!(name, "Edit" | "Write" | "NotebookEdit" | "MultiEdit")
+    let read_input = if edit_tool
         && let Some(cfg) = config.as_ref()
         && cfg.hooks.auto_reembed_on_edit
         && let Some(st) = store.as_ref()
         && !watcher_alive(st)
+        && changed_file
         && let Some(input) = payload.tool_input.as_ref()
     {
         let enqueued = enqueue_watchable_edits(st, input, session_id);
@@ -139,13 +189,21 @@ pub(super) async fn handle_post_tool_use(
         _ => None,
     };
 
-    let change_neighbors = take_change_neighbors_context(
-        store.as_ref(),
-        config.as_ref(),
-        "PostToolUse",
-        session_id,
-        &event_files,
-    );
+    // Only an edit that actually changed a file may ack the change-neighbors
+    // marker: the hint names the edit that tool just performed, and a
+    // Read/Grep/... event or a no-op Edit changed nothing. The UserPromptSubmit
+    // arm acks separately, with no file, and always uses the neutral wording.
+    let change_neighbors = if edit_tool && changed_file {
+        take_change_neighbors_context(
+            store.as_ref(),
+            config.as_ref(),
+            "PostToolUse",
+            session_id,
+            &event_files,
+        )
+    } else {
+        None
+    };
 
     let read_neighbors = read_surfacing_context(
         store.as_ref(),
@@ -1728,6 +1786,196 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_edit_tool_event_does_not_ack_or_surface_the_marker() -> Result<()> {
+        // A zero-edit turn must fire nothing: a Read of the very file the
+        // marker records is not an edit, so it must neither surface the hint
+        // nor consume the marker. Pre-fix, the Read's file_path fed the
+        // "your edit" comparison and claimed an edit this turn never made.
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+
+        let payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Read",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+
+        assert!(
+            response.is_none(),
+            "a non-edit Read must not surface the change-neighbors hint, got: {response:?}"
+        );
+        assert!(
+            store.change_neighbors_marker_path().exists(),
+            "a non-edit Read must not consume the marker; it must survive for the next edit or submit"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_op_edit_does_not_enqueue_or_surface_the_marker() -> Result<()> {
+        // A no-op Edit (the tool reports an empty `structuredPatch`) changed no
+        // file, so it must neither enqueue a reindex nor ack the pending
+        // marker: the same shape as a zero-edit turn. Pre-fix, the Edit's
+        // input alone claimed "your edit" for a file never changed.
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        write_neighbors_marker(
+            &store,
+            "src/lib.rs",
+            vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+        );
+
+        let payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Edit",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") },
+            "tool_response": { "structuredPatch": [] }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+
+        assert!(
+            response.is_none(),
+            "a no-op Edit must not surface the change-neighbors hint, got: {response:?}"
+        );
+        assert!(
+            store.change_neighbors_marker_path().exists(),
+            "a no-op Edit must not consume the marker"
+        );
+        assert!(
+            reindex_queue::read_content(&store.reindex_queue_path()).is_empty(),
+            "a no-op Edit must not enqueue a reindex"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_with_changes_enqueues_the_target() -> Result<()> {
+        // The other half of the no-op gate: a real Edit (non-empty
+        // `structuredPatch`) must still enqueue, so the gate only drops edits
+        // whose result proves no change.
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        let payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Edit",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") },
+            "tool_response": { "structuredPatch": [
+                { "oldStart": 1, "oldLines": 1, "newStart": 1, "newLines": 1, "lines": [] }
+            ] }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(
+            response.is_none(),
+            "an edit with no pending marker surfaces nothing, got: {response:?}"
+        );
+
+        let entries =
+            reindex_queue::parse_entries(&reindex_queue::read_content(&store.reindex_queue_path()));
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["src/lib.rs"],
+            "a real Edit must enqueue its target"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn edit_without_a_patch_enqueues_fail_open() -> Result<()> {
+        // An older client, or an Edit whose result omits `structuredPatch`,
+        // must not go silent: the gate fails open and enqueues.
+        let fixture = TestFixture::new("small_rust")?;
+        let config = stub_config();
+        write_config(fixture.root(), &config);
+        let store = Store::new(fixture.root(), &config)?;
+        store.ensure_layout()?;
+
+        let payload = json!({
+            "session_id": TEST_SESSION,
+            "tool_name": "Edit",
+            "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+        });
+        let response = run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+        assert!(response.is_none(), "got: {response:?}");
+
+        let entries =
+            reindex_queue::parse_entries(&reindex_queue::read_content(&store.reindex_queue_path()));
+        let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["src/lib.rs"],
+            "an Edit with no structuredPatch must still enqueue (fail-open)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn errored_edit_does_not_enqueue_or_surface_the_marker() -> Result<()> {
+        // A failed Edit (its result carries `is_error`, an `error` field, or
+        // `success: false`) changed no file, so it must neither enqueue nor ack
+        // — the same shape as a no-op. The fail-open arm must not resurrect
+        // "your edit" for a failure.
+        for errored_response in [
+            json!({ "is_error": true }),
+            json!({ "error": "old_string not found" }),
+            json!({ "success": false }),
+        ] {
+            let fixture = TestFixture::new("small_rust")?;
+            let config = stub_config();
+            write_config(fixture.root(), &config);
+            let store = Store::new(fixture.root(), &config)?;
+            store.ensure_layout()?;
+
+            write_neighbors_marker(
+                &store,
+                "src/lib.rs",
+                vec![make_neighbor_entry("src/math.rs", "add", 0.82)],
+            );
+
+            let payload = json!({
+                "session_id": TEST_SESSION,
+                "tool_name": "Edit",
+                "tool_input": { "file_path": fixture.root().join("src/lib.rs") },
+                "tool_response": errored_response
+            });
+            let response =
+                run(fixture.root(), HookEvent::PostToolUse, &payload.to_string()).await?;
+
+            assert!(
+                response.is_none(),
+                "an errored Edit must not surface the change-neighbors hint, got: {response:?}"
+            );
+            assert!(
+                store.change_neighbors_marker_path().exists(),
+                "an errored Edit must not consume the marker"
+            );
+            assert!(
+                reindex_queue::read_content(&store.reindex_queue_path()).is_empty(),
+                "an errored Edit must not enqueue a reindex"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn unattributed_marker_never_surfaces_not_even_to_a_sessionless_event() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;
         let config = stub_config();
@@ -2477,7 +2725,10 @@ mod tests {
     #[tokio::test]
     async fn combine_both_messages_when_both_present() -> Result<()> {
         let fixture = TestFixture::new("small_rust")?;
-        let config = stub_config();
+        let mut config = stub_config();
+        // Keep the edit from enqueueing a background drain worker; only the ack
+        // matters here.
+        config.hooks.auto_reembed_on_edit = false;
         write_config(fixture.root(), &config);
         let store = Store::new(fixture.root(), &config)?;
         store.ensure_layout()?;
@@ -2502,7 +2753,12 @@ mod tests {
         let response = run(
             fixture.root(),
             HookEvent::PostToolUse,
-            &json!({ "session_id": TEST_SESSION }).to_string(),
+            &json!({
+                "session_id": TEST_SESSION,
+                "tool_name": "Write",
+                "tool_input": { "file_path": fixture.root().join("src/lib.rs") }
+            })
+            .to_string(),
         )
         .await?;
         let response = response.unwrap_or(serde_json::Value::Null);

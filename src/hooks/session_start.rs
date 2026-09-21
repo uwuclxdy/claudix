@@ -234,6 +234,7 @@ mod tests {
                 tool_input: None,
                 session_id: None,
                 prompt_id: None,
+                tool_response: None,
             },
             vec![subdir.clone()],
         )
