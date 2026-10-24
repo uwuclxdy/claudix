@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CacheScope, CallToolResult, ContentBlock, Implementation, JsonObject, ListToolsResult,
-    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+    CacheScope, CallToolResult, ContentBlock, DiscoverResult, Implementation, JsonObject,
+    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::transport::io::stdio;
@@ -28,7 +28,7 @@ use crate::store::Store;
 /// an `Err`, so the message reaches the caller instead of being rendered opaque.
 type ToolOutcome = std::result::Result<CallToolResult, ErrorData>;
 
-/// Freshness bound on the served tool catalog. The catalog cannot change while
+/// Freshness bound on the served tool catalog and discovery reply. Neither can change while
 /// the server process lives, and stdio bounds staleness anyway (server death is
 /// connection death, so a client refetches regardless), so an hour is honest
 /// and lets a client cache the catalog across turns.
@@ -189,6 +189,22 @@ impl ServerHandler for ClaudixServer {
         Ok(ListToolsResult::with_all_items(tool_catalog()?)
             .with_ttl_ms(TOOL_CATALOG_TTL_MS)
             .with_cache_scope(CacheScope::Private))
+    }
+
+    /// The default `discover` builds from `get_info` with `ttl_ms: 0`, which a
+    /// conforming client reads as already stale and re-fetches every turn. The
+    /// server info is as static per process as the catalog, so it carries the
+    /// same freshness bound.
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<DiscoverResult, ErrorData> {
+        Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )
+        .with_ttl_ms(TOOL_CATALOG_TTL_MS)
+        .with_cache_scope(CacheScope::Private))
     }
 }
 

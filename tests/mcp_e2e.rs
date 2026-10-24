@@ -267,8 +267,8 @@ fn modern_frames_search_returns_fixture_hit() -> Result<(), Box<dyn std::error::
         discover["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
         "claudix"
     );
-    assert!(discover["result"].get("ttlMs").is_some());
-    assert!(discover["result"].get("cacheScope").is_some());
+    let discover_ttl = discover["result"]["ttlMs"].as_u64();
+    let discover_scope = discover["result"]["cacheScope"].as_str();
 
     writeln!(
         stdin,
@@ -283,6 +283,16 @@ fn modern_frames_search_returns_fixture_hit() -> Result<(), Box<dyn std::error::
     let tools = next_response(&mut reader)?;
     assert_eq!(tools["result"]["resultType"], "complete");
     assert_eq!(tools["result"]["cacheScope"], "private");
+    assert_eq!(
+        discover_ttl,
+        tools["result"]["ttlMs"].as_u64(),
+        "discover and tools/list must carry the same ttlMs"
+    );
+    assert!(
+        discover_ttl.is_some_and(|ttl| ttl > 0),
+        "discover ttlMs of 0 reads as already stale"
+    );
+    assert_eq!(discover_scope, Some("private"));
     let names = tools["result"]["tools"]
         .as_array()
         .ok_or("tools list missing array")?
