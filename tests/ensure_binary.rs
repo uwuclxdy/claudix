@@ -470,7 +470,12 @@ fn install_retries_until_release_asset_publishes() {
         {
             break p;
         }
-        if Instant::now().duration_since(started) > Duration::from_secs(3) {
+        // gate serialization box-wide can starve the node spawn far past a
+        // tight deadline; only a dead child or a real miss is failure.
+        if let Some(status) = server.try_wait().expect("server poll") {
+            panic!("fake release server exited before binding: {status}");
+        }
+        if Instant::now().duration_since(started) > Duration::from_secs(30) {
             kill_wait(&mut server);
             panic!("fake release server did not bind");
         }
